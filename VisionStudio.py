@@ -17,12 +17,25 @@ STYLE_SHEET = """
     QTabWidget::pane { border: 1px solid #333; }
 """
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 class BroadcastingApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vision Radio: Professional Creator Suite")
         self.resize(600, 500)
         self.setStyleSheet(STYLE_SHEET)
+        
+        # Example of how to use resource_path for your files:
+        # self.audio_path = resource_path("audio/SoundOne.mp3")
         
         self.rotation_file = "rotation.json"
         self.schedule = {":00": "", ":15": "", ":30": "", ":45": ""}
@@ -41,7 +54,7 @@ class BroadcastingApp(QWidget):
         layout_b.addWidget(self.status)
         self.tab_broadcast.setLayout(layout_b)
         
-        # Tab 2: Rotation Creator (Accessible Input Form)
+        # Tab 2: Rotation Creator
         self.tab_creator = QWidget()
         layout_c = QFormLayout()
         self.inputs = {}
