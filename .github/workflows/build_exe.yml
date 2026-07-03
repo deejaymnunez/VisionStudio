@@ -1,0 +1,32 @@
+name: Build Vision Radio EXE
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyqt6 pyinstaller
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "VisionRadio" VisionStudio.py
+
+      - name: Upload Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionRadio-EXE
+          path: dist/VisionRadio.exe
