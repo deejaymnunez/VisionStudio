@@ -1,5 +1,4 @@
 name: Build VisionStudio
-
 on: [push]
 
 jobs:
@@ -23,9 +22,10 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed ^
           --collect-all PyQt6 ^
           --collect-all pygame ^
-          --hidden-import PyQt6.QtMultimedia ^
-          --hidden-import PyQt6.QtMultimediaWidgets ^
+          --copy-metadata PyQt6 ^
+          --copy-metadata pygame ^
           VisionStudio.py
+          
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
