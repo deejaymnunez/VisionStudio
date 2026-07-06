@@ -1,31 +1,17 @@
 import sys
-import json
 import os
-import datetime
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
-                             QLabel, QFileDialog, QTabWidget, QLineEdit, QFormLayout)
-from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+                             QLabel, QFileDialog, QTabWidget, QFormLayout, QComboBox)
+from PyQt6.QtCore import QSettings
+from PyQt6.QtMultimedia import QMediaDevices
 
-# Accessible Color Palette
 STYLE_SHEET = """
     QWidget { background-color: #121212; color: #E0E0E0; font-family: Arial; font-size: 14px; }
     QPushButton { background-color: #007ACC; color: white; padding: 10px; border-radius: 5px; font-weight: bold; }
     QPushButton:hover { background-color: #005A9E; }
-    QLineEdit { background-color: #2C2C2C; border: 1px solid #555; padding: 5px; color: white; }
+    QComboBox { background-color: #2C2C2C; color: white; padding: 5px; }
     QLabel { font-weight: bold; }
-    QTabWidget::pane { border: 1px solid #333; }
 """
-
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-
-    return os.path.join(base_path, relative_path)
 
 class BroadcastingApp(QWidget):
     def __init__(self):
@@ -33,13 +19,7 @@ class BroadcastingApp(QWidget):
         self.setWindowTitle("Vision Radio: Professional Creator Suite")
         self.resize(600, 500)
         self.setStyleSheet(STYLE_SHEET)
-        
-        # Example of how to use resource_path for your files:
-        # self.audio_path = resource_path("audio/SoundOne.mp3")
-        
-        self.rotation_file = "rotation.json"
-        self.schedule = {":00": "", ":15": "", ":30": "", ":45": ""}
-        self.load_rotation()
+        self.settings = QSettings("VisionRecords", "VisionRadio")
         
         self.setup_ui()
         
@@ -47,46 +27,60 @@ class BroadcastingApp(QWidget):
         layout = QVBoxLayout()
         self.tabs = QTabWidget()
         
-        # Tab 1: Broadcast
-        self.tab_broadcast = QWidget()
-        layout_b = QVBoxLayout()
-        self.status = QLabel("Status: System Ready")
-        layout_b.addWidget(self.status)
-        self.tab_broadcast.setLayout(layout_b)
+        # Tab 1: Jingle Player
+        self.tab_player = QWidget()
+        layout_p = QVBoxLayout()
+        for label, key in {":00 (Top)": ":00", ":15 (Past)": ":15", ":30 (Half)": ":30", ":45 (To)": ":45"}.items():
+            btn = QPushButton(f"Set Folder for {label}")
+            btn.clicked.connect(lambda checked, k=key: self.set_jingle_folder(k))
+            layout_p.addWidget(btn)
+        self.tab_player.setLayout(layout_p)
         
-        # Tab 2: Rotation Creator
-        self.tab_creator = QWidget()
-        layout_c = QFormLayout()
-        self.inputs = {}
-        for time_slot in [":00", ":15", ":30", ":45"]:
-            edit = QLineEdit(self.schedule.get(time_slot, ""))
-            layout_c.addRow(f"Jingle at {time_slot}:", edit)
-            self.inputs[time_slot] = edit
+        # Tab 2: Audio Settings (Hardware Routing)
+        self.tab_audio = QWidget()
+        layout_a = QFormLayout()
+        
+        self.input_combo = QComboBox()
+        self.output_combo = QComboBox()
+        
+        # Populate devices
+        self.input_devices = QMediaDevices.audioInputs()
+        for dev in self.input_devices:
+            self.input_combo.addItem(dev.description(), dev)
             
-        save_btn = QPushButton("SAVE ROTATION")
-        save_btn.clicked.connect(self.save_rotation)
-        layout_c.addRow(save_btn)
-        self.tab_creator.setLayout(layout_c)
+        self.output_devices = QMediaDevices.audioOutputs()
+        for dev in self.output_devices:
+            self.output_combo.addItem(dev.description(), dev)
+            
+        # Restore saved settings
+        self.input_combo.setCurrentText(self.settings.value("input_device", ""))
+        self.output_combo.setCurrentText(self.settings.value("output_device", ""))
         
-        self.tabs.addTab(self.tab_broadcast, "Broadcast")
-        self.tabs.addTab(self.tab_creator, "Rotation Creator")
+        layout_a.addRow("Microphone/Line-In:", self.input_combo)
+        layout_a.addRow("Speaker/Interface:", self.output_combo)
+        
+        save_audio_btn = QPushButton("Save Audio Settings")
+        save_audio_btn.clicked.connect(self.save_audio_settings)
+        layout_a.addRow(save_audio_btn)
+        self.tab_audio.setLayout(layout_a)
+        
+        self.tabs.addTab(self.tab_player, "Jingles")
+        self.tabs.addTab(self.tab_audio, "Audio Settings")
+        
         layout.addWidget(self.tabs)
         self.setLayout(layout)
 
-    def save_rotation(self):
-        for time_slot, edit in self.inputs.items():
-            self.schedule[time_slot] = edit.text()
-        with open(self.rotation_file, 'w') as f:
-            json.dump(self.schedule, f)
-        self.status.setText("Rotation Saved Successfully.")
+    def set_jingle_folder(self, key):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if folder: self.settings.setValue(key, folder)
 
-    def load_rotation(self):
-        if os.path.exists(self.rotation_file):
-            with open(self.rotation_file, 'r') as f:
-                self.schedule = json.load(f)
+    def save_audio_settings(self):
+        self.settings.setValue("input_device", self.input_combo.currentText())
+        self.settings.setValue("output_device", self.output_combo.currentText())
+        print("Audio devices saved.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = BroadcastingApp()
-    window.show()
-sys.exit(app.exec())
+window.show()
+    sys.exit(app.exec())
