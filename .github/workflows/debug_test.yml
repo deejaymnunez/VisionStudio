@@ -1,3 +1,0 @@
-- name: Build with PyInstaller
-        run: |
-          pyinstaller --noconfirm --onefile --windowed --log-level=DEBUG VisionStudio.py
