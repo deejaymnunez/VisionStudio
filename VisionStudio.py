@@ -186,6 +186,10 @@ def get_layouts_folder():
     return tempfile.gettempdir()
 
 
+APP_VERSION = "2.0"
+BUILD_ID = "2026-10-19.12"      # changes with every delivery; written to the first log line and shown in Settings
+
+
 class RunLog:
     """A plain text as-run log, one file per day: what played, which break items ran, alerts and errors."""
 
@@ -4977,7 +4981,6 @@ class BroadcastingApp(QWidget):
         self._closing = False
         self._shutdown_done = False
         self._quitting = False
-        self._wts_registered = False
         self._voice_recording = False
         self.tray = None
         self.menu_actions = {}
@@ -4985,24 +4988,32 @@ class BroadcastingApp(QWidget):
         self.append_attempted = set()
         self.last_schedule_hour = datetime.now().hour
         self.rescan_counter = 0
-        RUN_LOG.write("START", "Vision Studio started.")
+        RUN_LOG.write("START", f"Vision Studio started. Build {BUILD_ID}.")
+        if str(self.settings.value("startup_defaults_v2", "")) != "done":
+            # Earlier builds could save these two as ticked. They start unchecked now and stay that way until you tick them.
+            self.settings.setValue("start_in_tray", "false")
+            self.settings.setValue("autoplay_on_boot", "false")
+            self.settings.setValue("startup_defaults_v2", "done")
         self.rotation_library = RotationLibrary(self.settings, on_changed=self.on_rotations_changed)
         self.rotation_schedule = RotationSchedule(self.settings, self.rotation_library)
         self.category_library = CategoryLibrary(self.settings, on_changed=self.on_categories_changed)
         self.playlist_generator = PlaylistGenerator(self.settings, self.rotation_library, self.rotation_schedule)
         self.shortcut_objects = []
+        RUN_LOG.write("START", "Step 1: libraries loaded.")
         self.migrate_old_playlists()
 
         self.normalizer = NormalizeManager(self)
         self.normalizer.progress.connect(self.on_normalize_progress)
         self.normalizer.batch_done.connect(self.on_normalize_done)
 
+        RUN_LOG.write("START", "Step 2: loudness manager ready.")
         self.mixer = ProgramMixer(self.update_status)
         # Safety switch (Audio Settings tab): turn the live stream mix off if it ever
         # interferes with playback on a particular computer. Takes effect on restart.
         if str(self.settings.value("use_live_mix", "true")).lower() == "false":
             self.mixer.available = False
 
+        RUN_LOG.write("START", "Step 3: stream mixer ready.")
         self.rotation = RotationEngine(
             self.settings, self.update_status, self.on_now_playing,
             self.on_track_ending, self.on_crossfader_move, self.on_deck_update,
@@ -5012,6 +5023,7 @@ class BroadcastingApp(QWidget):
         self.rotation.rotation_schedule = self.rotation_schedule
         self.rotation.on_queue_changed = self.refresh_queue_list
         self.rotation.on_rotation_swapped = self.on_rotation_swapped
+        RUN_LOG.write("START", "Step 4: decks ready.")
         self.sequence_player = SequencePlayer(
             self.settings, self.update_status, self.on_sequence_done, output_device
         )
@@ -5023,6 +5035,7 @@ class BroadcastingApp(QWidget):
             self.settings, self.update_status, self.get_current_input_source,
             self.mixer, self.on_encoder_state_changed
         )
+        RUN_LOG.write("START", "Step 5: encoders ready.")
         self.microphone = MicrophoneEngine(
             self.settings, self.update_status, self.on_mic_started, self.on_mic_stopped,
             self.on_mic_failed, self.on_mic_audio_chunk, self.on_mic_signal_changed
@@ -5038,11 +5051,14 @@ class BroadcastingApp(QWidget):
                                      lambda: self.sequence_player.audio_output.volume())
             self.mixer.add_source("mic", lambda: 0.0 if self.microphone.is_muted else 1.0)
 
+        RUN_LOG.write("START", "Step 6: audio sources connected.")
         self.warning_beep = HostBeep(get_or_create_warning_beep_path(), output_device)
         self.connect_beep = HostBeep(get_or_create_connect_beep_path(), output_device)
         self.disconnect_beep = HostBeep(get_or_create_disconnect_beep_path(), output_device)
 
+        RUN_LOG.write("START", "Step 7: sounds ready.")
         self.check_ffmpeg_availability()
+        RUN_LOG.write("START", "Step 8: music folder scan.")
         # Pointing at a music library folder builds one rotation per subfolder.
         root = self.settings.value("music_library_folder", "")
         if self.setup_complete() and root and os.path.isdir(root):
@@ -5057,7 +5073,8 @@ class BroadcastingApp(QWidget):
         self.setup_ui()
         RUN_LOG.write("START", "Window built.")
         self.setup_shortcuts()
-        for optional_step in (self.setup_tray, self.setup_session_watch, refresh_autostart_path, keep_system_awake):
+        RUN_LOG.write("START", "Shortcuts ready.")
+        for optional_step in (self.setup_tray, refresh_autostart_path, keep_system_awake):
             try:                      # none of these may ever stop the program from opening
                 optional_step()
             except Exception as e:
@@ -6014,7 +6031,6 @@ class BroadcastingApp(QWidget):
         if self.tray is None:
             self.showMinimized()
         RUN_LOG.write("START", "Running in the system tray.")
-        QTimer.singleShot(1500, self.register_session_notifications)
 
     def on_startup_launch(self):
         """Started by Windows at log-in. The window opens as normal unless "open in the system tray" is
@@ -6025,7 +6041,7 @@ class BroadcastingApp(QWidget):
             self.start_in_tray()
         else:
             self.show_remembered()
-        if str(self.settings.value("autoplay_on_boot", "true")).lower() == "true":
+        if str(self.settings.value("autoplay_on_boot", "false")).lower() == "true":
             QTimer.singleShot(8000, self.autoplay_after_boot)
 
     def autoplay_after_boot(self):
@@ -6053,65 +6069,6 @@ class BroadcastingApp(QWidget):
         except Exception:
             pass
         QTimer.singleShot(0, QApplication.quit)
-
-    # --- remote desktop and Windows sessions ---
-    SESSION_EVENTS = {1: "console connect", 2: "console disconnect", 3: "remote desktop connect",
-                      4: "remote desktop disconnect", 5: "logon", 6: "logoff", 7: "screen lock", 8: "screen unlock"}
-
-    def setup_session_watch(self):
-        """Remote Desktop connecting or disconnecting never stops the program. The sound output is simply
-        re-attached afterwards, because Windows swaps the audio devices when a remote session comes or goes."""
-        try:
-            self.media_devices = QMediaDevices(self)
-            self.media_devices.audioOutputsChanged.connect(lambda: QTimer.singleShot(1500, self.recover_audio))
-        except Exception:
-            self.media_devices = None
-
-    def register_session_notifications(self):
-        """Done once the window exists on screen (never before it is first shown)."""
-        if self._wts_registered:
-            return
-        self._wts_registered = True
-        try:
-            import ctypes
-            ctypes.windll.wtsapi32.WTSRegisterSessionNotification(int(self.winId()), 0)
-        except Exception:
-            pass
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        QTimer.singleShot(1500, self.register_session_notifications)
-
-    def nativeEvent(self, eventType, message):
-        try:
-            if bytes(eventType) == b"windows_generic_MSG":
-                import ctypes.wintypes as wt
-                msg = wt.MSG.from_address(int(message))
-                if msg.message == 0x02B1:       # WM_WTSSESSION_CHANGE
-                    self.on_session_change(int(msg.wParam))
-        except Exception:
-            pass
-        return super().nativeEvent(eventType, message)
-
-    def on_session_change(self, code):
-        name = self.SESSION_EVENTS.get(code, f"event {code}")
-        RUN_LOG.write("SESSION", f"Windows session: {name}. Vision Studio keeps running.")
-        if code in (1, 2, 3, 4, 8):
-            QTimer.singleShot(2000, self.recover_audio)
-            QTimer.singleShot(8000, self.recover_audio)
-
-    def recover_audio(self):
-        try:
-            device = get_selected_output_device(self.settings)
-            if device is None:
-                return
-            self.rotation.apply_output_device(device)
-            self.sequence_player.apply_output_device(device)
-            for beep in (self.warning_beep, self.connect_beep, self.disconnect_beep):
-                beep.set_device(device)
-            RUN_LOG.write("SESSION", f"Sound output re-attached: {device.description()}.")
-        except Exception as e:
-            RUN_LOG.write("ERROR", f"Could not re-attach the sound output: {e}")
 
     # --- voice tracking ---
     def voice_track_before(self):
@@ -6654,11 +6611,14 @@ class BroadcastingApp(QWidget):
         self.autostart_check.setChecked(autostart_enabled())
         self.autostart_check.toggled.connect(self.on_autostart_toggled)
         layout_a.addRow(self.autostart_check)
+        build_label = QLabel(f"Vision Studio {APP_VERSION}, build {BUILD_ID}")
+        build_label.setAccessibleName(f"About: Vision Studio {APP_VERSION}, build {BUILD_ID}")
+        layout_a.addRow(build_label)
         self.start_in_tray_check = QCheckBox("When it starts with Windows, open in the system tray instead of showing the window")
         self.start_in_tray_check.setChecked(str(self.settings.value("start_in_tray", "false")).lower() == "true")
         layout_a.addRow(self.start_in_tray_check)
         self.autoplay_check = QCheckBox("When it starts with Windows, begin playing automatically")
-        self.autoplay_check.setChecked(str(self.settings.value("autoplay_on_boot", "true")).lower() == "true")
+        self.autoplay_check.setChecked(str(self.settings.value("autoplay_on_boot", "false")).lower() == "true")
         layout_a.addRow(self.autoplay_check)
 
         layout_a.addRow(self.live_mix_check)
