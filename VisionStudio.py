@@ -27,8 +27,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QCheckBox, QListWidget, QListWidgetItem, QTableWidget,
                              QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
-                             QAbstractItemView)
-from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent
+                             QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem)
+from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
                                  QAudioSink, QAudioFormat, QAudio, QSoundEffect)
@@ -1295,7 +1295,15 @@ def read_m3u(path):
 
 
 def default_playlist_folder():
-    return os.path.join(os.path.expanduser("~"), "Documents", "VisionStudio", "Playlists")
+    """Documents\\VisionStudio\\Playlists, following the real Documents folder (even if OneDrive moved it)."""
+    documents = ""
+    try:
+        documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+    except Exception:
+        documents = ""
+    if not documents or not isinstance(documents, str):
+        documents = os.path.join(os.path.expanduser("~"), "Documents")
+    return os.path.join(documents, "VisionStudio", "Playlists")
 
 
 class PlaylistGenerator:
@@ -3799,6 +3807,123 @@ class ShortcutsTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# First-run setup wizard: point VisionStudio at every folder before anything starts
+# ---------------------------------------------------------------------------
+
+WIZARD_STEPS = [
+    ("music_library_folder", "Music folder",
+     "Choose the folder that holds your music. Every subfolder inside it becomes its own rotation, "
+     "and a 24 hour schedule is built from them."),
+    (":00", "Top of the hour",
+     "Choose the folder of top of the hour jingles and legal station identification. "
+     "They play at the start of every hour."),
+    (":15", "Quarter past jingles",
+     "Choose the folder of jingles that play at quarter past the hour."),
+    (":30", "Station identifications (half past)",
+     "Choose the folder of station identifications that play at half past the hour."),
+    (":45", "Quarter to jingles",
+     "Choose the folder of jingles that play at quarter to the hour."),
+    ("ad_break_folder", "Commercials",
+     "Choose the folder of commercials. They play between two jingles in the scheduled breaks."),
+]
+
+
+class SetupIntroPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+        self.setTitle("Welcome to Vision Radio setup")
+        label = QLabel("This short setup asks where your music, jingles, station identifications and "
+                       "commercials live. Nothing starts playing until you choose Start Rotation yourself. "
+                       "Every step can be skipped by leaving the folder blank, and you can run this setup "
+                       "again any time from the Settings tab.")
+        label.setWordWrap(True)
+        layout = QVBoxLayout()
+        layout.addWidget(label)
+        self.setLayout(layout)
+
+
+class SetupFolderPage(QWizardPage):
+    def __init__(self, key, title, description, initial=""):
+        super().__init__()
+        self.key = key
+        self.setTitle(title)
+        layout = QVBoxLayout()
+        text = QLabel(description + " Leave it blank to skip this step.")
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        self.edit = QLineEdit(initial)
+        self.edit.setAccessibleName(f"{title} folder path")
+        self.edit.textChanged.connect(lambda _t: self.completeChanged.emit())
+        layout.addWidget(self.edit)
+        browse = QPushButton(f"Browse for {title} Folder")
+        browse.clicked.connect(self.browse)
+        layout.addWidget(browse)
+        self.note = QLabel("")
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+        self.setLayout(layout)
+
+    def browse(self):
+        folder = QFileDialog.getExistingDirectory(self, f"Choose the {self.title()} folder", self.edit.text())
+        if folder:
+            self.edit.setText(folder)
+
+    def path(self):
+        return self.edit.text().strip()
+
+    def isComplete(self):
+        path = self.path()
+        ok = (not path) or os.path.isdir(path)
+        if not path:
+            self.note.setText("")
+        elif ok:
+            self.note.setText(f"{len(scan_audio_files(path))} audio files found, including subfolders.")
+        else:
+            self.note.setText("That folder does not exist. Choose another or clear the box.")
+        return ok
+
+
+class SetupFinishPage(QWizardPage):
+    def __init__(self, wizard, playlist_folder):
+        super().__init__()
+        self.owner = wizard
+        self.playlist_folder = playlist_folder
+        self.setTitle("Ready to finish")
+        self.label = QLabel("")
+        self.label.setWordWrap(True)
+        layout = QVBoxLayout()
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+
+    def initializePage(self):
+        lines = []
+        for key, title, _d in WIZARD_STEPS:
+            path = self.owner.results().get(key, "")
+            lines.append(f"{title}: {path if path else 'not set'}")
+        lines.append(f"Playlists will be saved in: {self.playlist_folder}")
+        lines.append("Choose Finish to save these choices. Nothing starts until you press Start Rotation.")
+        self.label.setText("\n".join(lines))
+
+
+class SetupWizard(QWizard):
+    def __init__(self, parent, current, playlist_folder):
+        super().__init__(parent)
+        self.setWindowTitle("Vision Radio Setup")
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
+        self.addPage(SetupIntroPage())
+        self.folder_pages = []
+        for key, title, description in WIZARD_STEPS:
+            page = SetupFolderPage(key, title, description, current.get(key, ""))
+            self.folder_pages.append(page)
+            self.addPage(page)
+        self.addPage(SetupFinishPage(self, playlist_folder))
+
+    def results(self):
+        return {page.key: page.path() for page in self.folder_pages}
+
+
+
+# ---------------------------------------------------------------------------
 # Main application window
 # ---------------------------------------------------------------------------
 
@@ -3878,7 +4003,7 @@ class BroadcastingApp(QWidget):
         self.check_ffmpeg_availability()
         # Pointing at a music library folder builds one rotation per subfolder.
         root = self.settings.value("music_library_folder", "")
-        if root and os.path.isdir(root):
+        if self.setup_complete() and root and os.path.isdir(root):
             self._rescan_in_progress = True
             try:
                 self.rotation_library.sync_from_root(root)
@@ -3890,6 +4015,9 @@ class BroadcastingApp(QWidget):
         self.setup_shortcuts()
         self.apply_processing_settings()
         self.refresh_queue_list()
+        self.refresh_status_tree()
+        if not self.setup_complete():
+            QTimer.singleShot(400, self.run_setup_wizard)   # first launch: ask for every folder
 
         self.vinyl_timer = QTimer()
         self.vinyl_timer.setInterval(30)
@@ -3998,6 +4126,165 @@ class BroadcastingApp(QWidget):
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(handler)
             self.shortcut_objects.append(shortcut)
+
+    # --- first-run setup wizard ---
+    def setup_complete(self):
+        return str(self.settings.value("setup_complete", "false")).lower() == "true"
+
+    def run_setup_wizard(self):
+        current = {key: self.settings.value(key, "") for key, _t, _d in WIZARD_STEPS}
+        wizard = SetupWizard(self, current, self.playlist_generator.output_folder())
+        if wizard.exec() == QDialog.DialogCode.Accepted:
+            self.apply_setup(wizard.results())
+        elif not self.setup_complete():
+            self.update_status("Setup was not finished. It will ask again next time you open Vision Radio.")
+
+    def apply_setup(self, results):
+        """Saves every folder from the wizard and creates the playlist folder. Never starts playback."""
+        for key, path in results.items():
+            if path:
+                self.settings.setValue(key, path)
+        playlist_folder = self.playlist_generator.output_folder()
+        try:
+            os.makedirs(playlist_folder, exist_ok=True)
+        except OSError as e:
+            self.update_status(f"Could not create the playlist folder: {e}")
+        self.settings.setValue("playlist_output_folder", playlist_folder)
+        self.playlist_folder_label.setText(f"Playlist folder: {playlist_folder}")
+        self.settings.setValue("setup_complete", "true")
+        root = results.get("music_library_folder", "")
+        if root and os.path.isdir(root):
+            self._rescan_in_progress = True
+            try:
+                self.rotation_library.sync_from_root(root)
+            finally:
+                self._rescan_in_progress = False
+            self.rotation_schedule.regenerate_even()
+            self.rotation_library.detect_new_files()
+        self.rotations_tab.refresh()
+        self.schedule_tab.refresh()
+        self.refresh_queue_list()
+        self.analyze_all_imported_folders()
+        self.refresh_status_tree()
+        self.announce("Setup saved. Choose Start Rotation when you are ready to go on air.")
+
+    # --- status tree ---
+    def build_status_tree(self):
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setAccessibleName("Station status tree. Up and Down move between items, Right opens a group, "
+                               "Left closes it.")
+        tree.setMinimumHeight(170)
+        self.status_tree = tree
+        self.status_items = {}
+        self.encoder_tree_items = {}
+        groups = [
+            ("onair", "On Air", [("deck_a", "Deck A"), ("deck_b", "Deck B"),
+                                 ("rotation", "Rotation"), ("break", "Break")]),
+            ("next", "Up Next", [("upnext", "Next track")]),
+            ("time", "Time", [("hour_left", "Left in this hour"), ("elapsed", "Elapsed on the air track"),
+                              ("remaining", "Remaining on the air track")]),
+            ("audio", "Audio", [("mute", "Mute"), ("mic", "Microphone"), ("feed", "Stream feed"),
+                                ("proc", "Processor")]),
+            ("enc", "Encoders", []),
+        ]
+        for group_key, title, children in groups:
+            group = QTreeWidgetItem(tree, [title])
+            self.status_items[group_key] = group
+            for key, label in children:
+                self.status_items[key] = QTreeWidgetItem(group, [label])
+            group.setExpanded(True)
+        tree.setCurrentItem(self.status_items["onair"])
+        return tree
+
+    def _set_tree(self, key, text):
+        item = self.status_items.get(key)
+        if item is not None and item.text(0) != text:
+            item.setText(0, text)
+
+    @staticmethod
+    def _track_text(path):
+        if not path:
+            return ""
+        if path not in _QUEUE_TEXT_CACHE:
+            try:
+                _QUEUE_TEXT_CACHE[path] = format_track_display(path)
+            except Exception:
+                _QUEUE_TEXT_CACHE[path] = os.path.splitext(os.path.basename(path))[0]
+        return _QUEUE_TEXT_CACHE[path]
+
+    def refresh_status_tree(self):
+        if not hasattr(self, "status_tree"):
+            return
+        rot = self.rotation
+        for name, deck in (("A", rot.deck_a), ("B", rot.deck_b)):
+            path = deck.current_track_path
+            if not path:
+                text = f"Deck {name}: empty"
+            else:
+                playing = deck.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                if name == rot.live_deck_name and playing:
+                    state = "ON AIR"
+                elif playing:
+                    state = "fading out"
+                elif name == rot.live_deck_name:
+                    state = "on air, paused"
+                else:
+                    state = "cued"
+                text = f"Deck {name}: {self._track_text(path)}, {state}"
+            self._set_tree("deck_" + name.lower(), text)
+        self._set_tree("rotation", f"Rotation: {rot.active_rotation_name() or 'none'}"
+                       + (", running" if rot.is_running else ", stopped"))
+        if rot.is_paused_for_sequence:
+            break_text = "Break: playing now"
+        elif rot.break_target is not None:
+            seconds = max(0, int((rot.break_target - datetime.now()).total_seconds()))
+            break_text = f"Break: {rot.break_slot} armed, {speak_duration(seconds)} to the mark"
+        else:
+            break_text = "Break: none pending"
+        self._set_tree("break", break_text)
+        upcoming = rot.get_upcoming_track_path()
+        self._set_tree("upnext", f"Next track: {self._track_text(upcoming)}" if upcoming else "Next track: none")
+        now = datetime.now()
+        self._set_tree("hour_left", f"Left in this hour: {speak_duration(3600 - (now.minute * 60 + now.second))}")
+        live = rot.get_live_deck()
+        if live.current_track_path and live.player.duration() > 0:
+            elapsed = int(live.player.position() / 5000) * 5
+            remaining = int(max(0, live.player.duration() - live.player.position()) / 5000) * 5
+            self._set_tree("elapsed", f"Elapsed on the air track: about {speak_duration(elapsed)}")
+            self._set_tree("remaining", f"Remaining on the air track: about {speak_duration(remaining)}")
+        else:
+            self._set_tree("elapsed", "Elapsed on the air track: nothing playing")
+            self._set_tree("remaining", "Remaining on the air track: nothing playing")
+        self._set_tree("mute", "Mute: ON" if self.is_muted else "Mute: off")
+        self._set_tree("mic", self.console_mic_label.text().rstrip("."))
+        self._set_tree("feed", self.console_feed_label.text().rstrip("."))
+        master = self.mixer.master_processor
+        if master is not None and master.enabled and self.mixer.available:
+            self._set_tree("proc", f"Processor: on, {master.preset_name} preset")
+        else:
+            self._set_tree("proc", "Processor: off")
+        # one child per encoder
+        group = self.status_items["enc"]
+        slots = list(self.encoder_bank.slots)
+        for slot in list(self.encoder_tree_items):
+            if slot not in slots:
+                group.removeChild(self.encoder_tree_items.pop(slot))
+        for slot in slots:
+            item = self.encoder_tree_items.get(slot)
+            if item is None:
+                item = QTreeWidgetItem(group, [""])
+                self.encoder_tree_items[slot] = item
+                group.setExpanded(True)
+            state = {"live": "LIVE", "connecting": "connecting"}.get(slot.state, "offline")
+            problem = self.encoder_problems.get(slot)
+            text = f"{slot.stream_name}: {state}" + (f", problem: {problem}" if problem else "")
+            if item.text(0) != text:
+                item.setText(0, text)
+        if not slots:
+            self._set_tree("enc", "Encoders (none set up)")
+        elif group.text(0) != "Encoders":
+            group.setText(0, "Encoders")
 
     # --- shortcut actions ---
     def open_options(self):
@@ -4139,6 +4426,8 @@ class BroadcastingApp(QWidget):
 
     def rescan_library(self):
         """Picks up new songs and new subfolders without rebuilding the schedule."""
+        if not self.setup_complete():
+            return
         root = self.settings.value("music_library_folder", "")
         self._rescan_in_progress = True
         try:
@@ -4164,6 +4453,7 @@ class BroadcastingApp(QWidget):
         try:
             hour = datetime.now().hour
             self.rotation.check_rotation_for_hour()
+            self.refresh_status_tree()
             if hour != self.last_schedule_hour:
                 self.last_schedule_hour = hour
                 self.schedule_tab.refresh()
@@ -4484,6 +4774,11 @@ class BroadcastingApp(QWidget):
         rotation_btn_row.addWidget(stop_rotation_btn)
         layout_r.addLayout(rotation_btn_row)
 
+        tree_label = QLabel("Station status (keyboard tree)")
+        tree_label.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
+        layout_r.addWidget(tree_label)
+        layout_r.addWidget(self.build_status_tree())
+
         self.queue_label = QLabel("Queue")
         self.queue_label.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
         layout_r.addWidget(self.queue_label)
@@ -4616,6 +4911,11 @@ class BroadcastingApp(QWidget):
         self.playlist_autoload_check = QCheckBox("Load each hour's playlist into the queue when the hour starts")
         self.playlist_autoload_check.setChecked(str(self.settings.value("playlist_autoload", "false")).lower() == "true")
         layout_a.addRow(self.playlist_autoload_check)
+
+        wizard_btn = QPushButton("Run Setup Wizard Again")
+        wizard_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        wizard_btn.clicked.connect(self.run_setup_wizard)
+        layout_a.addRow(wizard_btn)
 
         generate_btn = QPushButton("Generate Playlists Now (Ctrl+Shift+G)")
         generate_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)

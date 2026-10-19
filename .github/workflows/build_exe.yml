@@ -41,3 +41,21 @@ jobs:
         with:
           name: VisionStudio-App
           path: dist/VisionStudio.exe
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { throw "Inno Setup was not installed" }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" VisionStudio.iss
+          Get-ChildItem installer
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionStudio-Installer
+          path: installer/VisionStudioSetup.exe
