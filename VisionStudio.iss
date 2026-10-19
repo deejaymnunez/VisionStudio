@@ -44,6 +44,8 @@ Name: "{app}\Playlists"; Permissions: users-modify
 Name: "{app}\Logs"; Permissions: users-modify
 ; Voice tracks recorded in the queue are saved here.
 Name: "{app}\VoiceTracks"; Permissions: users-modify
+; Live-show recordings (MP3 plus optional cue sheet) are saved here unless another folder is chosen in Settings.
+Name: "{app}\Recordings"; Permissions: users-modify
 ; Keyboard layout files (Station Playlist, other automation systems) are kept here.
 Name: "{app}\Layouts"; Permissions: users-modify
 

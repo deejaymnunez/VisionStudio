@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
                              QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
-                             QMenuBar, QMenu, QSystemTrayIcon)
+                             QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget)
 from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
@@ -117,6 +117,18 @@ def get_voice_folder():
     return tempfile.gettempdir()
 
 
+def get_recordings_folder():
+    """Live-show recordings are saved here by default, next to Logs and Playlists."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "Recordings")
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Recordings")
+    if _writable_dir(fallback):
+        return fallback
+    return tempfile.gettempdir()
+
+
 # --- Start with Windows (current user, no administrator rights needed) ---
 AUTOSTART_VALUE_NAME = "VisionStudio"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -187,7 +199,7 @@ def get_layouts_folder():
 
 
 APP_VERSION = "2.0"
-BUILD_ID = "2026-10-19.12"      # changes with every delivery; written to the first log line and shown in Settings
+BUILD_ID = "2026-10-19.13"      # changes with every delivery; written to the first log line and shown in Settings
 
 
 class RunLog:
@@ -1733,7 +1745,8 @@ DEFAULT_SHORTCUTS = [
     ("start_rotation", "Automation on", "Ctrl+Return", True),
     ("stop_rotation", "Stop everything at once", "Ctrl+Shift+S", True),
     ("mute_all", "Mute or unmute all audio", "Ctrl+Shift+U", True),
-    ("open_options", "Open Options (Settings tab)", "Ctrl+O", True),
+    ("open_options", "Open or close Settings", "Ctrl+O", True),
+    ("toggle_recording", "Start or stop recording", "R", True),
     ("new_item", "New rotation, category or hour marker (depends on the tab)", "Ctrl+N", True),
     ("generate_now", "Generate playlists now", "Ctrl+Shift+G", True),
     ("say_elapsed", "Announce elapsed time of the current track", "Alt+Shift+T", True),
@@ -4956,6 +4969,788 @@ class SetupWizard(QWizard):
         return {page.key: page.path() for page in self.folder_pages}
 
 
+# ---------------------------------------------------------------------------
+# Tagging: fills in missing licensing tags (album, record label, ISRC) from MusicBrainz, using the
+# artist and title already in the file. No account is needed. Existing tags are never changed.
+# ---------------------------------------------------------------------------
+
+LICENSE_FIELDS = ("artist", "title", "album", "label", "isrc")
+TAG_MIN_SCORE = 95                      # MusicBrainz search score needed before a match is trusted
+TAG_REQUEST_GAP_SECONDS = 1.1           # MusicBrainz asks for no more than one request per second
+MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2/"
+
+
+def tag_checked_path():
+    return os.path.join(get_logs_folder(), "tag_checked.json")
+
+
+def _first(values):
+    if isinstance(values, (list, tuple)):
+        return str(values[0]).strip() if values else ""
+    return str(values).strip() if values is not None else ""
+
+
+def read_licensing_tags(path):
+    """Artist, title, album, record label and ISRC as stored in the file (blank when missing)."""
+    tags = {key: "" for key in LICENSE_FIELDS}
+    tags["year"] = ""
+    if not (MUTAGEN_AVAILABLE and path and os.path.isfile(path)):
+        return tags
+    try:
+        audio = mutagen.File(path, easy=True)
+        easy = audio.tags if audio is not None else None
+        if easy:
+            tags["artist"] = _first(easy.get("artist"))
+            tags["title"] = _first(easy.get("title"))
+            tags["album"] = _first(easy.get("album"))
+            tags["isrc"] = _first(easy.get("isrc"))
+            tags["label"] = _first(easy.get("organization")) or _first(easy.get("label"))
+            tags["year"] = _first(easy.get("date"))
+    except Exception:
+        pass
+    if path.lower().endswith((".m4a", ".mp4", ".aac")):
+        try:
+            from mutagen.mp4 import MP4 as _MP4
+            mp4 = _MP4(path)
+            for key, atom in (("label", "----:com.apple.iTunes:LABEL"), ("isrc", "----:com.apple.iTunes:ISRC")):
+                if not tags[key] and atom in (mp4.tags or {}):
+                    raw = mp4.tags[atom][0]
+                    tags[key] = (raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)).strip()
+        except Exception:
+            pass
+    return tags
+
+
+def tags_complete(tags):
+    return all(tags.get(key) for key in LICENSE_FIELDS)
+
+
+def _normal(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+_last_request = [0.0]
+
+
+def _musicbrainz_get(path_and_query):
+    wait = TAG_REQUEST_GAP_SECONDS - (time.monotonic() - _last_request[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_request[0] = time.monotonic()
+    request = urllib.request.Request(
+        MUSICBRAINZ_URL + path_and_query,
+        headers={"User-Agent": f"VisionStudio/{APP_VERSION} (https://github.com/deejaymnunez/VisionStudio)",
+                 "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def lookup_musicbrainz(artist, title, album=""):
+    """Returns {'album','label','isrc','year'} for a confident match, or None. Raises on network errors."""
+    query = f'recording:"{title}" AND artist:"{artist}"'
+    data = _musicbrainz_get("recording/?" + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": 5}))
+    best = None
+    for rec in data.get("recordings", []):
+        try:
+            score = int(rec.get("score", 0))
+        except Exception:
+            score = 0
+        if score < TAG_MIN_SCORE or _normal(rec.get("title")) != _normal(title):
+            continue
+        credit = " ".join(str(c.get("name", "")) + str(c.get("joinphrase", ""))
+                          for c in rec.get("artist-credit", []) if isinstance(c, dict))
+        if _normal(credit) != _normal(artist) and _normal(artist) not in _normal(credit):
+            continue
+        best = rec
+        break
+    if best is None:
+        return None
+    result = {"album": "", "label": "", "isrc": "", "year": ""}
+    isrcs = best.get("isrcs") or []
+    if isrcs:
+        first = isrcs[0]
+        result["isrc"] = (first.get("id", "") if isinstance(first, dict) else str(first)).strip()
+    releases = best.get("releases") or []
+    chosen = None
+    if album:
+        for rel in releases:
+            if _normal(rel.get("title")) == _normal(album):
+                chosen = rel
+                break
+    if chosen is None:
+        official = [r for r in releases if str(r.get("status", "")).lower() == "official"]
+        chosen = (official or releases or [None])[0]
+    if chosen is not None:
+        result["album"] = str(chosen.get("title", "")).strip()
+        result["year"] = str(chosen.get("date", ""))[:4]
+        try:
+            rel_data = _musicbrainz_get(f"release/{chosen['id']}?" + urllib.parse.urlencode({"inc": "labels", "fmt": "json"}))
+            for info in rel_data.get("label-info", []):
+                name = (info.get("label") or {}).get("name", "")
+                if name:
+                    result["label"] = str(name).strip()
+                    break
+        except Exception:
+            pass
+    if not result["isrc"] and best.get("id"):
+        try:
+            rec_data = _musicbrainz_get(f"recording/{best['id']}?" + urllib.parse.urlencode({"inc": "isrcs", "fmt": "json"}))
+            codes = rec_data.get("isrcs") or []
+            if codes:
+                result["isrc"] = str(codes[0]).strip()
+        except Exception:
+            pass
+    return result
+
+
+def write_missing_tags(path, values):
+    """Writes only the fields in `values` (callers pass blanks only). Returns the list of fields written."""
+    values = {k: v for k, v in values.items() if v}
+    if not values or not MUTAGEN_AVAILABLE:
+        return []
+    ext = os.path.splitext(path)[1].lower()
+    written = []
+    if ext == ".mp3":
+        from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TIT2, TALB, TPUB, TSRC, TDRC
+        try:
+            id3 = ID3(path)
+        except ID3NoHeaderError:
+            id3 = ID3()
+        frames = {"artist": TPE1, "title": TIT2, "album": TALB, "label": TPUB, "isrc": TSRC, "year": TDRC}
+        for key, cls in frames.items():
+            if values.get(key):
+                id3.add(cls(encoding=3, text=[values[key]]))
+                written.append(key)
+        if written:
+            id3.save(path, v2_version=3)
+    elif ext in (".flac", ".ogg", ".opus"):
+        audio = mutagen.File(path)
+        if audio is None:
+            return []
+        names = {"artist": "artist", "title": "title", "album": "album", "label": "label", "isrc": "isrc", "year": "date"}
+        for key, name in names.items():
+            if values.get(key):
+                audio[name] = [values[key]]
+                written.append(key)
+        if written:
+            audio.save()
+    elif ext in (".m4a", ".mp4", ".aac"):
+        from mutagen.mp4 import MP4 as _MP4, MP4FreeForm
+        mp4 = _MP4(path)
+        if mp4.tags is None:
+            mp4.add_tags()
+        atoms = {"artist": "\xa9ART", "title": "\xa9nam", "album": "\xa9alb", "year": "\xa9day"}
+        for key, atom in atoms.items():
+            if values.get(key):
+                mp4.tags[atom] = [values[key]]
+                written.append(key)
+        for key, atom in (("label", "----:com.apple.iTunes:LABEL"), ("isrc", "----:com.apple.iTunes:ISRC")):
+            if values.get(key):
+                mp4.tags[atom] = [MP4FreeForm(values[key].encode("utf-8"))]
+                written.append(key)
+        if written:
+            mp4.save()
+    return written
+
+
+def tag_one_file(path, lookup=lookup_musicbrainz, writer=write_missing_tags):
+    """Returns (status, detail). Statuses: complete, no_tags, no_match, tagged, nothing_new, error."""
+    tags = read_licensing_tags(path)
+    if tags_complete(tags):
+        return "complete", ""
+    if not (tags["artist"] and tags["title"]):
+        return "no_tags", "needs an artist and title in the file first"
+    try:
+        found = lookup(tags["artist"], tags["title"], tags["album"])
+    except Exception as e:
+        return "error", f"lookup failed: {e}"
+    if not found:
+        return "no_match", ""
+    fill = {key: found.get(key, "") for key in ("album", "label", "isrc") if not tags.get(key)}
+    if not tags.get("year") and found.get("year"):
+        fill["year"] = found["year"]
+    fill = {k: v for k, v in fill.items() if v}
+    if not fill:
+        return "nothing_new", ""
+    try:
+        written = writer(path, fill)
+    except Exception as e:
+        return "error", f"could not write tags: {e}"
+    return ("tagged", ", ".join(written)) if written else ("nothing_new", "")
+
+
+class LibraryTagger(QObject):
+    """Walks the music library on a background thread and fills in missing tags. Safe to stop and
+    start again: files that were checked and have not changed are not looked up twice."""
+
+    progress = pyqtSignal(str)
+    finished_scan = pyqtSignal(str)
+
+    def __init__(self, busy_paths=None, lookup=lookup_musicbrainz, writer=write_missing_tags):
+        super().__init__()
+        self.busy_paths = busy_paths or (lambda: set())
+        self.lookup = lookup
+        self.writer = writer
+        self.thread = None
+        self.stop_flag = threading.Event()
+        self.running = False
+
+    def start(self, folder):
+        if self.running or not folder or not os.path.isdir(folder):
+            return False
+        if not MUTAGEN_AVAILABLE:
+            self.progress.emit("Tagging needs the mutagen library, which was not found.")
+            return False
+        self.stop_flag.clear()
+        self.running = True
+        self.thread = threading.Thread(target=self._run, args=(folder,), daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.stop_flag.set()
+
+    def _load_checked(self):
+        try:
+            with open(tag_checked_path(), "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return {}
+
+    def _save_checked(self, checked):
+        try:
+            with open(tag_checked_path(), "w", encoding="utf-8") as handle:
+                json.dump(checked, handle)
+        except Exception:
+            pass
+
+    def _run(self, folder):
+        counts = {"complete": 0, "tagged": 0, "no_match": 0, "no_tags": 0, "nothing_new": 0, "error": 0, "skipped": 0}
+        checked = self._load_checked()
+        files = []
+        try:
+            for root, _dirs, names in os.walk(folder):
+                for name in names:
+                    if name.lower().endswith(SUPPORTED_AUDIO):
+                        files.append(os.path.join(root, name))
+        except Exception:
+            pass
+        total = len(files)
+        network_failures = 0
+        for number, path in enumerate(files, 1):
+            if self.stop_flag.is_set():
+                break
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if checked.get(path) == mtime:
+                counts["skipped"] += 1
+                continue
+            if path in self.busy_paths():
+                counts["skipped"] += 1
+                continue
+            status, detail = tag_one_file(path, self.lookup, self.writer)
+            counts[status] = counts.get(status, 0) + 1
+            if status == "tagged":
+                RUN_LOG.write("TAG", f"{os.path.basename(path)}: added {detail}")
+                try:
+                    checked[path] = os.path.getmtime(path)
+                except OSError:
+                    pass
+            elif status in ("complete", "no_match", "no_tags", "nothing_new"):
+                checked[path] = mtime
+            elif status == "error":
+                network_failures += 1
+                if network_failures >= 5:
+                    self.progress.emit("Tagging stopped: the lookup service could not be reached.")
+                    break
+            if number % 25 == 0 or status == "tagged":
+                self.progress.emit(f"Tagging: checked {number} of {total} files, {counts['tagged']} updated.")
+                self._save_checked(checked)
+        self._save_checked(checked)
+        summary = (f"Tagging finished: {counts['tagged']} files updated, {counts['complete']} already complete, "
+                   f"{counts['no_match']} not found in the database, {counts['no_tags']} without an artist and title, "
+                   f"{counts['error']} errors.")
+        if self.stop_flag.is_set():
+            summary = "Tagging stopped. " + summary
+        RUN_LOG.write("TAG", summary)
+        self.running = False
+        self.finished_scan.emit(summary)
+
+
+# ---------------------------------------------------------------------------
+# Live-show recording: the program mix is written to one MP3 (128 or 320 kbps), with an optional
+# cue sheet (.cue) and a licensing list (.csv) listing artist, title, album, label and ISRC.
+# ---------------------------------------------------------------------------
+
+RECORD_BITRATES = (128, 320)
+
+
+def cue_timestamp(seconds):
+    """mm:ss:ff where ff is 75ths of a second, as cue sheets require."""
+    seconds = max(0.0, float(seconds))
+    total_frames = int(seconds * 75)
+    minutes, rest = divmod(total_frames, 75 * 60)
+    secs, frames = divmod(rest, 75)
+    return f"{minutes:02d}:{secs:02d}:{frames:02d}"
+
+
+def clock_timestamp(seconds):
+    seconds = int(max(0.0, float(seconds)))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
+def _cue_text(text):
+    return str(text or "").replace('"', "'")
+
+
+def build_cue_sheet(mp3_name, entries, show_title="Vision Studio recording"):
+    """entries: list of dicts with start (seconds), kind ('music' or 'other'), artist, title, album,
+    label, isrc. Non-music items are written as labeled tracks so the times line up with the file."""
+    lines = [f'REM GENERATOR "Vision Studio {APP_VERSION}"',
+             f'TITLE "{_cue_text(show_title)}"',
+             f'FILE "{_cue_text(mp3_name)}" MP3']
+    for number, entry in enumerate(entries, 1):
+        lines.append(f"  TRACK {number:02d} AUDIO")
+        if entry.get("kind") == "music":
+            lines.append(f'    TITLE "{_cue_text(entry.get("title"))}"')
+            lines.append(f'    PERFORMER "{_cue_text(entry.get("artist"))}"')
+            lines.append(f'    REM ALBUM "{_cue_text(entry.get("album"))}"')
+            if entry.get("label"):
+                lines.append(f'    REM LABEL "{_cue_text(entry.get("label"))}"')
+            isrc = re.sub(r"[^A-Za-z0-9]", "", str(entry.get("isrc") or "")).upper()
+            if len(isrc) == 12:
+                lines.append(f"    ISRC {isrc}")
+            elif isrc:
+                lines.append(f'    REM ISRC "{isrc}"')
+        else:
+            lines.append(f'    TITLE "{_cue_text(entry.get("title"))}"')
+            lines.append('    REM TYPE "not music"')
+        lines.append(f"    INDEX 01 {cue_timestamp(entry.get('start', 0))}")
+    return "\n".join(lines) + "\n"
+
+
+def build_licensing_csv(entries):
+    import csv
+    import io
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(["Start", "Type", "Artist", "Title", "Album", "Record label", "ISRC"])
+    for entry in entries:
+        writer.writerow([clock_timestamp(entry.get("start", 0)),
+                         "music" if entry.get("kind") == "music" else "not music",
+                         entry.get("artist", ""), entry.get("title", ""), entry.get("album", ""),
+                         entry.get("label", ""), entry.get("isrc", "")])
+    return buffer.getvalue()
+
+
+class ProgramRecorder(QObject):
+    """Records whatever the stream mixer is producing. It is fed by the mixer like an encoder is."""
+
+    message = pyqtSignal(str)
+    state_changed = pyqtSignal(bool)
+
+    def __init__(self, settings):
+        super().__init__()
+        self.settings = settings
+        self.mixer = None
+        self.process = None
+        self.feed_queue = None
+        self.writer_thread = None
+        self.stderr_tail = deque(maxlen=6)
+        self.recording = False
+        self.started_by_schedule = False
+        self.started_at = 0.0
+        self.entries = []
+        self.mp3_path = ""
+        self.cue_on = False
+
+    # --- settings ---
+    def bitrate(self):
+        try:
+            value = int(float(self.settings.value("record_bitrate", 0)))
+        except Exception:
+            value = 0
+        return value if value in RECORD_BITRATES else 0
+
+    def cue_enabled(self):
+        return str(self.settings.value("record_cue", "false")).lower() == "true"
+
+    def folder(self):
+        chosen = str(self.settings.value("recordings_folder", "") or "").strip()
+        return chosen or get_recordings_folder()
+
+    def setup_done(self):
+        return str(self.settings.value("record_setup_done", "false")).lower() == "true" and self.bitrate() != 0
+
+    # --- command line ---
+    def build_command(self, mp3_path, bitrate):
+        return [get_ffmpeg_path(), "-hide_banner", "-loglevel", "warning", "-y",
+                "-f", "s16le", "-ar", str(STREAM_SAMPLE_RATE), "-ac", str(STREAM_CHANNELS), "-i", "pipe:0",
+                "-vn", "-acodec", "libmp3lame", "-b:a", f"{bitrate}k",
+                "-ar", str(STREAM_SAMPLE_RATE), "-ac", str(STREAM_CHANNELS),
+                "-id3v2_version", "3", "-metadata", f"title=Vision Studio recording {time.strftime('%Y-%m-%d %H:%M')}",
+                "-f", "mp3", mp3_path]
+
+    # --- start / stop ---
+    def start(self, mixer, current_meta=None, by_schedule=False, current_path=None):
+        """Returns (ok, message)."""
+        if self.recording:
+            return True, "Already recording."
+        bitrate = self.bitrate()
+        if not bitrate:
+            return False, "Choose a recording bitrate first."
+        if mixer is None or not mixer.available:
+            reason = mixer.unavailable_reason() if mixer is not None else "no mixer"
+            return False, f"Recording needs the live mix, which is unavailable ({reason})."
+        folder = self.folder()
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            return False, f"The recordings folder cannot be used: {e}"
+        base = time.strftime("Recording_%Y-%m-%d_%H%M%S")
+        self.mp3_path = os.path.join(folder, base + ".mp3")
+        copy = 2
+        while os.path.exists(self.mp3_path):
+            self.mp3_path = os.path.join(folder, f"{base}_{copy}.mp3")
+            copy += 1
+        try:
+            self.process = subprocess.Popen(
+                self.build_command(self.mp3_path, bitrate), stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=SUBPROCESS_FLAGS)
+        except FileNotFoundError:
+            self.process = None
+            return False, "Recording cannot start: ffmpeg was not found."
+        except Exception as e:
+            self.process = None
+            return False, f"Recording cannot start: {e}"
+        self.stderr_tail.clear()
+        threading.Thread(target=self._drain_stderr, args=(self.process,), daemon=True).start()
+        self.feed_queue = queue.Queue(maxsize=400)
+        self.writer_thread = threading.Thread(target=self._writer_loop, args=(self.process, self.feed_queue), daemon=True)
+        self.writer_thread.start()
+        self.entries = []
+        self.cue_on = self.cue_enabled()
+        self.started_at = time.monotonic()
+        self.started_by_schedule = by_schedule
+        self.recording = True
+        self.mixer = mixer
+        mixer.register_encoder(self)
+        if current_meta:
+            self.note_track(current_meta, current_path)
+        self.state_changed.emit(True)
+        RUN_LOG.write("RECORD", f"Recording started at {bitrate} kbps: {self.mp3_path}")
+        return True, f"Recording started at {bitrate} kbps."
+
+    def _drain_stderr(self, proc):
+        try:
+            for line in iter(proc.stderr.readline, b""):
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    self.stderr_tail.append(text)
+        except Exception:
+            pass
+
+    def _writer_loop(self, proc, feed_queue):
+        try:
+            while True:
+                data = feed_queue.get()
+                if data is None:
+                    break
+                proc.stdin.write(data)
+        except Exception:
+            pass
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+    def feed(self, data):
+        """Called by the mixer with 20 ms of program audio."""
+        queue_ = self.feed_queue
+        if queue_ is None:
+            return
+        try:
+            queue_.put_nowait(data)
+        except queue.Full:
+            pass
+
+    def elapsed(self):
+        return time.monotonic() - self.started_at if self.recording else 0.0
+
+    def stop(self, wait=False):
+        """Finishes the file cleanly. With wait=True the call returns once ffmpeg has closed it."""
+        if not self.recording:
+            return ""
+        self.recording = False
+        mixer, self.mixer = self.mixer, None
+        if mixer is not None:
+            try:
+                mixer.unregister_encoder(self)
+            except Exception:
+                pass
+        proc, feed_queue, writer = self.process, self.feed_queue, self.writer_thread
+        self.process = self.feed_queue = self.writer_thread = None
+        path = self.mp3_path
+        try:
+            feed_queue.put(None, timeout=1)
+        except Exception:
+            pass
+        self.write_cue_files()
+
+        def finalize():
+            try:
+                if writer is not None:
+                    writer.join(timeout=15)
+                if proc is not None:
+                    try:
+                        proc.wait(timeout=20)
+                    except Exception:
+                        proc.kill()
+            except Exception:
+                pass
+
+        if wait:
+            finalize()
+        else:
+            threading.Thread(target=finalize, daemon=True).start()
+        self.state_changed.emit(False)
+        RUN_LOG.write("RECORD", f"Recording stopped: {path}")
+        return path
+
+    # --- cue sheet ---
+    def note_track(self, meta, path=None):
+        """Called when a song starts on air."""
+        if not self.recording:
+            return
+        tags = read_licensing_tags(path) if path else {}
+        entry = {"start": self.elapsed(), "kind": "music",
+                 "artist": meta.get("artist") or tags.get("artist", ""),
+                 "title": meta.get("title") or tags.get("title", ""),
+                 "album": meta.get("album") or tags.get("album", ""),
+                 "label": tags.get("label", ""), "isrc": tags.get("isrc", "")}
+        self.entries.append(entry)
+        self.write_cue_files()
+
+    def note_other(self, label):
+        """Called when a jingle, commercial or voice break starts."""
+        if not self.recording:
+            return
+        self.entries.append({"start": self.elapsed(), "kind": "other", "title": label})
+        self.write_cue_files()
+
+    def write_cue_files(self):
+        if not self.cue_on or not self.mp3_path:
+            return
+        base = os.path.splitext(self.mp3_path)[0]
+        try:
+            with open(base + ".cue", "w", encoding="utf-8") as handle:
+                handle.write(build_cue_sheet(os.path.basename(self.mp3_path), self.entries))
+            with open(base + ".csv", "w", encoding="utf-8-sig", newline="") as handle:
+                handle.write(build_licensing_csv(self.entries))
+        except OSError as e:
+            self.message.emit(f"The cue sheet could not be written: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Live-show recording times (entirely optional; the list is empty until you add a show)
+# ---------------------------------------------------------------------------
+
+WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def parse_clock(text):
+    match = re.fullmatch(r"\s*(\d{1,2}):?(\d{2})\s*", str(text))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def load_show_times(settings):
+    try:
+        data = json.loads(str(settings.value("record_shows", "[]")))
+    except Exception:
+        return []
+    shows = []
+    for item in data if isinstance(data, list) else []:
+        try:
+            start, end = parse_clock(item["start"]), parse_clock(item["end"])
+            days = [int(d) for d in item.get("days", [])]
+            if start is None or end is None or not days or start == end:
+                continue
+            shows.append({"name": str(item.get("name", "Live show")), "days": days,
+                          "start": start, "end": end, "enabled": bool(item.get("enabled", True))})
+        except Exception:
+            continue
+    return shows
+
+
+def save_show_times(settings, shows):
+    def clock(minutes):
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    settings.setValue("record_shows", json.dumps(
+        [{"name": s["name"], "days": s["days"], "start": clock(s["start"]), "end": clock(s["end"]),
+          "enabled": s.get("enabled", True)} for s in shows]))
+
+
+def active_show(shows, now):
+    """The show whose time window contains `now`, as (index, window_key), or None. Windows that run past
+    midnight belong to the day they started on."""
+    minutes = now.hour * 60 + now.minute
+    weekday = now.weekday()
+    for index, show in enumerate(shows):
+        if not show.get("enabled", True):
+            continue
+        if show["start"] < show["end"]:
+            if weekday in show["days"] and show["start"] <= minutes < show["end"]:
+                return index, f"{index}:{now.date()}"
+        else:
+            if weekday in show["days"] and minutes >= show["start"]:
+                return index, f"{index}:{now.date()}"
+            if (weekday - 1) % 7 in show["days"] and minutes < show["end"]:
+                return index, f"{index}:{(now - timedelta(days=1)).date()}"
+    return None
+
+
+class ShowRecordingController:
+    """Decides, once every few seconds, whether the schedule wants recording on or off. Pressing R
+    during a show wins: the schedule will not start that same show again."""
+
+    def __init__(self):
+        self.suppressed_window = None
+        self.schedule_window = None
+
+    def decide(self, shows, now, recording, started_by_schedule):
+        active = active_show(shows, now)
+        key = active[1] if active else None
+        if self.schedule_window and key != self.schedule_window:
+            self.schedule_window = None
+        if not recording:
+            if key and key != self.suppressed_window:
+                self.schedule_window = key
+                return "start", shows[active[0]]["name"]
+            if not key:
+                self.suppressed_window = None
+            return None, ""
+        if started_by_schedule and not key:
+            return "stop", ""
+        return None, ""
+
+    def user_stopped(self, current_key=None):
+        """R was pressed to stop during a scheduled window: the schedule leaves that show alone."""
+        key = current_key or self.schedule_window
+        if key:
+            self.suppressed_window = key
+
+
+class FirstRecordingSetupDialog(QDialog):
+    """Asked once, before the first recording: bitrate, and whether to write a cue sheet."""
+
+    def __init__(self, parent, bitrate=128, cue=False):
+        super().__init__(parent)
+        self.setWindowTitle("Recording setup")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        intro = QLabel("Before the first recording, choose how recordings are made. You can change these "
+                       "later in Settings, in the Recording section.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.bitrate_combo = QComboBox()
+        self.bitrate_combo.setAccessibleName("Recording bitrate")
+        self.bitrate_combo.addItem("128 kbps (smaller files)", 128)
+        self.bitrate_combo.addItem("320 kbps (best quality, for podcast platforms)", 320)
+        self.bitrate_combo.setCurrentIndex(1 if int(bitrate) == 320 else 0)
+        form.addRow("Bitrate:", self.bitrate_combo)
+        layout.addLayout(form)
+        self.cue_check = QCheckBox("Write a cue sheet (artist, title, album, label and ISRC for each song)")
+        self.cue_check.setChecked(bool(cue))
+        layout.addWidget(self.cue_check)
+        buttons = QHBoxLayout()
+        ok = QPushButton("Save And Continue")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def chosen_bitrate(self):
+        return int(self.bitrate_combo.currentData())
+
+    def chosen_cue(self):
+        return self.cue_check.isChecked()
+
+
+class ShowTimeDialog(QDialog):
+    """Adds one live show: a name, the days it airs, and when recording starts and stops."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Add a live show")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        self.name_edit = QLineEdit("Live show")
+        self.name_edit.setAccessibleName("Show name")
+        form.addRow("Show name:", self.name_edit)
+        self.start_edit = QLineEdit("20:00")
+        self.start_edit.setAccessibleName("Recording starts at, hours and minutes, 24 hour clock")
+        form.addRow("Start recording at (HH:MM):", self.start_edit)
+        self.end_edit = QLineEdit("22:00")
+        self.end_edit.setAccessibleName("Recording stops at, hours and minutes, 24 hour clock")
+        form.addRow("Stop recording at (HH:MM):", self.end_edit)
+        layout.addLayout(form)
+        self.day_checks = []
+        for number, name in enumerate(WEEKDAY_NAMES):
+            check = QCheckBox(name)
+            check.setChecked(number < 5)
+            self.day_checks.append(check)
+            layout.addWidget(check)
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        ok = QPushButton("Add Show")
+        ok.setDefault(True)
+        ok.clicked.connect(self.try_accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def try_accept(self):
+        start, end = parse_clock(self.start_edit.text()), parse_clock(self.end_edit.text())
+        if start is None or end is None or start == end:
+            self.error_label.setText("Enter two different times like 20:00 and 22:00.")
+            return
+        if not any(c.isChecked() for c in self.day_checks):
+            self.error_label.setText("Choose at least one day.")
+            return
+        self.accept()
+
+    def show_entry(self):
+        return {"name": self.name_edit.text().strip() or "Live show",
+                "days": [i for i, c in enumerate(self.day_checks) if c.isChecked()],
+                "start": parse_clock(self.start_edit.text()), "end": parse_clock(self.end_edit.text()),
+                "enabled": True}
+
+
+def describe_show(show):
+    def clock(minutes):
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    days = ", ".join(WEEKDAY_NAMES[d][:3] for d in sorted(show["days"]))
+    return f"{show['name']}: {days}, {clock(show['start'])} to {clock(show['end'])}"
+
+
 
 # ---------------------------------------------------------------------------
 # Main application window
@@ -5036,6 +5831,15 @@ class BroadcastingApp(QWidget):
             self.mixer, self.on_encoder_state_changed
         )
         RUN_LOG.write("START", "Step 5: encoders ready.")
+        self.recorder = ProgramRecorder(self.settings)
+        self.recorder.message.connect(self.update_status)
+        self.recorder.state_changed.connect(self.on_recording_state_changed)
+        self.show_controller = ShowRecordingController()
+        self._seq_was_active = False
+        self._vt_recording = False
+        self.tagger = LibraryTagger(busy_paths=self.decks_busy_paths)
+        self.tagger.progress.connect(self.on_tagging_progress)
+        self.tagger.finished_scan.connect(self.on_tagging_finished)
         self.microphone = MicrophoneEngine(
             self.settings, self.update_status, self.on_mic_started, self.on_mic_stopped,
             self.on_mic_failed, self.on_mic_audio_chunk, self.on_mic_signal_changed
@@ -5108,6 +5912,17 @@ class BroadcastingApp(QWidget):
         self.blink_timer.timeout.connect(self.on_blink_tick)
         self.blink_timer.start()
 
+        self.show_timer = QTimer()
+        self.show_timer.setInterval(5000)
+        self.show_timer.timeout.connect(self.on_show_timer)
+        self.show_timer.start()
+        self.tag_timer = QTimer()
+        self.tag_timer.setInterval(30 * 60 * 1000)
+        self.tag_timer.timeout.connect(self.on_tag_timer)
+        self.tag_timer.start()
+        QTimer.singleShot(20000, self.maybe_start_first_tag_scan)
+        QTimer.singleShot(40000, self.on_tag_timer)
+
         if not MUTAGEN_AVAILABLE:
             QTimer.singleShot(500, lambda: self.update_status(
                 "Note: mutagen isn't installed, so album artwork and now-playing text won't be available."
@@ -5171,6 +5986,7 @@ class BroadcastingApp(QWidget):
             "stop_rotation": self.rotation.stop,
             "mute_all": self.toggle_mute,
             "open_options": self.open_options,
+            "toggle_recording": self.toggle_recording,
             "new_item": self.new_item,
             "generate_now": self.generate_now,
             "say_elapsed": self.say_elapsed,
@@ -5404,14 +6220,342 @@ class BroadcastingApp(QWidget):
         elif group.text(0) != "Encoders":
             group.setText(0, "Encoders")
 
+    # --- recording ---
+    def decks_busy_paths(self):
+        paths = set()
+        for deck in (self.rotation.deck_a, self.rotation.deck_b):
+            if deck.current_track_path:
+                paths.add(deck.current_track_path)
+        return paths
+
+    def toggle_recording(self):
+        if self.recorder.recording:
+            self.stop_recording(by_user=True)
+        else:
+            self.start_recording()
+
+    def start_recording(self, by_schedule=False):
+        """Returns True when recording is running. The first time, asks for bitrate and cue sheet."""
+        if not self.recorder.setup_done():
+            if by_schedule:
+                self.announce("A scheduled recording was skipped. Press R once to finish the recording setup.")
+                return False
+            dialog = FirstRecordingSetupDialog(self, bitrate=self.recorder.bitrate() or 128,
+                                               cue=self.recorder.cue_enabled())
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.announce("Recording was not started.")
+                return False
+            self.settings.setValue("record_bitrate", dialog.chosen_bitrate())
+            self.settings.setValue("record_cue", "true" if dialog.chosen_cue() else "false")
+            self.settings.setValue("record_setup_done", "true")
+            self.refresh_recording_controls()
+        path, meta = None, None
+        try:
+            deck = self.rotation.get_live_deck()
+            if deck.current_track_path and self.audio_is_playing():
+                path = deck.current_track_path
+                meta = get_track_metadata(path)
+        except Exception:
+            pass
+        ok, message = self.recorder.start(self.mixer, meta, by_schedule, path)
+        self.announce(message)
+        return ok
+
+    def stop_recording(self, by_user=False):
+        if not self.recorder.recording:
+            return
+        if by_user:
+            try:
+                active = active_show(load_show_times(self.settings), datetime.now())
+                self.show_controller.user_stopped(active[1] if active else None)
+            except Exception:
+                pass
+        path = self.recorder.stop()
+        self.announce(f"Recording stopped. Saved to {path}" if path else "Recording stopped.")
+
+    def on_recording_state_changed(self, active):
+        try:
+            if active:
+                self.record_label.setText(f"RECORDING at {self.recorder.bitrate()} kbps.")
+                self.record_label.setStyleSheet(f"color: {COLOR_LIVE_RED}; font-weight: bold;")
+                self.record_btn.setText("Stop Recording (R)")
+            else:
+                self.record_label.setText("Recording: off.")
+                self.record_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-weight: bold;")
+                self.record_btn.setText("Start Recording (R)")
+        except Exception:
+            pass
+
+    def on_show_timer(self):
+        try:
+            shows = load_show_times(self.settings)
+            if not shows and not self.recorder.started_by_schedule:
+                return
+            action, name = self.show_controller.decide(shows, datetime.now(), self.recorder.recording,
+                                                       self.recorder.started_by_schedule)
+            if action == "start":
+                if self.start_recording(by_schedule=True):
+                    self.announce(f"Live show recording started: {name}.")
+                else:
+                    self.show_controller.suppressed_window = self.show_controller.schedule_window
+            elif action == "stop":
+                self.stop_recording()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def build_recording_tab(self):
+        page = QWidget()
+        layout = QFormLayout()
+        intro = QLabel("Recording captures the program mix to an MP3. Press R anywhere to start or stop. "
+                       "Nothing records by itself unless you add a live show time below.")
+        intro.setWordWrap(True)
+        layout.addRow(intro)
+        self.record_bitrate_combo = QComboBox()
+        self.record_bitrate_combo.setAccessibleName("Recording bitrate")
+        self.record_bitrate_combo.addItem("128 kbps (smaller files)", 128)
+        self.record_bitrate_combo.addItem("320 kbps (best quality, for podcast platforms)", 320)
+        self.record_bitrate_combo.currentIndexChanged.connect(self.on_record_options_changed)
+        layout.addRow("Bitrate:", self.record_bitrate_combo)
+        self.record_cue_check = QCheckBox("Write a cue sheet and a licensing list with each recording "
+                                          "(artist, title, album, label and ISRC)")
+        self.record_cue_check.toggled.connect(self.on_record_options_changed)
+        layout.addRow(self.record_cue_check)
+        self.record_custom_folder_check = QCheckBox("Use a different recordings folder (otherwise the Recordings folder "
+                                                    "made by the installer is used)")
+        self.record_custom_folder_check.toggled.connect(self.on_record_custom_folder_toggled)
+        layout.addRow(self.record_custom_folder_check)
+        self.record_folder_label = QLabel("")
+        self.record_folder_label.setWordWrap(True)
+        layout.addRow("Recordings folder:", self.record_folder_label)
+        self.record_folder_btn = QPushButton("Choose Recordings Folder")
+        self.record_folder_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.record_folder_btn.clicked.connect(self.choose_recordings_folder)
+        layout.addRow(self.record_folder_btn)
+        open_btn = QPushButton("Open Recordings Folder")
+        open_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        open_btn.clicked.connect(self.open_recordings_folder)
+        layout.addRow(open_btn)
+        self.record_vt_check = QCheckBox("Also record the program while I am voice tracking")
+        self.record_vt_check.toggled.connect(self.on_record_options_changed)
+        layout.addRow(self.record_vt_check)
+        toggle_btn = QPushButton("Start Or Stop Recording (R)")
+        toggle_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        toggle_btn.clicked.connect(self.toggle_recording)
+        layout.addRow(toggle_btn)
+        layout.addRow(QLabel("Live show times: recording starts and stops by itself at these times."))
+        self.show_list = QListWidget()
+        self.show_list.setAccessibleName("Live show recording times")
+        self.show_list.setMaximumHeight(140)
+        layout.addRow(self.show_list)
+        show_buttons = QHBoxLayout()
+        add_show = QPushButton("Add Live Show")
+        add_show.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        add_show.clicked.connect(self.add_live_show)
+        show_buttons.addWidget(add_show)
+        remove_show = QPushButton("Remove Selected Show")
+        remove_show.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        remove_show.clicked.connect(self.remove_live_show)
+        show_buttons.addWidget(remove_show)
+        layout.addRow(show_buttons)
+        page.setLayout(layout)
+        self.refresh_recording_controls()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
+
+    def refresh_recording_controls(self):
+        self._loading_record_options = True
+        try:
+            index = self.record_bitrate_combo.findData(self.recorder.bitrate() or 128)
+            self.record_bitrate_combo.setCurrentIndex(max(0, index))
+            self.record_cue_check.setChecked(self.recorder.cue_enabled())
+            self.record_vt_check.setChecked(str(self.settings.value("record_voice_tracking", "false")).lower() == "true")
+            custom = bool(str(self.settings.value("recordings_folder", "") or "").strip())
+            self.record_custom_folder_check.setChecked(custom)
+            self.record_folder_btn.setEnabled(custom)
+            self.record_folder_label.setText(self.recorder.folder())
+            self.show_list.clear()
+            for show in load_show_times(self.settings):
+                self.show_list.addItem(describe_show(show))
+        finally:
+            self._loading_record_options = False
+
+    def on_record_options_changed(self, *_args):
+        if getattr(self, "_loading_record_options", False):
+            return
+        self.settings.setValue("record_bitrate", self.record_bitrate_combo.currentData())
+        self.settings.setValue("record_cue", "true" if self.record_cue_check.isChecked() else "false")
+        self.settings.setValue("record_voice_tracking", "true" if self.record_vt_check.isChecked() else "false")
+        self.announce("Recording options saved.")
+
+    def on_record_custom_folder_toggled(self, checked):
+        if getattr(self, "_loading_record_options", False):
+            return
+        self.record_folder_btn.setEnabled(checked)
+        if not checked:
+            self.settings.setValue("recordings_folder", "")
+            self.record_folder_label.setText(self.recorder.folder())
+            self.announce("Recordings go to the installer's Recordings folder.")
+
+    def choose_recordings_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose the recordings folder", self.recorder.folder())
+        if folder:
+            self.settings.setValue("recordings_folder", folder)
+            self.record_folder_label.setText(folder)
+            self.announce(f"Recordings folder: {folder}")
+        elif not str(self.settings.value("recordings_folder", "") or "").strip():
+            self.record_custom_folder_check.setChecked(False)
+
+    def open_recordings_folder(self):
+        folder = self.recorder.folder()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(folder)
+            else:
+                self.announce(f"Recordings folder: {folder}")
+        except Exception as e:
+            self.announce(f"The folder could not be opened: {e}")
+
+    def add_live_show(self):
+        dialog = ShowTimeDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        shows = load_show_times(self.settings)
+        shows.append(dialog.show_entry())
+        save_show_times(self.settings, shows)
+        self.refresh_recording_controls()
+        self.announce("Live show added. Recording will start and stop at those times.")
+
+    def remove_live_show(self):
+        row = self.show_list.currentRow()
+        shows = load_show_times(self.settings)
+        if 0 <= row < len(shows):
+            del shows[row]
+            save_show_times(self.settings, shows)
+            self.refresh_recording_controls()
+            self.announce("Live show removed.")
+
+    # --- tagging ---
+    def build_tagging_tab(self):
+        page = QWidget()
+        layout = QFormLayout()
+        intro = QLabel("Tagging fills in a song's missing album, record label and ISRC using the artist and title "
+                       "already in the file, looked up in the free MusicBrainz database. No account is needed. "
+                       "Tags that are already there are never changed, and songs with every tag are skipped. "
+                       "It needs an internet connection and never touches a song that is loaded on a deck.")
+        intro.setWordWrap(True)
+        layout.addRow(intro)
+        scan_btn = QPushButton("Tag My Music Library Now")
+        scan_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        scan_btn.clicked.connect(self.start_library_tagging)
+        layout.addRow(scan_btn)
+        stop_btn = QPushButton("Stop Tagging")
+        stop_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        stop_btn.clicked.connect(lambda _checked=False: self.tagger.stop())
+        layout.addRow(stop_btn)
+        self.tag_new_check = QCheckBox("Also tag new songs added to the library (checked at startup and every 30 minutes)")
+        self.tag_new_check.setChecked(str(self.settings.value("tag_new_songs", "false")).lower() == "true")
+        self.tag_new_check.toggled.connect(self.on_tag_new_toggled)
+        layout.addRow(self.tag_new_check)
+        self.tag_status_label = QLabel("Tagging: idle.")
+        self.tag_status_label.setAccessibleName("Tagging status")
+        self.tag_status_label.setWordWrap(True)
+        layout.addRow(self.tag_status_label)
+        page.setLayout(layout)
+        return page
+
+    def on_tag_new_toggled(self, checked):
+        self.settings.setValue("tag_new_songs", "true" if checked else "false")
+        self.announce("New songs will be tagged." if checked else "New songs will not be tagged automatically.")
+
+    def start_library_tagging(self):
+        folder = self.settings.value("music_library_folder", "")
+        if not folder or not os.path.isdir(folder):
+            self.announce("Choose the music library folder in Settings, General, first.")
+            return
+        if self.tagger.start(folder):
+            self.tag_status_label.setText("Tagging: started.")
+            self.announce("Tagging started in the background.")
+        else:
+            self.announce("Tagging is already running." if self.tagger.running else "Tagging could not start.")
+
+    def on_tagging_progress(self, text):
+        try:
+            self.tag_status_label.setText(text)
+            self.update_status(text)
+        except Exception:
+            pass
+
+    def on_tagging_finished(self, summary):
+        try:
+            self.tag_status_label.setText(summary)
+            self.announce(summary)
+        except Exception:
+            pass
+
+    def maybe_start_first_tag_scan(self):
+        """Once, a little after the first launch with a music library: offers to tag the whole library."""
+        try:
+            if str(self.settings.value("tag_first_scan_done", "false")).lower() == "true":
+                return
+            folder = self.settings.value("music_library_folder", "")
+            if not (folder and os.path.isdir(folder)) or not self.isVisible():
+                QTimer.singleShot(60000, self.maybe_start_first_tag_scan)
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle("Tag your music library?")
+            box.setText("Vision Studio can fill in missing album, record label and ISRC tags in your music library "
+                        "for licensing. Tags that are already there are never changed. It runs in the background "
+                        "and needs the internet. Tag the library now?")
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            self.settings.setValue("tag_first_scan_done", "true")
+            if box.exec() == QMessageBox.StandardButton.Yes:
+                self.start_library_tagging()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def on_tag_timer(self):
+        try:
+            if str(self.settings.value("tag_new_songs", "false")).lower() != "true" or self.tagger.running:
+                return
+            folder = self.settings.value("music_library_folder", "")
+            if folder and os.path.isdir(folder):
+                self.tagger.start(folder)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
     # --- shortcut actions ---
     def open_options(self):
-        self.tabs.setCurrentWidget(self.tab_audio_scroll)
-        self.output_combo.setFocus()
-        self.announce("Options. Settings tab.")
+        """Ctrl+O: opens Settings, or goes back to the on-air screen when Settings is already open."""
+        if self.pages.currentIndex() == 1:
+            self.show_onair()
+        else:
+            self.show_settings()
+
+    def show_settings(self, section=None):
+        if section is not None:
+            self.section_list.setCurrentRow(section)
+        self.pages.setCurrentIndex(1)
+        self.section_list.setFocus()
+        self.announce("Settings. Use the up and down arrows to choose a section, then Tab. "
+                      "Press Ctrl+O or Escape to go back to the on-air screen.")
+
+    def show_onair(self):
+        self.pages.setCurrentIndex(0)
+        self.queue_list.setFocus()
+        self.announce("On-air screen.")
+
+    def on_escape_pressed(self):
+        if self.pages.currentIndex() == 1:
+            self.show_onair()
 
     def new_item(self):
-        """Ctrl+N: creates whatever belongs to the tab you are on."""
+        """Ctrl+N: creates whatever belongs to the Settings section you are on."""
+        if self.pages.currentIndex() == 0:
+            self.insert_hour_marker()
+            return
         current = self.tabs.currentWidget()
         if current is self.rotations_tab:
             self.rotations_tab.new_rotation()
@@ -5706,6 +6850,12 @@ class BroadcastingApp(QWidget):
                 "encoders": encoders, "summary": summary}
 
     def on_vinyl_tick(self):
+        try:
+            self._vinyl_tick()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def _vinyl_tick(self):
         for name, deck in (("A", self.rotation.deck_a), ("B", self.rotation.deck_b)):
             widgets = self.deck_widgets.get(name)
             if not widgets:
@@ -5919,16 +7069,10 @@ class BroadcastingApp(QWidget):
         add(file_menu, "stop_fade", "Stop with fade (the record stays on the deck)", self.stop_with_fade)
         add(file_menu, "stop_rotation", "Stop everything at once", self.rotation.stop)
         add(file_menu, "mute_all", "Mute or unmute all audio", self.toggle_mute)
+        add(file_menu, "toggle_recording", "Start or stop recording", self.toggle_recording)
+        add(file_menu, "open_options", "Open or close Settings", self.open_options)
         file_menu.addSeparator()
         add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
-        act = add(file_menu, "close_to_tray", "Closing the window sends it to the system tray", self.on_close_to_tray_toggled, True)
-        act.blockSignals(True)
-        act.setChecked(str(self.settings.value("close_to_tray", "false")).lower() == "true")
-        act.blockSignals(False)
-        act = add(file_menu, "autostart", "Start Vision Studio when Windows starts", self.on_autostart_toggled, True)
-        act.blockSignals(True)
-        act.setChecked(autostart_enabled())
-        act.blockSignals(False)
         file_menu.addSeparator()
         add(file_menu, "exit", "Exit Vision Studio", self.exit_program)
 
@@ -6104,10 +7248,18 @@ class BroadcastingApp(QWidget):
         except Exception:
             default_under = 6
         dialog = VoiceTrackDialog(self, recorder, where, self.settings, default_under)
+        started_recording = False
+        if (str(self.settings.value("record_voice_tracking", "false")).lower() == "true"
+                and not self.recorder.recording and self.recorder.setup_done()):
+            started_recording = self.start_recording()
+            if started_recording:
+                self.recorder.note_other("Voice tracking session")
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         finally:
             self._voice_recording = False
+            if started_recording:
+                self.stop_recording()
         seconds = dialog.recorded_seconds
         if not accepted or seconds < 0.5:
             recorder.cancel()
@@ -6162,10 +7314,12 @@ class BroadcastingApp(QWidget):
             self.hide_to_tray()
             return
         encoders = self.live_encoder_count()
-        if self.audio_is_playing() or encoders:
+        if self.audio_is_playing() or encoders or self.recorder.recording:
             text = "Audio is playing. Are you sure you want to close Vision Studio?"
             if encoders:
                 text += f" {encoders} encoder(s) are live and will go off the air."
+            if self.recorder.recording:
+                text += " The recording will be finished and saved first."
             text += " The sound will fade out first, so nothing is cut off."
             box = QMessageBox(self)
             box.setWindowTitle("Close Vision Studio?")
@@ -6218,7 +7372,9 @@ class BroadcastingApp(QWidget):
             return
         self._shutdown_done = True
         self.remember_window()
-        for step in (lambda: self.rotation.stop(),
+        for step in (lambda: self.tagger.stop(),
+                     lambda: self.recorder.stop(wait=True),
+                     lambda: self.rotation.stop(),
                      lambda: self.sequence_player.player.stop(),
                      lambda: self.microphone.stop(),
                      lambda: self.encoder_bank.shutdown(),
@@ -6352,17 +7508,26 @@ class BroadcastingApp(QWidget):
         self.alert_label.setStyleSheet(f"color: {COLOR_WARNING_AMBER}; font-weight: bold;")
         layout.addWidget(self.alert_label)
 
+        top_row = QHBoxLayout()
+        self.settings_btn = QPushButton("Settings (Ctrl+O)")
+        self.settings_btn.setAccessibleName("Settings. Keyboard shortcut Control O.")
+        self.settings_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.settings_btn.clicked.connect(self.open_options)
+        top_row.addWidget(self.settings_btn)
+        self.record_btn = QPushButton("Start Recording (R)")
+        self.record_btn.setAccessibleName("Start or stop recording. Keyboard shortcut R.")
+        self.record_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.record_btn.clicked.connect(self.toggle_recording)
+        top_row.addWidget(self.record_btn)
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
+
         self.tabs = QTabWidget()
+        self.tabs.tabBar().hide()
 
         # --- Tab 1: Music Rotation ---
         self.tab_rotation = QWidget()
         layout_r = QVBoxLayout()
-
-        lib_btn = QPushButton("Set Music Library Folder")
-        lib_btn.setAccessibleName("Set music library folder")
-        lib_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        lib_btn.clicked.connect(self.set_library_folder)
-        layout_r.addWidget(lib_btn)
 
         player_display = QHBoxLayout()
         player_display.addLayout(self.build_deck_column("A"))
@@ -6389,6 +7554,13 @@ class BroadcastingApp(QWidget):
         crossfader_labels.addWidget(QLabel("Deck B"))
         mixer_column.addLayout(crossfader_labels)
 
+        try:
+            console = MixerConsole()
+            mixer_column.addWidget(console, 1)
+            self.console = console
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
         self.now_playing_label = QLabel("Now Playing: (nothing yet)")
         self.now_playing_label.setAccessibleName("Now playing")
         self.now_playing_label.setWordWrap(True)
@@ -6406,6 +7578,12 @@ class BroadcastingApp(QWidget):
         self.onair_status_label.setWordWrap(True)
         self.onair_status_label.setStyleSheet(f"color: {COLOR_ON_AIR_GREEN}; font-weight: bold;")
         mixer_column.addWidget(self.onair_status_label)
+
+        self.record_label = QLabel("Recording: off.")
+        self.record_label.setAccessibleName("Recording status")
+        self.record_label.setWordWrap(True)
+        self.record_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-weight: bold;")
+        mixer_column.addWidget(self.record_label)
 
         self.console_mic_label = QLabel("Mic: off air.")
         self.console_mic_label.setAccessibleName("Console microphone status")
@@ -6443,19 +7621,12 @@ class BroadcastingApp(QWidget):
         self.loudness_label.setStyleSheet(f"color: {loudness_color};")
         mixer_column.addWidget(self.loudness_label)
 
-        player_display.addLayout(mixer_column)
+        player_display.addLayout(mixer_column, 1)
         player_display.addLayout(self.build_deck_column("B"))
         layout_r.addLayout(player_display)
 
-        try:
-            console = MixerConsole()
-            layout_r.addWidget(console)
-            self.console = console
-        except Exception as e:
-            _log_exception(type(e), e, e.__traceback__)
-
         automation_hint = QLabel("Press A to turn automation on or off. Press S to fade out and stop. "
-                                 "The buttons for these are in the Settings tab.")
+                                 "The buttons for these are in Settings (Ctrl+O). Press R to start or stop recording.")
         automation_hint.setWordWrap(True)
         automation_hint.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
         layout_r.addWidget(automation_hint)
@@ -6611,6 +7782,10 @@ class BroadcastingApp(QWidget):
         self.autostart_check.setChecked(autostart_enabled())
         self.autostart_check.toggled.connect(self.on_autostart_toggled)
         layout_a.addRow(self.autostart_check)
+        self.close_to_tray_check = QCheckBox("Closing the window sends Vision Studio to the system tray instead of exiting")
+        self.close_to_tray_check.setChecked(str(self.settings.value("close_to_tray", "false")).lower() == "true")
+        self.close_to_tray_check.toggled.connect(self.on_close_to_tray_toggled)
+        layout_a.addRow(self.close_to_tray_check)
         build_label = QLabel(f"Vision Studio {APP_VERSION}, build {BUILD_ID}")
         build_label.setAccessibleName(f"About: Vision Studio {APP_VERSION}, build {BUILD_ID}")
         layout_a.addRow(build_label)
@@ -6741,17 +7916,42 @@ class BroadcastingApp(QWidget):
         self.categories_tab = CategoriesTab(self)
         self.shortcuts_tab = ShortcutsTab(self)
 
-        # --- Tab order ---
-        self.tabs.addTab(rotation_scroll, "Music Rotation")
-        self.tabs.addTab(self.rotations_tab, "Rotations")
-        self.tabs.addTab(self.schedule_tab, "Schedule")
-        self.tabs.addTab(self.categories_tab, "Categories")
-        self.tabs.addTab(self.tab_jingles, "Jingles && Scheduler")
-        self.tabs.addTab(self.tab_audio_scroll, "Settings")
-        self.tabs.addTab(self.shortcuts_tab, "Keyboard Shortcuts")
-        self.tabs.addTab(self.encoder_bank, "Encoders / Simulcast")
+        # --- Settings sections (the old tabs now live here) ---
+        self.recording_tab = self.build_recording_tab()
+        self.tagging_tab = self.build_tagging_tab()
+        sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
+                    ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
+                    ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
+                    ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
+                    ("Tagging", self.tagging_tab))
+        self.section_list = QListWidget()
+        self.section_list.setAccessibleName("Settings sections")
+        self.section_list.setMaximumWidth(220)
+        for name, widget in sections:
+            self.tabs.addTab(widget, name)
+            self.section_list.addItem(name)
+        self.section_list.currentRowChanged.connect(self.tabs.setCurrentIndex)
+        self.section_list.setCurrentRow(0)
 
-        layout.addWidget(self.tabs)
+        settings_page = QWidget()
+        settings_layout = QVBoxLayout()
+        back_btn = QPushButton("Back To The On-Air Screen (Ctrl+O or Escape)")
+        back_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        back_btn.clicked.connect(self.show_onair)
+        settings_layout.addWidget(back_btn)
+        body = QHBoxLayout()
+        body.addWidget(self.section_list)
+        body.addWidget(self.tabs, 1)
+        settings_layout.addLayout(body, 1)
+        settings_page.setLayout(settings_layout)
+
+        self.pages = QStackedWidget()
+        self.pages.addWidget(rotation_scroll)
+        self.pages.addWidget(settings_page)
+        self.escape_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self.escape_shortcut.activated.connect(self.on_escape_pressed)
+
+        layout.addWidget(self.pages, 1)
         self.setLayout(layout)
 
     # --- Status / rotation callbacks ---
@@ -6765,6 +7965,10 @@ class BroadcastingApp(QWidget):
 
     def on_now_playing(self, track_path):
         RUN_LOG.write("PLAY", f"{self._track_text(track_path)} | {track_path}")
+        try:
+            self.recorder.note_track(get_track_metadata(track_path), track_path)
+        except Exception:
+            pass
         track_name = os.path.basename(track_path)
         self.now_playing_label.setText(f"Now Playing: {track_name}")
         self.onair_status_label.setText("On Air: music rotation playing.")
@@ -6946,6 +8150,13 @@ class BroadcastingApp(QWidget):
         self.start_break(slot)
 
     def on_sequence_changed(self):
+        try:
+            active = bool(self.sequence_player.active)
+            if active and not self._seq_was_active and self.recorder.recording:
+                self.recorder.note_other(f"Jingles and ads ({self.sequence_player.slot})")
+            self._seq_was_active = active
+        except Exception:
+            pass
         self.refresh_queue_list()
         self.refresh_status_tree()
 
