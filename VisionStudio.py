@@ -124,8 +124,8 @@ AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 def autostart_command():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" --tray'
-    return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --tray'
+        return f'"{sys.executable}" --startup'
+    return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --startup'
 
 
 def autostart_enabled():
@@ -1724,8 +1724,10 @@ class PlaylistGenerator:
 DEFAULT_SHORTCUTS = [
     ("insert_tracks", "Insert tracks into the queue", "Ins", True),
     ("insert_tracks_alt", "Insert tracks (alternate key)", "Ctrl+I", True),
-    ("start_rotation", "Start rotation", "Ctrl+Return", True),
-    ("stop_rotation", "Stop rotation", "Ctrl+Shift+S", True),
+    ("automation_toggle", "Automation on / off (the first song goes onto the deck, like Station Playlist)", "A", True),
+    ("stop_fade", "Stop with fade (the record stays on the deck)", "S", True),
+    ("start_rotation", "Automation on", "Ctrl+Return", True),
+    ("stop_rotation", "Stop everything at once", "Ctrl+Shift+S", True),
     ("mute_all", "Mute or unmute all audio", "Ctrl+Shift+U", True),
     ("open_options", "Open Options (Settings tab)", "Ctrl+O", True),
     ("new_item", "New rotation, category or hour marker (depends on the tab)", "Ctrl+N", True),
@@ -2106,6 +2108,7 @@ class RotationEngine:
         self.shuffled_queue = []
         self.is_paused_for_sequence = False
         self.break_fading = False      # a break has taken over; the song is fading and nothing else may start
+        self.automation_on = False     # A turns it on; with it off, the song on air finishes and nothing follows
         self.is_running = False
         self.next_track_cued = False
 
@@ -2456,27 +2459,84 @@ class RotationEngine:
         if count == 0:
             self.on_status("Music library folder has no audio files, including its subfolders. Rotation cannot start.")
             return
+        live = self.get_live_deck()
+        if live.current_track_path and live.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            # A song is still finishing from before: automation simply takes over again after it.
+            self.automation_on = True
+            self.is_running = True
+            self.is_paused_for_sequence = False
+            self.on_status("Automation is on. The song on air continues and the queue plays after it.")
+            return
+        self.automation_on = True
         self.is_running = True
         self.is_paused_for_sequence = False
         self.break_fading = False
-        self.live_deck_name = "A"
-        self.on_status(f"Rotation started, {count} track(s) in the queue.")
+        # The first song goes onto Deck A. If Deck A still holds a record that was stopped, it goes onto Deck B.
+        occupied = {d.name for d in (self.deck_a, self.deck_b) if d.current_track_path}
+        if "A" not in occupied:
+            target_name = "A"
+        elif "B" not in occupied:
+            target_name = "B"
+        else:
+            target_name = "B" if self.live_deck_name == "A" else "A"
+        target = self.deck_a if target_name == "A" else self.deck_b
+        self.live_deck_name = target_name
+        self.on_status(f"Automation is on, {count} track(s) in the queue. The first song goes onto Deck {target_name}.")
         first_track = self.pick_next_valid_track()
         if first_track is None:
-            self.on_status("Music library is empty. Rotation halted.")
+            self.on_status("Music library is empty. Automation stopped.")
             self.is_running = False
+            self.automation_on = False
             return
         self.play_history.record_play(first_track)
         self.ending_beep_fired = False
         self.next_track_cued = False
         playback_path = normalize_file_loudness(first_track, self.on_status)
-        self.deck_a.audio_output.setVolume(self._effective_level() * self.deck_a.manual_volume)
-        self.deck_a.load_and_play(playback_path, first_track)
-        self._notify_deck_update("A", first_track)
+        target.fader.timer.stop()
+        target.audio_output.setVolume(self._effective_level() * target.manual_volume)
+        target.load_and_play(playback_path, first_track)
+        self._notify_deck_update(target_name, first_track)
         self.on_now_playing(first_track)
+
+    def automation_off(self):
+        """A while automation is on: the song on air plays to its end, then nothing follows."""
+        self.automation_on = False
+        self.disarm_break()
+        self.uncue_to_front()
+        self.on_status("Automation is off. The song on air will finish and nothing will play after it. "
+                       "Press A to turn automation back on.")
+
+    def stop_with_fade(self):
+        """S: fades what is playing and stops it. The record stays on its deck."""
+        self.automation_on = False
+        self.break_fading = False
+        self.disarm_break()
+        self.uncue_to_front()
+        self.is_paused_for_sequence = False
+        faded = []
+        for deck in (self.deck_a, self.deck_b):
+            if deck.current_track_path and deck.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                faded.append(deck)
+        if not faded:
+            self.is_running = False
+            self.on_status("Nothing is playing. Automation is off.")
+            return
+        remaining = {"count": len(faded)}
+
+        def finished(d):
+            d.pause()
+            remaining["count"] -= 1
+            if remaining["count"] <= 0:
+                self.is_running = False
+                self.on_status(f"Stopped. The record stays on Deck {self.live_deck_name}. "
+                               "Press A to start automation again.")
+        self.on_status("Fading out and stopping.")
+        for deck in faded:
+            deck.fader.fade_to(0.0, steps=20, interval_ms=100, on_complete=lambda d=deck: finished(d))
 
     def stop(self):
         self.is_running = False
+        self.automation_on = False
         self.break_fading = False
         self.next_track_cued = False
         self.disarm_break()
@@ -2516,7 +2576,7 @@ class RotationEngine:
 
     def cue_next_track_if_needed(self):
         """Loads the next track, paused at its start, into the non-live deck."""
-        if self.next_track_cued or not self.is_running or self.is_paused_for_sequence:
+        if self.next_track_cued or not self.is_running or not self.automation_on or self.is_paused_for_sequence:
             return
         next_track = self.pick_next_valid_track()
         if next_track is None:
@@ -2596,13 +2656,13 @@ class RotationEngine:
 
         if self.break_fading:
             return          # the break owns the closing seconds: no cue, no crossfade
-        if (self.is_running and not self.is_paused_for_sequence and self.break_target is not None
+        if (self.is_running and self.automation_on and not self.is_paused_for_sequence and self.break_target is not None
                 and not self.break_started and self.break_style() == "fade_at_mark"
                 and self._seconds_to_mark() <= self.QUICK_BREAK_FADE_SECONDS):
             self.on_status("Fading the music out so the break starts right on the mark.")
             self._take_break(quick=True)
             return
-        if self.is_running and not self.is_paused_for_sequence:
+        if self.is_running and self.automation_on and not self.is_paused_for_sequence:
             crossfade_lead_ms = max(FADE_STEPS * FADE_INTERVAL_MS, 4000)
             if remaining_ms <= crossfade_lead_ms + 2000 and self._break_gate(deck, position_ms, duration_ms):
                 return
@@ -2615,7 +2675,7 @@ class RotationEngine:
 
     def begin_crossfade_out(self, on_complete, seconds=None):
         """Fades the live deck out ahead of a scheduled break."""
-        if not self.is_running or self.is_paused_for_sequence:
+        if not self.is_running or not self.automation_on or self.is_paused_for_sequence:
             if on_complete:
                 on_complete()
             return
@@ -2649,6 +2709,10 @@ class RotationEngine:
 
     def resume_after_sequence(self):
         self.is_paused_for_sequence = False
+        if self.is_running and not self.automation_on:
+            self.is_running = False
+            self.on_status("The break is over. Automation is off, so no music follows. Press A to start automation.")
+            return
         if self.is_running:
             self.on_status("Rotation resuming, fading music back in.")
             live_deck = self.get_live_deck()
@@ -2715,6 +2779,10 @@ class RotationEngine:
         if status == QMediaPlayer.MediaStatus.EndOfMedia and deck.name == self.live_deck_name:
             if self.break_fading:
                 return
+            if not self.automation_on and not self.is_paused_for_sequence:
+                self.is_running = False
+                self.on_status("The song finished. Automation is off, so nothing plays next. Press A to start automation.")
+                return
             if not self.is_paused_for_sequence and self.is_running:
                 if (self.break_target is not None and not self.break_started
                         and (self.break_style() == "finish_song" or self._seconds_to_mark() <= self.QUICK_BREAK_FADE_SECONDS + 1)):
@@ -2725,7 +2793,7 @@ class RotationEngine:
                 self.crossfade_to_cued_deck()
         elif status == QMediaPlayer.MediaStatus.InvalidMedia and deck.name == self.live_deck_name:
             # A file the player can't read: skip it instead of going silent.
-            if self.is_running and not self.is_paused_for_sequence:
+            if self.is_running and self.automation_on and not self.is_paused_for_sequence:
                 self.on_status("Skipped an unreadable audio file.")
                 if not self.next_track_cued:
                     self.cue_next_track_if_needed()
@@ -4909,6 +4977,7 @@ class BroadcastingApp(QWidget):
         self._closing = False
         self._shutdown_done = False
         self._quitting = False
+        self._wts_registered = False
         self._voice_recording = False
         self.tray = None
         self.menu_actions = {}
@@ -4984,7 +5053,9 @@ class BroadcastingApp(QWidget):
                 self._rescan_in_progress = False
         self.rotation_schedule.ensure_valid()
         self.rotation_library.detect_new_files()  # first look: remember what is already there
+        RUN_LOG.write("START", "Building the window.")
         self.setup_ui()
+        RUN_LOG.write("START", "Window built.")
         self.setup_shortcuts()
         for optional_step in (self.setup_tray, self.setup_session_watch, refresh_autostart_path, keep_system_awake):
             try:                      # none of these may ever stop the program from opening
@@ -4999,6 +5070,7 @@ class BroadcastingApp(QWidget):
         if self.setup_complete() and self.rotation_library.rotations:
             QTimer.singleShot(1500, lambda: self.ensure_hour_playlists(force=True))
 
+        RUN_LOG.write("START", "Ready to show.")
         self.console_timer = QTimer()
         self.console_timer.setInterval(60)
         self.console_timer.timeout.connect(self.refresh_console)
@@ -5076,6 +5148,8 @@ class BroadcastingApp(QWidget):
         return {
             "insert_tracks": self.insert_tracks,
             "insert_tracks_alt": self.insert_tracks,
+            "automation_toggle": self.automation_toggle,
+            "stop_fade": self.stop_with_fade,
             "start_rotation": self.start_rotation,
             "stop_rotation": self.rotation.stop,
             "mute_all": self.toggle_mute,
@@ -5257,7 +5331,7 @@ class BroadcastingApp(QWidget):
                 text = f"Deck {name}: {self._track_text(path)}, {state}"
             self._set_tree("deck_" + name.lower(), text)
         self._set_tree("rotation", f"Rotation: {rot.active_rotation_name() or 'none'}"
-                       + (", running" if rot.is_running else ", stopped"))
+                       + (", automation on" if rot.automation_on else (", song finishing, automation off" if rot.is_running else ", stopped")))
         sp = self.sequence_player
         if sp.active and sp.items and 0 <= sp.item_index < len(sp.items):
             break_text = (f"Break {sp.slot}: item {sp.item_index + 1} of {len(sp.items)}, "
@@ -5360,7 +5434,7 @@ class BroadcastingApp(QWidget):
         elif self.rotation.is_running:
             text = "Rotation is running but paused."
         else:
-            text = "Rotation is stopped."
+            text = "Automation is off."
         self.announce(text)
 
     def say_hour_remaining(self):
@@ -5520,7 +5594,7 @@ class BroadcastingApp(QWidget):
             if self.rescan_counter >= 60:
                 self.rescan_counter = 0
                 self.rescan_library()
-            if (self.rotation.is_running and not self.rotation.is_paused_for_sequence
+            if (self.rotation.is_running and self.rotation.automation_on and not self.rotation.is_paused_for_sequence
                     and self.rotation.break_target is None):
                 now = datetime.now()
                 mark = SchedulerEngine.next_mark(now)
@@ -5760,6 +5834,24 @@ class BroadcastingApp(QWidget):
             str(self.settings.value("proc_master", "true")).lower() != "false",
             str(self.settings.value("proc_preset", "Broadcast")), ceiling, per_source)
 
+    def ensure_on_screen(self):
+        """Makes sure the window can be seen: visible, and not stranded on a screen that is gone."""
+        try:
+            if not self.isVisible():
+                self.showNormal()
+            if not self.isMaximized():
+                screens = QApplication.screens()
+                frame = self.frameGeometry()
+                if screens and not any(s.availableGeometry().intersects(frame) for s in screens):
+                    area = QApplication.primaryScreen().availableGeometry()
+                    self.resize(min(self.width(), area.width()), min(self.height(), area.height()))
+                    self.move(area.topLeft())
+            self.raise_()
+            self.activateWindow()
+            RUN_LOG.write("START", "Window is on screen.")
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
     def show_remembered(self):
         """Opens maximized the first time. After that it opens the way it was last closed."""
         maximized = True
@@ -5776,6 +5868,7 @@ class BroadcastingApp(QWidget):
             self.showMaximized()
         else:
             self.show()
+        QTimer.singleShot(800, self.ensure_on_screen)
 
     def remember_window(self):
         try:
@@ -5805,8 +5898,9 @@ class BroadcastingApp(QWidget):
             return action
 
         add(file_menu, "insert_tracks", "Insert tracks into the queue", self.insert_tracks)
-        add(file_menu, "start_rotation", "Start rotation", self.start_rotation)
-        add(file_menu, "stop_rotation", "Stop rotation", self.rotation.stop)
+        add(file_menu, "automation_toggle", "Automation on or off", self.automation_toggle)
+        add(file_menu, "stop_fade", "Stop with fade (the record stays on the deck)", self.stop_with_fade)
+        add(file_menu, "stop_rotation", "Stop everything at once", self.rotation.stop)
         add(file_menu, "mute_all", "Mute or unmute all audio", self.toggle_mute)
         file_menu.addSeparator()
         add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
@@ -5875,8 +5969,8 @@ class BroadcastingApp(QWidget):
             self.tray.setToolTip("Vision Studio")
             menu = QMenu()
             for text, handler in (("Show Vision Studio", self.show_from_tray),
-                                  ("Start rotation", self.start_rotation),
-                                  ("Stop rotation", self.rotation.stop),
+                                  ("Automation on or off", self.automation_toggle),
+                                  ("Stop with fade", self.stop_with_fade),
                                   ("Mute or unmute all audio", self.toggle_mute),
                                   ("Exit Vision Studio", self.exit_program)):
                 action = menu.addAction(text)
@@ -5916,10 +6010,21 @@ class BroadcastingApp(QWidget):
         self.activateWindow()
 
     def start_in_tray(self):
-        """Opened by Windows at start-up: no window, just the tray icon (and optionally playing)."""
+        """No window, just the tray icon."""
         if self.tray is None:
             self.showMinimized()
-        RUN_LOG.write("START", "Started with Windows, running in the system tray.")
+        RUN_LOG.write("START", "Running in the system tray.")
+        QTimer.singleShot(1500, self.register_session_notifications)
+
+    def on_startup_launch(self):
+        """Started by Windows at log-in. The window opens as normal unless "open in the system tray" is
+        ticked. Playing begins by itself if that option is ticked."""
+        in_tray = str(self.settings.value("start_in_tray", "false")).lower() == "true" and self.tray is not None
+        RUN_LOG.write("START", "Started with Windows" + (", opening in the system tray." if in_tray else ", window shown."))
+        if in_tray:
+            self.start_in_tray()
+        else:
+            self.show_remembered()
         if str(self.settings.value("autoplay_on_boot", "true")).lower() == "true":
             QTimer.singleShot(8000, self.autoplay_after_boot)
 
@@ -5961,11 +6066,21 @@ class BroadcastingApp(QWidget):
             self.media_devices.audioOutputsChanged.connect(lambda: QTimer.singleShot(1500, self.recover_audio))
         except Exception:
             self.media_devices = None
+
+    def register_session_notifications(self):
+        """Done once the window exists on screen (never before it is first shown)."""
+        if self._wts_registered:
+            return
+        self._wts_registered = True
         try:
             import ctypes
             ctypes.windll.wtsapi32.WTSRegisterSessionNotification(int(self.winId()), 0)
         except Exception:
             pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(1500, self.register_session_notifications)
 
     def nativeEvent(self, eventType, message):
         try:
@@ -6382,17 +6497,11 @@ class BroadcastingApp(QWidget):
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
 
-        rotation_btn_row = QHBoxLayout()
-        start_rotation_btn = QPushButton("Start Rotation")
-        start_rotation_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        start_rotation_btn.clicked.connect(self.start_rotation)
-        rotation_btn_row.addWidget(start_rotation_btn)
-
-        stop_rotation_btn = QPushButton("Stop Rotation")
-        stop_rotation_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        stop_rotation_btn.clicked.connect(self.rotation.stop)
-        rotation_btn_row.addWidget(stop_rotation_btn)
-        layout_r.addLayout(rotation_btn_row)
+        automation_hint = QLabel("Press A to turn automation on or off. Press S to fade out and stop. "
+                                 "The buttons for these are in the Settings tab.")
+        automation_hint.setWordWrap(True)
+        automation_hint.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
+        layout_r.addWidget(automation_hint)
 
         tree_label = QLabel("Station status (keyboard tree)")
         tree_label.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
@@ -6545,6 +6654,9 @@ class BroadcastingApp(QWidget):
         self.autostart_check.setChecked(autostart_enabled())
         self.autostart_check.toggled.connect(self.on_autostart_toggled)
         layout_a.addRow(self.autostart_check)
+        self.start_in_tray_check = QCheckBox("When it starts with Windows, open in the system tray instead of showing the window")
+        self.start_in_tray_check.setChecked(str(self.settings.value("start_in_tray", "false")).lower() == "true")
+        layout_a.addRow(self.start_in_tray_check)
         self.autoplay_check = QCheckBox("When it starts with Windows, begin playing automatically")
         self.autoplay_check.setChecked(str(self.settings.value("autoplay_on_boot", "true")).lower() == "true")
         layout_a.addRow(self.autoplay_check)
@@ -6591,6 +6703,21 @@ class BroadcastingApp(QWidget):
         wizard_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         wizard_btn.clicked.connect(self.run_setup_wizard)
         layout_a.addRow(wizard_btn)
+
+        auto_btn = QPushButton("Automation On / Off (A)")
+        auto_btn.setAccessibleName("Automation on or off. Keyboard shortcut A.")
+        auto_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        auto_btn.clicked.connect(self.automation_toggle)
+        layout_a.addRow(auto_btn)
+        stop_fade_btn = QPushButton("Stop With Fade (S)")
+        stop_fade_btn.setAccessibleName("Stop with fade. The record stays on the deck. Keyboard shortcut S.")
+        stop_fade_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        stop_fade_btn.clicked.connect(self.stop_with_fade)
+        layout_a.addRow(stop_fade_btn)
+        stop_all_btn = QPushButton("Stop Everything At Once (Ctrl+Shift+S)")
+        stop_all_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        stop_all_btn.clicked.connect(self.rotation.stop)
+        layout_a.addRow(stop_all_btn)
 
         generate_btn = QPushButton("Generate Playlists Now (Ctrl+Shift+G)")
         generate_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
@@ -6839,12 +6966,14 @@ class BroadcastingApp(QWidget):
 
     def on_break_upcoming(self, slot, target):
         """About two minutes before a mark: the engine starts protecting the song on air."""
-        if self.rotation.is_running and not self.rotation.is_paused_for_sequence:
+        if self.rotation.is_running and self.rotation.automation_on and not self.rotation.is_paused_for_sequence:
             self.rotation.arm_break(target, slot, lambda s=slot: self.play_break_sequence(s))
             self.update_status(f"{slot} break coming up. The song on air will not be cut.")
 
     def on_crossfade_start(self, slot):
         """The clock reached the mark. If the engine is already managing this break, leave it to the engine."""
+        if not self.rotation.automation_on:
+            return          # automation is off: no jingles or breaks fire by themselves
         if self.rotation.break_is_armed(slot):
             if self.rotation.break_style() == "fade_at_mark" and not self.rotation.is_paused_for_sequence:
                 self.update_status(f"It is {slot}. Fading the music out for the break now.")
@@ -6921,9 +7050,34 @@ class BroadcastingApp(QWidget):
         self.ensure_hour_playlists()
         self.rotation.start()
 
+    def automation_toggle(self):
+        """A: automation on (the first song goes onto the deck) or off (the song on air finishes)."""
+        if self.rotation.automation_on:
+            self.rotation.automation_off()
+            self.announce("Automation off. The song on air will finish.")
+        else:
+            self.start_rotation()
+        self.refresh_queue_list()
+
+    def stop_with_fade(self):
+        """S: fade the record out and stop it. It stays on its deck."""
+        sp = self.sequence_player
+        if sp.active:
+            sp.queue = []
+            sp.active = False
+            try:
+                sp.player.stop()
+            except Exception:
+                pass
+            self.on_sequence_changed()
+        self.rotation.stop_with_fade()
+        self.announce("Stopping. Fading out.")
+        self.refresh_queue_list()
+
     def save_audio_settings(self):
         self.settings.setValue("input_device", self.input_combo.currentText())
         self.settings.setValue("output_device", self.output_combo.currentText())
+        self.settings.setValue("start_in_tray", "true" if self.start_in_tray_check.isChecked() else "false")
         self.settings.setValue("autoplay_on_boot", "true" if self.autoplay_check.isChecked() else "false")
         self.settings.setValue("top_hour_ads", "true" if self.top_hour_ads_check.isChecked() else "false")
         self.settings.setValue("use_live_mix", "true" if self.live_mix_check.isChecked() else "false")
@@ -6954,8 +7108,9 @@ if __name__ == "__main__":
     app.setQuitOnLastWindowClosed(False)      # hiding to the system tray must not end the program
     try:
         window = BroadcastingApp()
-        if "--tray" in sys.argv:
-            window.start_in_tray()
+        # Only a start-up entry made by the "Start with Windows" setting counts as a Windows start-up launch.
+        if ("--startup" in sys.argv or "--tray" in sys.argv) and autostart_enabled():
+            window.on_startup_launch()
         else:
             window.show_remembered()
     except Exception as e:
