@@ -133,7 +133,7 @@ SLOT_CONFIG = {
 }
 
 CROSSFADE_LEAD_SECONDS = 10
-BREAK_ARM_SECONDS = 150  # how long before a break the engine starts protecting the song
+BREAK_WINDOW_DEFAULT = 120  # a song that ends this many seconds (or fewer) before a mark hands over to the break
 FADE_STEPS = 20
 FADE_INTERVAL_MS = (CROSSFADE_LEAD_SECONDS * 1000) // FADE_STEPS
 
@@ -2041,32 +2041,20 @@ class RotationEngine:
 
     def _break_gate(self, deck, position_ms, duration_ms, ended=False):
         """
-        Returns True when the break logic has taken over this moment (so the normal
-        cue/crossfade must not run). Called once the live song is in its closing seconds.
-        Song ends before the mark: loop its last seconds so the fade lands on the mark.
-        Song still playing at the mark: let it finish, then take the break late.
+        Called when the song on air is in its closing seconds. A song is never cut and never looped:
+        if a break is armed (it is within the break window before the mark, or the mark has passed),
+        the song fades out as it finishes and the break plays right then. A song still playing at the
+        mark simply finishes first, so the break comes in late, straight after it.
+        Returns True when the break took over (so the normal cue/crossfade must not run).
         """
         if self.break_target is None or self.break_started:
             return False
-        fade_s = FADE_STEPS * FADE_INTERVAL_MS / 1000.0
         seconds_to_mark = (self.break_target - datetime.now()).total_seconds()
-        max_hold = float(self.settings.value("break_max_hold_seconds", 90) or 90)
-        if seconds_to_mark <= fade_s + 0.5:
-            self._take_break()
-            return True
-        if seconds_to_mark > max_hold or ended:
-            return False  # too far away to hold the song: carry on and let the next song run
-        now = time.monotonic()
-        if now - self.last_tail_seek < 1.0:
-            return True
-        loop_ms = int(min(8000, max(2000, duration_ms * 0.25)))
-        target_pos = max(0, duration_ms - loop_ms - 1500)
-        self.last_tail_seek = now
-        self.tail_loops += 1
-        deck.player.setPosition(target_pos)
-        if self.tail_loops == 1:
-            self.on_status(f"Holding the end of this song so the break starts on the mark "
-                           f"({int(seconds_to_mark)} seconds to go).")
+        if seconds_to_mark >= 0:
+            self.on_status(f"Song finishing {int(seconds_to_mark)} seconds before the mark: starting the break now.")
+        else:
+            self.on_status("Song finished after the mark: starting the break now.")
+        self._take_break()
         return True
 
     def prefetch_upcoming(self):
@@ -2787,7 +2775,7 @@ class SchedulerEngine:
         now = datetime.now()
         if self.on_break_upcoming is not None:
             target = self.next_mark(now)
-            if self.armed_target != target and (target - now).total_seconds() <= BREAK_ARM_SECONDS:
+            if self.armed_target != target and (target - now).total_seconds() <= break_window_seconds(self.settings):
                 self.armed_target = target
                 slot = {0: ":00", 15: ":15", 30: ":30", 45: ":45"}[target.minute]
                 try:
@@ -3805,6 +3793,12 @@ class ShortcutsTab(QWidget):
         self.app.update_status("Shortcuts reset to the Station Playlist defaults.")
 
 
+def break_window_seconds(settings):
+    try:
+        return max(10, min(300, int(float(settings.value("break_window_seconds", BREAK_WINDOW_DEFAULT)))))
+    except Exception:
+        return BREAK_WINDOW_DEFAULT
+
 
 # ---------------------------------------------------------------------------
 # First-run setup wizard: point VisionStudio at every folder before anything starts
@@ -3831,7 +3825,7 @@ WIZARD_STEPS = [
 class SetupIntroPage(QWizardPage):
     def __init__(self):
         super().__init__()
-        self.setTitle("Welcome to Vision Radio setup")
+        self.setTitle("Welcome to Vision Studio setup")
         label = QLabel("This short setup asks where your music, jingles, station identifications and "
                        "commercials live. Nothing starts playing until you choose Start Rotation yourself. "
                        "Every step can be skipped by leaving the folder blank, and you can run this setup "
@@ -3908,7 +3902,7 @@ class SetupFinishPage(QWizardPage):
 class SetupWizard(QWizard):
     def __init__(self, parent, current, playlist_folder):
         super().__init__(parent)
-        self.setWindowTitle("Vision Radio Setup")
+        self.setWindowTitle("Vision Studio Setup")
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.addPage(SetupIntroPage())
         self.folder_pages = []
@@ -3930,7 +3924,7 @@ class SetupWizard(QWizard):
 class BroadcastingApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Vision Radio: Professional Creator Suite")
+        self.setWindowTitle("Vision Studio")
         self.resize(760, 720)
         self.setStyleSheet(MAIN_WINDOW_STYLE)
         self.settings = QSettings("VisionRecords", "VisionRadio")
@@ -4137,7 +4131,7 @@ class BroadcastingApp(QWidget):
         if wizard.exec() == QDialog.DialogCode.Accepted:
             self.apply_setup(wizard.results())
         elif not self.setup_complete():
-            self.update_status("Setup was not finished. It will ask again next time you open Vision Radio.")
+            self.update_status("Setup was not finished. It will ask again next time you open Vision Studio.")
 
     def apply_setup(self, results):
         """Saves every folder from the wizard and creates the playlist folder. Never starts playback."""
@@ -4468,17 +4462,21 @@ class BroadcastingApp(QWidget):
                 now = datetime.now()
                 mark = SchedulerEngine.next_mark(now)
                 slot = {0: ":00", 15: ":15", 30: ":30", 45: ":45"}[mark.minute]
-                if (mark - now).total_seconds() <= BREAK_ARM_SECONDS and not self.rotation.break_recently_taken(slot):
+                if (mark - now).total_seconds() <= break_window_seconds(self.settings) and not self.rotation.break_recently_taken(slot):
                     self.on_break_upcoming(slot, mark)
             job = self.playlist_generator.due_job()
             if job is not None:
                 self.run_generation_job(job)
             # Safety net: a break that never got its turn (for example the deck was paused by hand).
             target = self.rotation.break_target
-            if target is not None and (datetime.now() - target).total_seconds() > 600:
-                slot = self.rotation.break_slot
-                self.rotation.disarm_break()
-                self.start_break(slot)
+            if target is not None:
+                late = (datetime.now() - target).total_seconds()
+                live_playing = (self.rotation.get_live_deck().player.playbackState()
+                                == QMediaPlayer.PlaybackState.PlayingState)
+                if (late > 5 and not live_playing) or late > 900:
+                    slot = self.rotation.break_slot
+                    self.rotation.disarm_break()
+                    self.start_break(slot)
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
 
@@ -4925,12 +4923,12 @@ class BroadcastingApp(QWidget):
         # Break protection
         self.break_hold_spin = QSpinBox()
         self.break_hold_spin.setRange(10, 300)
-        self.break_hold_spin.setAccessibleName("Longest time to hold the end of a song for a break, in seconds")
+        self.break_hold_spin.setAccessibleName("Break window: a song that ends this many seconds before a mark starts the break")
         try:
-            self.break_hold_spin.setValue(int(float(self.settings.value("break_max_hold_seconds", 90))))
+            self.break_hold_spin.setValue(break_window_seconds(self.settings))
         except Exception:
-            self.break_hold_spin.setValue(90)
-        layout_a.addRow("Hold the end of a song for a break up to (seconds):", self.break_hold_spin)
+            self.break_hold_spin.setValue(BREAK_WINDOW_DEFAULT)
+        layout_a.addRow("Break window, seconds before the mark (a song ending inside it starts the break):", self.break_hold_spin)
 
         # Processing
         self.proc_master_check = QCheckBox("Process the stream with the broadcast processor (AGC, 5-band compressor, limiter)")
@@ -5148,6 +5146,11 @@ class BroadcastingApp(QWidget):
     def play_break_sequence(self, slot):
         config = SLOT_CONFIG.get(slot, {"folder_key": slot, "sequence": "simple"})
         jingle_folder = self.settings.value(config["folder_key"], "")
+        if not jingle_folder or not os.path.isdir(jingle_folder):
+            self.announce(f"No folder is set for the {slot} break, so no jingle will play. "
+                          f"Set it in the Jingles and Scheduler tab or run the setup wizard.")
+        elif not scan_audio_files(jingle_folder):
+            self.announce(f"The {slot} break folder has no audio files in it.")
         self.sequence_player.play_sequence(slot, config["sequence"], jingle_folder)
 
     def on_break_upcoming(self, slot, target):
@@ -5158,7 +5161,10 @@ class BroadcastingApp(QWidget):
 
     def on_crossfade_start(self, slot):
         """The clock reached the mark. If the engine is already managing this break, leave it to the engine."""
-        if self.rotation.break_is_armed(slot) or self.rotation.break_recently_taken(slot):
+        if self.rotation.break_is_armed(slot):
+            self.update_status(f"It is {slot}. The break starts as soon as the song on air finishes.")
+            return
+        if self.rotation.break_recently_taken(slot):
             return
         self.start_break(slot)
 
@@ -5198,7 +5204,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("playlist_lead_seconds", self.playlist_lead_spin.value())
         self.settings.setValue("playlist_fixed_times", self.playlist_times_edit.text())
         self.settings.setValue("playlist_autoload", "true" if self.playlist_autoload_check.isChecked() else "false")
-        self.settings.setValue("break_max_hold_seconds", self.break_hold_spin.value())
+        self.settings.setValue("break_window_seconds", self.break_hold_spin.value())
         self.settings.setValue("proc_master", "true" if self.proc_master_check.isChecked() else "false")
         self.settings.setValue("proc_preset", self.proc_preset_combo.currentText())
         self.settings.setValue("proc_ceiling_db", self.proc_ceiling_spin.value())
