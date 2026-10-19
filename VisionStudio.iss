@@ -42,6 +42,10 @@ Type: files; Name: "{autodesktop}\Vision Radio.lnk"
 Name: "{app}\Playlists"; Permissions: users-modify
 ; Logs (one file per day plus errors.log) live next to Playlists, for example C:\Program Files (x86)\Vision Studio\Logs.
 Name: "{app}\Logs"; Permissions: users-modify
+; Voice tracks recorded in the queue are saved here.
+Name: "{app}\VoiceTracks"; Permissions: users-modify
+; Keyboard layout files (Station Playlist, other automation systems) are kept here.
+Name: "{app}\Layouts"; Permissions: users-modify
 
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion

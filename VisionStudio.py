@@ -28,9 +28,10 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QCheckBox, QListWidget, QListWidgetItem, QTableWidget,
                              QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
-                             QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem)
+                             QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
+                             QMenuBar, QMenu, QSystemTrayIcon)
 from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
-from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush
+from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
                                  QAudioSink, QAudioFormat, QAudio, QSoundEffect)
 
@@ -99,6 +100,87 @@ def get_logs_folder():
         if _writable_dir(candidate):
             return candidate
     fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Logs")
+    if _writable_dir(fallback):
+        return fallback
+    return tempfile.gettempdir()
+
+
+def get_voice_folder():
+    """Voice tracks are saved here, next to Logs and Playlists."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "VoiceTracks")
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "VoiceTracks")
+    if _writable_dir(fallback):
+        return fallback
+    return tempfile.gettempdir()
+
+
+# --- Start with Windows (current user, no administrator rights needed) ---
+AUTOSTART_VALUE_NAME = "VisionStudio"
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --tray'
+
+
+def autostart_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            return True
+    except Exception:
+        return False
+
+
+def set_autostart(enabled):
+    """Adds or removes the Windows start-up entry. Returns (ok, message)."""
+    try:
+        import winreg
+    except ImportError:
+        return False, "Starting with Windows only works on Windows."
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            if enabled:
+                winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, "Vision Studio will start with Windows, in the system tray." if enabled else \
+            "Vision Studio will no longer start with Windows."
+    except Exception as e:
+        return False, f"Could not change the Windows start-up setting: {e}"
+
+
+def refresh_autostart_path():
+    """If start-up is on, keep its command pointing at this copy of the program (after a reinstall or move)."""
+    if autostart_enabled():
+        set_autostart(True)
+
+
+def keep_system_awake():
+    """Asks Windows not to sleep while Vision Studio is open. The display may still turn off."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    except Exception:
+        pass
+
+
+def get_layouts_folder():
+    """Keyboard layout files (one .json per automation system) live here, next to Logs and Playlists."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "Layouts")
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Layouts")
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
@@ -952,12 +1034,28 @@ def hour_label(hour):
     return f"{hour % 24:02d}00"
 
 
+def voice_underlay_ms(path):
+    """A voice track's file name carries how many seconds of the next song's intro play under its end
+    (voicetrack_..._u6.wav). Returns milliseconds, or None when the file is not a voice track."""
+    if not path:
+        return None
+    name = os.path.splitext(os.path.basename(path))[0].lower()
+    if not name.startswith("voicetrack_"):
+        return None
+    match = re.search(r"_u(\d+)$", name)
+    return int(match.group(1)) * 1000 if match else 0
+
+
 def format_track_display(path):
     if is_hour_marker(path):
         tag = marker_tag(path)
         if len(tag) >= 2 and tag[-2:].isdigit():
             return f"---- Hour marker: {hour_label(int(tag[-2:]) % 24)} ----"
         return "---- Hour marker ----"
+    name = os.path.basename(path)
+    if name.lower().startswith("voicetrack_"):
+        stamp = re.sub(r"_u\d+$", "", os.path.splitext(name)[0][len("voicetrack_"):]).replace("_", " ")
+        return f"Voice track {stamp}"
     meta = get_track_metadata(path)
     if meta["artist"]:
         return f"{meta['artist']} - {meta['title']}"
@@ -1639,6 +1737,8 @@ DEFAULT_SHORTCUTS = [
     ("say_hour_remaining", "Announce time remaining in this hour", "Ctrl+Alt+H", True),
     ("say_mute", "Announce mute status", "Ctrl+Alt+M", True),
     ("say_encoders", "Announce encoder status", "Ctrl+Alt+E", True),
+    ("voice_track_before", "Voice track: record before the selected queue item", "Ctrl+T", True),
+    ("voice_track_after", "Voice track: record after the selected queue item", "Ctrl+Shift+T", True),
     ("queue_move_up", "Queue list: move the selected track up", "Ctrl+Up", False),
     ("queue_move_down", "Queue list: move the selected track down", "Ctrl+Down", False),
     ("queue_remove", "Queue list: remove the selected track", "Del", False),
@@ -1646,9 +1746,70 @@ DEFAULT_SHORTCUTS = [
 ]
 
 
+DEFAULT_LAYOUT_NAME = "Station Playlist (default)"
+
+
+def list_shortcut_layouts():
+    names = [DEFAULT_LAYOUT_NAME]
+    try:
+        for name in sorted(os.listdir(get_layouts_folder()), key=str.lower):
+            if name.lower().endswith(".json"):
+                names.append(os.path.splitext(name)[0])
+    except OSError:
+        pass
+    return names
+
+
+def read_layout_keys(name):
+    """The command-to-key map of a layout file, or {} for the built-in Station Playlist layout."""
+    if not name or name == DEFAULT_LAYOUT_NAME:
+        return {}
+    try:
+        with open(os.path.join(get_layouts_folder(), name + ".json"), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        keys = data.get("keys", data) if isinstance(data, dict) else {}
+        return {str(k): str(v) for k, v in keys.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def export_shortcut_layout(settings, path, name):
+    bindings = load_shortcut_bindings(settings)
+    data = {
+        "name": name,
+        "note": "Edit the keys below, save, then use Import Layout in Vision Studio. "
+                "Key names look like Ctrl+Shift+T. Leave a key empty to turn a command off.",
+        "keys": {sid: bindings.get(sid, "") for sid, _l, _k, rebind in DEFAULT_SHORTCUTS if rebind},
+        "commands": {sid: label for sid, label, _k, rebind in DEFAULT_SHORTCUTS if rebind},
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def import_shortcut_layout(src_path):
+    """Copies a layout file into the Layouts folder. Returns the layout name, or None if it is not valid."""
+    with open(src_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    keys = data.get("keys", data) if isinstance(data, dict) else None
+    if not isinstance(keys, dict) or not keys:
+        return None
+    name = re.sub(r"[^\w .()-]", "_", os.path.splitext(os.path.basename(src_path))[0]).strip() or "Imported layout"
+    with open(os.path.join(get_layouts_folder(), name + ".json"), "w", encoding="utf-8") as handle:
+        json.dump({"name": name, "keys": {str(k): str(v) for k, v in keys.items()}}, handle, indent=2)
+    return name
+
+
+def set_shortcut_layout(settings, name):
+    settings.setValue("shortcut_layout", name)
+    settings.setValue("shortcut_overrides", "{}")
+
+
 def load_shortcut_bindings(settings):
-    """Default layout, with any keys the user has changed layered on top."""
+    """Default layout, then the chosen layout file, then any keys the user changed on top."""
     bindings = {sid: key for sid, _label, key, _rebind in DEFAULT_SHORTCUTS}
+    for sid, key in read_layout_keys(str(settings.value("shortcut_layout", DEFAULT_LAYOUT_NAME))).items():
+        if sid in bindings:
+            bindings[sid] = key
     try:
         overrides = json.loads(settings.value("shortcut_overrides", "{}"))
         for sid, key in overrides.items():
@@ -2268,7 +2429,7 @@ class RotationEngine:
             self.on_status(f"Song finishing {int(seconds_to_mark)} seconds before the mark: starting the break now.")
         else:
             self.on_status("Song finished after the mark: starting the break now.")
-        self._take_break()
+        self._take_break(quick=(self.break_style() == "fade_at_mark" and seconds_to_mark >= 0))
         return True
 
     def prefetch_upcoming(self):
@@ -2375,8 +2536,12 @@ class RotationEngine:
         deck.stop()
         self._notify_deck_update(deck.name, None)
 
-    def crossfade_to_cued_deck(self):
-        """Starts the cued deck, crossfades the live deck out and the cued deck in, then swaps roles."""
+    VOICE_UNDERLAY_LEVEL = 0.30
+
+    def crossfade_to_cued_deck(self, underlay_ms=None):
+        """Starts the cued deck, crossfades the live deck out and the cued deck in, then swaps roles.
+        After a voice track (underlay_ms given) the song starts quietly under the end of the voice, and
+        rises to full level the moment the voice finishes; the voice itself is never faded."""
         live_deck = self.get_live_deck()
         cued_deck = self.get_cued_deck()
         if cued_deck.current_track_path is None:
@@ -2384,10 +2549,21 @@ class RotationEngine:
 
         target_level = self._effective_level()
         cued_deck.play()
-        live_deck.fader.fade_to(0.0, steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS,
-                                 on_complete=lambda d=live_deck: self._retire_deck(d))
-        cued_deck.fader.fade_to(target_level * cued_deck.manual_volume,
-                                 steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS)
+        if underlay_ms is not None:
+            full = target_level * cued_deck.manual_volume
+            cued_deck.audio_output.setVolume(full * (self.VOICE_UNDERLAY_LEVEL if underlay_ms > 700 else 0.0))
+            old_deck = live_deck
+
+            def voice_finished():
+                cued_deck.fader.fade_to(self._effective_level() * cued_deck.manual_volume,
+                                        steps=15, interval_ms=100)
+                QTimer.singleShot(1800, lambda d=old_deck: self._retire_deck(d))
+            QTimer.singleShot(max(50, int(underlay_ms)), voice_finished)
+        else:
+            live_deck.fader.fade_to(0.0, steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS,
+                                     on_complete=lambda d=live_deck: self._retire_deck(d))
+            cued_deck.fader.fade_to(target_level * cued_deck.manual_volume,
+                                     steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS)
 
         self.live_deck_name = cued_deck.name
         self.next_track_cued = False
@@ -2430,10 +2606,12 @@ class RotationEngine:
             crossfade_lead_ms = max(FADE_STEPS * FADE_INTERVAL_MS, 4000)
             if remaining_ms <= crossfade_lead_ms + 2000 and self._break_gate(deck, position_ms, duration_ms):
                 return
-            if not self.next_track_cued and 0 < remaining_ms <= crossfade_lead_ms + 2000:
+            underlay = voice_underlay_ms(deck.current_track_path)
+            lead_ms = crossfade_lead_ms if underlay is None else max(underlay, 500)
+            if not self.next_track_cued and 0 < remaining_ms <= max(crossfade_lead_ms, lead_ms) + 2000:
                 self.cue_next_track_if_needed()
-            if self.next_track_cued and 0 < remaining_ms <= crossfade_lead_ms:
-                self.crossfade_to_cued_deck()
+            if self.next_track_cued and 0 < remaining_ms <= lead_ms:
+                self.crossfade_to_cued_deck(underlay_ms=remaining_ms if underlay is not None else None)
 
     def begin_crossfade_out(self, on_complete, seconds=None):
         """Fades the live deck out ahead of a scheduled break."""
@@ -2611,6 +2789,8 @@ class _MixSource:
         self.frames = 0
         self.lock = threading.Lock()
         self.last_gain = 0.0
+        self.peak = 0.0
+        self.peak_time = 0.0
 
 
 class ProgramMixer:
@@ -2720,6 +2900,11 @@ class ProgramMixer:
         data = pcm_to_stereo_float(raw, sample_rate, channels, sample_format)
         if data is None or len(data) == 0:
             return
+        try:
+            source.peak = float(np.max(np.abs(data)))
+            source.peak_time = time.time()
+        except Exception:
+            pass
         with source.lock:
             source.chunks.append(data)
             source.frames += len(data)
@@ -2727,6 +2912,13 @@ class ProgramMixer:
             while source.frames > limit and source.chunks:
                 dropped = source.chunks.popleft()
                 source.frames -= len(dropped)
+
+    def recent_peak(self, name):
+        """Loudest sample from this source in the last fraction of a second, 0 to 1 (0 when idle)."""
+        source = self.sources.get(name)
+        if source is None or time.time() - source.peak_time > 0.25:
+            return 0.0
+        return min(1.0, source.peak)
 
     def register_encoder(self, encoder):
         if encoder not in self.encoders:
@@ -3145,6 +3337,107 @@ class SequencePlayer:
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
             self.on_status("Skipped an unreadable jingle or ad file.")
             self.play_next_in_queue()
+
+
+# ---------------------------------------------------------------------------
+# Voice tracking: records the microphone to a WAV file (separate from the on-air microphone)
+# ---------------------------------------------------------------------------
+
+class VoiceRecorder:
+    MAX_SECONDS = 300
+
+    def __init__(self, settings, on_status):
+        self.settings = settings
+        self.on_status = on_status
+        self.source = None
+        self.io = None
+        self.wav = None
+        self.path = None
+        self.format = None
+        self.bytes_written = 0
+
+    def start(self, path):
+        in_device = get_selected_input_device(self.settings)
+        if in_device is None or in_device.isNull():
+            self.on_status("No microphone was found, so a voice track cannot be recorded.")
+            return False
+        fmt = QAudioFormat()
+        fmt.setSampleRate(STREAM_SAMPLE_RATE)
+        fmt.setChannelCount(STREAM_CHANNELS)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        if not in_device.isFormatSupported(fmt):
+            fmt = in_device.preferredFormat()
+        if fmt.sampleFormat() not in (QAudioFormat.SampleFormat.Int16, QAudioFormat.SampleFormat.Float):
+            self.on_status("This microphone uses a sound format Vision Studio cannot record yet.")
+            return False
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.wav = wave.open(path, "wb")
+            self.wav.setnchannels(fmt.channelCount())
+            self.wav.setsampwidth(2)
+            self.wav.setframerate(fmt.sampleRate())
+            self.source = QAudioSource(in_device, fmt)
+            self.io = self.source.start()
+        except Exception as e:
+            self._close_file()
+            self.on_status(f"The voice track could not be started: {e}")
+            return False
+        if self.io is None:
+            self._close_file()
+            self.on_status("The microphone could not be opened for the voice track.")
+            return False
+        self.format = fmt
+        self.path = path
+        self.bytes_written = 0
+        self.io.readyRead.connect(self._read)
+        return True
+
+    def _read(self):
+        if self.io is None or self.wav is None:
+            return
+        data = bytes(self.io.readAll())
+        if not data:
+            return
+        if self.format.sampleFormat() == QAudioFormat.SampleFormat.Float:
+            samples = np.frombuffer(data[: len(data) // 4 * 4], dtype=np.float32)
+            data = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        self.wav.writeframes(data)
+        self.bytes_written += len(data)
+
+    def seconds(self):
+        if self.format is None:
+            return 0.0
+        return self.bytes_written / float(max(1, self.format.sampleRate() * self.format.channelCount() * 2))
+
+    def _close_file(self):
+        try:
+            if self.wav is not None:
+                self.wav.close()
+        except Exception:
+            pass
+        self.wav = None
+
+    def stop(self):
+        """Finishes the file and returns how many seconds were recorded."""
+        try:
+            self._read()
+            if self.source is not None:
+                self.source.stop()
+        except Exception:
+            pass
+        self.source = None
+        self.io = None
+        seconds = self.seconds()
+        self._close_file()
+        return seconds
+
+    def cancel(self):
+        self.stop()
+        try:
+            if self.path and os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError:
+            pass
 
 
 
@@ -3704,6 +3997,186 @@ QUEUE_DISPLAY_LIMIT = 300
 _QUEUE_TEXT_CACHE = {}
 
 
+class MixerConsole(QWidget):
+    """A broadcast-style mixer drawn on screen: a strip for each deck, the microphone, the jingle and ad
+    player and the master, with level meters, on-air lamps and faders that light up when they move, a
+    crossfader, and a lamp for every encoder (green when live)."""
+
+    CHANNEL_ORDER = ("deck_a", "deck_b", "mic", "seq", "master")
+    MOVE_FLASH_SECONDS = 1.5
+    SEGMENTS = 16
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(250)
+        self.setMinimumWidth(480)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setAccessibleName("Mixer console")
+        self.state = {"channels": {}, "crossfader": 0, "encoders": [], "summary": ""}
+        self.vu_shown = {}
+        self.fader_prev = {}
+        self.moved_at = {}
+        self._last_summary = ""
+
+    def update_state(self, state):
+        now = time.time()
+        for key, channel in state.get("channels", {}).items():
+            raw = float(channel.get("vu", 0.0))
+            self.vu_shown[key] = max(raw, self.vu_shown.get(key, 0.0) * 0.82)
+            fader = channel.get("fader")
+            if fader is not None:
+                previous = self.fader_prev.get(key)
+                if previous is not None and abs(fader - previous) > 0.004:
+                    self.moved_at[key] = now
+                self.fader_prev[key] = fader
+        cross = float(state.get("crossfader", 0))
+        previous = self.fader_prev.get("xfade")
+        if previous is not None and abs(cross - previous) > 0.5:
+            self.moved_at["xfade"] = now
+        self.fader_prev["xfade"] = cross
+        self.state = state
+        summary = state.get("summary", "")
+        if summary != self._last_summary:
+            self._last_summary = summary
+            self.setAccessibleDescription(summary)
+        self.update()
+
+    def is_moving(self, key):
+        return time.time() - self.moved_at.get(key, 0.0) < self.MOVE_FLASH_SECONDS
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            self.draw(painter)
+        except Exception:
+            pass
+        finally:
+            painter.end()
+
+    def draw(self, p):
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(COLOR_PANEL_DARK))
+        p.setPen(QPen(QColor(COLOR_BORDER), 1))
+        p.drawRect(0, 0, w - 1, h - 1)
+        bottom_rows = 76                       # crossfader and encoders
+        strips = len(self.CHANNEL_ORDER)
+        strip_w = (w - 16) / float(strips)
+        top = 8
+        strip_h = h - bottom_rows - top - 6
+        channels = self.state.get("channels", {})
+        for n, key in enumerate(self.CHANNEL_ORDER):
+            channel = channels.get(key, {})
+            x = 8 + n * strip_w
+            self.draw_strip(p, key, channel, x, top, strip_w - 6, strip_h)
+        self.draw_crossfader(p, 14, h - bottom_rows + 2, w - 28)
+        self.draw_encoders(p, 14, h - 40, w - 28)
+
+    def draw_strip(self, p, key, channel, x, y, w, h):
+        p.setPen(QPen(QColor(COLOR_BORDER), 1))
+        p.setBrush(QBrush(QColor(COLOR_BACKGROUND)))
+        p.drawRoundedRect(QRectF(x, y, w, h), 6, 6)
+        label = channel.get("label", key)
+        p.setPen(QColor(COLOR_TEXT_BRIGHT))
+        font = p.font()
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(QRectF(x, y + 3, w, 16), Qt.AlignmentFlag.AlignCenter, label)
+        font.setBold(False)
+        p.setFont(font)
+        # lamp and status
+        color = QColor(channel.get("color", COLOR_TEXT_DIM))
+        lit = bool(channel.get("on", False))
+        p.setPen(QPen(color.darker(160), 1))
+        p.setBrush(QBrush(color if lit else QColor(COLOR_BORDER)))
+        p.drawEllipse(QPointF(x + 14, y + 32), 6, 6)
+        p.setPen(color if lit else QColor(COLOR_TEXT_DIM))
+        p.drawText(QRectF(x + 24, y + 22, w - 26, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   channel.get("status", ""))
+        # meter
+        meter_top, meter_bottom = y + 50, y + h - 22
+        meter_x, meter_w = x + 12, 14
+        seg_h = (meter_bottom - meter_top) / float(self.SEGMENTS)
+        level = self.vu_shown.get(key, 0.0)
+        lit_segments = int(round(min(1.0, level) * self.SEGMENTS))
+        for s in range(self.SEGMENTS):
+            from_bottom = s
+            seg_y = meter_bottom - (from_bottom + 1) * seg_h
+            if from_bottom < self.SEGMENTS * 0.62:
+                seg_color = QColor(COLOR_ON_AIR_GREEN)
+            elif from_bottom < self.SEGMENTS * 0.85:
+                seg_color = QColor(COLOR_WARNING_AMBER)
+            else:
+                seg_color = QColor(COLOR_LIVE_RED)
+            if from_bottom >= lit_segments:
+                seg_color = seg_color.darker(400)
+            p.fillRect(QRectF(meter_x, seg_y + 1, meter_w, max(1.0, seg_h - 2)), seg_color)
+        # fader
+        fader = channel.get("fader")
+        track_x = x + w - 26
+        p.setPen(QPen(QColor(COLOR_BORDER), 3))
+        p.drawLine(QPointF(track_x, meter_top), QPointF(track_x, meter_bottom))
+        if fader is None:
+            p.setPen(QColor(COLOR_TEXT_DIM))
+            p.drawText(QRectF(x + 32, meter_top, w - 34, meter_bottom - meter_top),
+                       Qt.AlignmentFlag.AlignCenter, "no fader")
+        else:
+            moving = self.is_moving(key)
+            knob_y = meter_bottom - max(0.0, min(1.0, fader)) * (meter_bottom - meter_top)
+            knob_color = QColor(COLOR_ACTIVE_BLUE if moving else COLOR_TEXT_DIM)
+            p.setPen(QPen(QColor(COLOR_TEXT_BRIGHT if moving else COLOR_BORDER), 2 if moving else 1))
+            p.setBrush(QBrush(knob_color))
+            p.drawRoundedRect(QRectF(track_x - 11, knob_y - 6, 22, 12), 3, 3)
+            p.setPen(QColor(COLOR_ACTIVE_BLUE if moving else COLOR_TEXT_DIM))
+            p.drawText(QRectF(x, y + h - 20, w, 18), Qt.AlignmentFlag.AlignCenter,
+                       f"{int(round(fader * 100))}%" + ("  MOVING" if moving else ""))
+
+    def draw_crossfader(self, p, x, y, w):
+        p.setPen(QColor(COLOR_TEXT_BRIGHT))
+        p.drawText(QRectF(x, y, w, 16), Qt.AlignmentFlag.AlignCenter, "CROSSFADER")
+        track_y = y + 28
+        p.setPen(QPen(QColor(COLOR_BORDER), 4))
+        p.drawLine(QPointF(x + 22, track_y), QPointF(x + w - 22, track_y))
+        p.setPen(QColor(COLOR_TEXT_DIM))
+        p.drawText(QRectF(x, track_y - 10, 20, 20), Qt.AlignmentFlag.AlignCenter, "A")
+        p.drawText(QRectF(x + w - 20, track_y - 10, 20, 20), Qt.AlignmentFlag.AlignCenter, "B")
+        position = max(0.0, min(100.0, float(self.state.get("crossfader", 0)))) / 100.0
+        knob_x = x + 22 + position * (w - 44)
+        moving = self.is_moving("xfade")
+        p.setPen(QPen(QColor(COLOR_TEXT_BRIGHT if moving else COLOR_BORDER), 2 if moving else 1))
+        p.setBrush(QBrush(QColor(COLOR_ACTIVE_BLUE if moving else COLOR_TEXT_DIM)))
+        p.drawRoundedRect(QRectF(knob_x - 6, track_y - 11, 12, 22), 3, 3)
+
+    def draw_encoders(self, p, x, y, w):
+        encoders = self.state.get("encoders", [])
+        p.setPen(QColor(COLOR_TEXT_BRIGHT))
+        p.drawText(QRectF(x, y, 80, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "ENCODERS")
+        if not encoders:
+            p.setPen(QColor(COLOR_TEXT_DIM))
+            p.drawText(QRectF(x + 84, y, w - 84, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       "none set up")
+            return
+        colors = {"live": COLOR_ON_AIR_GREEN, "connecting": COLOR_WARNING_AMBER,
+                  "problem": COLOR_LIVE_RED, "offline": COLOR_BORDER}
+        cursor = x + 84
+        shown = 0
+        for name, state in encoders:
+            text = name if len(name) <= 14 else name[:13] + "..."
+            need = 26 + 7 * len(text)
+            if cursor + need > x + w - 40 and shown < len(encoders):
+                p.setPen(QColor(COLOR_TEXT_DIM))
+                p.drawText(QRectF(cursor, y, 60, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           f"+{len(encoders) - shown}")
+                break
+            color = QColor(colors.get(state, COLOR_BORDER))
+            p.setPen(QPen(color.darker(160), 1))
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QPointF(cursor + 7, y + 10), 6, 6)
+            p.setPen(QColor(COLOR_TEXT_BRIGHT if state == "live" else COLOR_TEXT_DIM))
+            p.drawText(QRectF(cursor + 18, y, need - 18, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+            cursor += need
+            shown += 1
+
+
 class QueueList(QListWidget):
     """Browse with Up/Down. Ctrl+Up/Down moves a track, Delete removes it, Insert adds tracks."""
 
@@ -4018,6 +4491,22 @@ class ShortcutsTab(QWidget):
                       "choose Change Key to remap it.")
         info.setWordWrap(True)
         layout.addWidget(info)
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("Layout:"))
+        self.layout_combo = QComboBox()
+        self.layout_combo.setAccessibleName("Keyboard layout. Choose the automation system whose keys you know.")
+        layout_row.addWidget(self.layout_combo, 1)
+        import_btn = QPushButton("Import Layout File...")
+        import_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        import_btn.clicked.connect(self.import_layout)
+        layout_row.addWidget(import_btn)
+        export_btn = QPushButton("Export Current Layout...")
+        export_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        export_btn.clicked.connect(self.export_layout)
+        layout_row.addWidget(export_btn)
+        layout.addLayout(layout_row)
+        self.fill_layouts()
+        self.layout_combo.currentIndexChanged.connect(self.on_layout_chosen)
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Command", "Key"])
         self.table.setAccessibleName("Keyboard shortcuts")
@@ -4030,12 +4519,58 @@ class ShortcutsTab(QWidget):
         change.setStyleSheet(BUTTON_STYLE_CONSOLE)
         change.clicked.connect(self.change_key)
         layout.addWidget(change)
-        reset = QPushButton("Reset All Shortcuts to Station Playlist Defaults")
+        reset = QPushButton("Reset All Keys to the Selected Layout")
         reset.setStyleSheet(BUTTON_STYLE_CONSOLE)
         reset.clicked.connect(self.reset_all)
         layout.addWidget(reset)
         self.setLayout(layout)
         self.refresh()
+
+    def fill_layouts(self):
+        self.layout_combo.blockSignals(True)
+        self.layout_combo.clear()
+        current = str(self.app.settings.value("shortcut_layout", DEFAULT_LAYOUT_NAME))
+        for name in list_shortcut_layouts():
+            self.layout_combo.addItem(name)
+        index = self.layout_combo.findText(current)
+        self.layout_combo.setCurrentIndex(max(0, index))
+        self.layout_combo.blockSignals(False)
+
+    def on_layout_chosen(self, _index):
+        name = self.layout_combo.currentText()
+        set_shortcut_layout(self.app.settings, name)
+        self.app.rebuild_shortcuts()
+        self.refresh()
+        self.app.announce(f"Keyboard layout: {name}. Your own key changes were cleared.")
+
+    def import_layout(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import a keyboard layout file", "", "Layout files (*.json)")
+        if not path:
+            return
+        try:
+            name = import_shortcut_layout(path)
+        except Exception as e:
+            self.app.announce(f"That layout file could not be read: {e}")
+            return
+        if not name:
+            self.app.announce("That file has no keys in it, so it was not imported.")
+            return
+        self.fill_layouts()
+        self.layout_combo.setCurrentIndex(max(0, self.layout_combo.findText(name)))   # applies it
+        if self.app.settings.value("shortcut_layout", "") != name:
+            self.on_layout_chosen(0)
+
+    def export_layout(self):
+        name = self.layout_combo.currentText()
+        path, _ = QFileDialog.getSaveFileName(self, "Export the current keyboard layout",
+                                              name.replace(" (default)", "") + ".json", "Layout files (*.json)")
+        if not path:
+            return
+        try:
+            export_shortcut_layout(self.app.settings, path, name)
+            self.app.announce(f"Layout saved to {path}. Edit it and import it to make your own layout.")
+        except Exception as e:
+            self.app.announce(f"The layout could not be saved: {e}")
 
     def refresh(self):
         bindings = load_shortcut_bindings(self.app.settings)
@@ -4076,7 +4611,143 @@ class ShortcutsTab(QWidget):
         reset_shortcut_overrides(self.app.settings)
         self.app.rebuild_shortcuts()
         self.refresh()
-        self.app.update_status("Shortcuts reset to the Station Playlist defaults.")
+        self.app.update_status("Keys reset to the selected layout.")
+
+
+class VoiceTrackDialog(QDialog):
+    """Voice track recorder. Recording: Enter stops. Review: P plays it back, Enter keeps it, R records it
+    again, Escape discards it. The music keeps playing the whole time."""
+
+    def __init__(self, parent, recorder, description, settings, default_underlay=6):
+        super().__init__(parent)
+        self.recorder = recorder
+        self.settings = settings
+        self.recorded_seconds = 0.0
+        self.state = "recording"
+        self.preview = None
+        self.setWindowTitle("Voice track")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        layout.addWidget(self.info)
+        self.time_label = QLabel("Recorded: 0 seconds")
+        self.time_label.setAccessibleName("Recorded time")
+        layout.addWidget(self.time_label)
+        form = QFormLayout()
+        self.underlay_spin = QSpinBox()
+        self.underlay_spin.setRange(0, 30)
+        self.underlay_spin.setValue(int(default_underlay))
+        self.underlay_spin.setAccessibleName("Seconds of the next song's intro that play under the end of this voice track. "
+                                             "Zero starts the song as the voice ends.")
+        form.addRow("Next song's intro under the end of the voice track, seconds:", self.underlay_spin)
+        layout.addLayout(form)
+        self.primary = QPushButton("")
+        self.primary.setDefault(True)
+        self.primary.clicked.connect(self.on_primary)
+        layout.addWidget(self.primary)
+        self.play_button = QPushButton("Play it back (P)")
+        self.play_button.clicked.connect(self.toggle_preview)
+        layout.addWidget(self.play_button)
+        self.again_button = QPushButton("Record it again (R)")
+        self.again_button.clicked.connect(self.record_again)
+        layout.addWidget(self.again_button)
+        self.cancel_button = QPushButton("Discard (Escape)")
+        self.cancel_button.clicked.connect(self.reject)
+        layout.addWidget(self.cancel_button)
+        self.setLayout(layout)
+        self.description = description
+        QShortcut(QKeySequence("P"), self).activated.connect(self.toggle_preview)
+        QShortcut(QKeySequence("R"), self).activated.connect(self.record_again)
+        self.timer = QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
+        self.show_state()
+
+    def show_state(self):
+        recording = self.state == "recording"
+        if recording:
+            text = (f"Recording a voice track {self.description}. Speak now. "
+                    "Press Enter when you are finished.")
+            self.primary.setText("Stop recording (Enter)")
+        else:
+            text = (f"Recorded {int(round(self.recorded_seconds))} seconds. Press P to play it back, "
+                    "R to record it again, Enter to keep it, or Escape to discard it.")
+            self.primary.setText("Keep this voice track (Enter)")
+        self.info.setText(text)
+        self.info.setAccessibleName(text)
+        self.play_button.setEnabled(not recording)
+        self.again_button.setEnabled(not recording)
+        self.primary.setFocus()
+
+    def tick(self):
+        if self.state == "recording":
+            seconds = int(self.recorder.seconds())
+            self.time_label.setText(f"Recorded: {seconds} seconds")
+            if seconds >= self.recorder.MAX_SECONDS:
+                self.finish_recording()
+
+    def finish_recording(self):
+        self.recorded_seconds = self.recorder.stop()
+        self.state = "review"
+        self.time_label.setText(f"Recorded: {int(round(self.recorded_seconds))} seconds")
+        self.show_state()
+
+    def on_primary(self):
+        if self.state == "recording":
+            self.finish_recording()
+        else:
+            self.stop_preview()
+            self.accept()
+
+    def toggle_preview(self):
+        if self.state != "review":
+            return
+        if self.preview is not None:
+            self.stop_preview()
+            return
+        try:
+            self.preview = QMediaPlayer()
+            output = QAudioOutput()
+            device = get_selected_output_device(self.settings)
+            if device is not None:
+                output.setDevice(device)
+            output.setVolume(1.0)
+            self.preview.setAudioOutput(output)
+            self._preview_output = output
+            self.preview.setSource(QUrl.fromLocalFile(self.recorder.path))
+            self.preview.mediaStatusChanged.connect(
+                lambda status: self.stop_preview() if status == QMediaPlayer.MediaStatus.EndOfMedia else None)
+            self.preview.play()
+            self.play_button.setText("Stop playback (P)")
+        except Exception:
+            self.preview = None
+
+    def stop_preview(self):
+        if self.preview is not None:
+            try:
+                self.preview.stop()
+            except Exception:
+                pass
+            self.preview = None
+        self.play_button.setText("Play it back (P)")
+
+    def record_again(self):
+        if self.state != "review":
+            return
+        self.stop_preview()
+        if self.recorder.start(self.recorder.path):
+            self.state = "recording"
+            self.time_label.setText("Recorded: 0 seconds")
+            self.show_state()
+
+    def done(self, result):
+        self.timer.stop()
+        self.stop_preview()
+        if self.state == "recording":
+            self.recorded_seconds = self.recorder.stop()
+        super().done(result)
 
 
 def break_window_seconds(settings):
@@ -4237,6 +4908,10 @@ class BroadcastingApp(QWidget):
         self._rescan_in_progress = False
         self._closing = False
         self._shutdown_done = False
+        self._quitting = False
+        self._voice_recording = False
+        self.tray = None
+        self.menu_actions = {}
         self.day_generated = set()
         self.append_attempted = set()
         self.last_schedule_hour = datetime.now().hour
@@ -4311,6 +4986,10 @@ class BroadcastingApp(QWidget):
         self.rotation_library.detect_new_files()  # first look: remember what is already there
         self.setup_ui()
         self.setup_shortcuts()
+        self.setup_tray()
+        self.setup_session_watch()
+        refresh_autostart_path()
+        keep_system_awake()
         self.apply_processing_settings()
         self.refresh_queue_list()
         self.refresh_status_tree()
@@ -4318,6 +4997,11 @@ class BroadcastingApp(QWidget):
         # is built and shown in the queue right away (nothing starts playing by itself).
         if self.setup_complete() and self.rotation_library.rotations:
             QTimer.singleShot(1500, lambda: self.ensure_hour_playlists(force=True))
+
+        self.console_timer = QTimer()
+        self.console_timer.setInterval(60)
+        self.console_timer.timeout.connect(self.refresh_console)
+        self.console_timer.start()
 
         self.vinyl_timer = QTimer()
         self.vinyl_timer.setInterval(30)
@@ -4404,6 +5088,8 @@ class BroadcastingApp(QWidget):
             "say_hour_remaining": self.say_hour_remaining,
             "say_mute": self.say_mute,
             "say_encoders": self.say_encoders,
+            "voice_track_before": self.voice_track_before,
+            "voice_track_after": self.voice_track_after,
         }
 
     def rebuild_shortcuts(self):
@@ -4418,6 +5104,8 @@ class BroadcastingApp(QWidget):
         self.shortcut_objects = []
         bindings = load_shortcut_bindings(self.settings)
         handlers = self.shortcut_handlers()
+        if self.menu_actions:
+            self.refresh_menu_labels()
         for sid, handler in handlers.items():
             key = bindings.get(sid, "")
             if not key:
@@ -4854,6 +5542,77 @@ class BroadcastingApp(QWidget):
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
 
+    def refresh_console(self):
+        try:
+            if hasattr(self, "console") and self.console.isVisible():
+                self.console.update_state(self.console_state())
+        except Exception:
+            pass
+
+    def console_state(self):
+        playing_state = QMediaPlayer.PlaybackState.PlayingState
+        live_mix = self.mixer.available
+        rot = self.rotation
+        channels = {}
+        names = {}
+        for key, deck, label in (("deck_a", rot.deck_a, "DECK A"), ("deck_b", rot.deck_b, "DECK B")):
+            playing = deck.current_track_path is not None and deck.player.playbackState() == playing_state
+            loaded = deck.current_track_path is not None
+            if playing:
+                status, color = "PLAYING", COLOR_ON_AIR_GREEN
+            elif loaded:
+                status, color = "CUED", COLOR_WARNING_AMBER
+            else:
+                status, color = "EMPTY", COLOR_TEXT_DIM
+            if live_mix:
+                vu = self.mixer.recent_peak(key) if playing else 0.0
+            else:
+                vu = deck.audio_output.volume() * 0.6 if playing else 0.0
+            channels[key] = {"label": label, "on": playing or loaded, "status": status, "color": color,
+                             "vu": vu, "fader": deck.manual_volume}
+            names[key] = f"{label.title()} {status.lower()}"
+        mic = self.microphone
+        if mic.is_live and mic.is_muted:
+            mic_status, mic_color, mic_on = "MUTED", COLOR_WARNING_AMBER, True
+        elif mic.is_live:
+            mic_status, mic_color, mic_on = "ON AIR", COLOR_LIVE_RED, True
+        else:
+            mic_status, mic_color, mic_on = "OFF", COLOR_TEXT_DIM, False
+        channels["mic"] = {"label": "MIC", "on": mic_on, "status": mic_status, "color": mic_color,
+                           "vu": self.mixer.recent_peak("mic") if (live_mix and mic.is_live and not mic.is_muted) else 0.0,
+                           "fader": None}
+        seq = self.sequence_player
+        seq_playing = seq.active and seq.player.playbackState() == playing_state
+        if seq.active and seq.items:
+            seq_status = f"{seq.slot} {min(seq.item_index + 1, len(seq.items))}/{len(seq.items)}"
+        else:
+            seq_status = "IDLE"
+        channels["seq"] = {"label": "JINGLES / ADS", "on": seq_playing, "status": seq_status,
+                           "color": COLOR_ON_AIR_GREEN if seq_playing else COLOR_TEXT_DIM,
+                           "vu": (self.mixer.recent_peak("sequence") if live_mix else 0.7) if seq_playing else 0.0,
+                           "fader": None}
+        if self.is_muted:
+            m_status, m_color, level = "MUTED", COLOR_LIVE_RED, 0.0
+        elif rot.is_ducked:
+            m_status, m_color, level = "DUCKED", COLOR_WARNING_AMBER, MIC_DUCKING_LEVEL
+        elif rot.is_running or seq_playing:
+            m_status, m_color, level = "ON AIR", COLOR_ON_AIR_GREEN, 1.0
+        else:
+            m_status, m_color, level = "IDLE", COLOR_TEXT_DIM, 1.0
+        master_vu = max(channels[k]["vu"] for k in ("deck_a", "deck_b", "mic", "seq"))
+        channels["master"] = {"label": "MASTER", "on": m_status != "IDLE", "status": m_status, "color": m_color,
+                              "vu": 0.0 if self.is_muted else master_vu, "fader": level}
+        encoders = []
+        for slot in self.encoder_bank.slots:
+            state = "problem" if slot in self.encoder_problems else slot.state
+            encoders.append((slot.stream_name, state))
+        live_names = [n for n, s in encoders if s == "live"]
+        summary = (f"{names['deck_a']}. {names['deck_b']}. Microphone {mic_status.lower()}. "
+                   f"Jingles and ads {seq_status.lower()}. Master {m_status.lower()}. "
+                   + (f"Encoders live: {', '.join(live_names)}." if live_names else "No encoders live."))
+        return {"channels": channels, "crossfader": self.crossfader_slider.value(),
+                "encoders": encoders, "summary": summary}
+
     def on_vinyl_tick(self):
         for name, deck in (("A", self.rotation.deck_a), ("B", self.rotation.deck_b)):
             widgets = self.deck_widgets.get(name)
@@ -5025,6 +5784,273 @@ class BroadcastingApp(QWidget):
         except Exception:
             pass
 
+    # --- menu bar (Alt+F) ---
+    def build_menus(self, layout):
+        self.menu_bar = QMenuBar()
+        file_menu = self.menu_bar.addMenu("&File")
+        file_menu.setAccessibleName("File menu")
+        voice_menu = self.menu_bar.addMenu("&Voice Track")
+        voice_menu.setAccessibleName("Voice Track menu")
+
+        def add(menu, key, text, handler, checkable=False):
+            action = QAction(text, self)
+            if checkable:
+                action.setCheckable(True)
+                action.toggled.connect(handler)
+            else:
+                action.triggered.connect(lambda _checked=False, h=handler: h())
+            menu.addAction(action)
+            self.menu_actions[key] = (action, text)
+            return action
+
+        add(file_menu, "insert_tracks", "Insert tracks into the queue", self.insert_tracks)
+        add(file_menu, "start_rotation", "Start rotation", self.start_rotation)
+        add(file_menu, "stop_rotation", "Stop rotation", self.rotation.stop)
+        add(file_menu, "mute_all", "Mute or unmute all audio", self.toggle_mute)
+        file_menu.addSeparator()
+        add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
+        act = add(file_menu, "close_to_tray", "Closing the window sends it to the system tray", self.on_close_to_tray_toggled, True)
+        act.setChecked(str(self.settings.value("close_to_tray", "false")).lower() == "true")
+        act = add(file_menu, "autostart", "Start Vision Studio when Windows starts", self.on_autostart_toggled, True)
+        act.setChecked(autostart_enabled())
+        file_menu.addSeparator()
+        add(file_menu, "exit", "Exit Vision Studio", self.exit_program)
+
+        add(voice_menu, "voice_track_before", "Record a voice track before the selected queue item", self.voice_track_before)
+        add(voice_menu, "voice_track_after", "Record a voice track after the selected queue item", self.voice_track_after)
+        layout.setMenuBar(self.menu_bar)
+        self.refresh_menu_labels()
+
+    def refresh_menu_labels(self):
+        """Shows each command's current shortcut key in its menu text."""
+        try:
+            bindings = load_shortcut_bindings(self.settings)
+        except Exception:
+            bindings = {}
+        for key, (action, text) in self.menu_actions.items():
+            shortcut = bindings.get(key, "")
+            action.setText(f"{text} ({shortcut})" if shortcut else text)
+
+    def on_close_to_tray_toggled(self, checked):
+        self.settings.setValue("close_to_tray", "true" if checked else "false")
+        self.announce("Closing the window now sends it to the system tray." if checked
+                      else "Closing the window now exits the program.")
+
+    def on_autostart_toggled(self, checked):
+        ok, message = set_autostart(checked)
+        self.settings.setValue("autostart_requested", "true" if checked else "false")
+        if hasattr(self, "autostart_check"):
+            self.autostart_check.blockSignals(True)
+            self.autostart_check.setChecked(autostart_enabled() if ok else not checked)
+            self.autostart_check.blockSignals(False)
+        action = self.menu_actions.get("autostart", (None, ""))[0]
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(autostart_enabled() if ok else not checked)
+            action.blockSignals(False)
+        self.announce(message)
+
+    # --- system tray ---
+    def make_app_icon(self):
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(QColor(20, 24, 33))
+        painter = QPainter(pixmap)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "VS")
+        painter.end()
+        return QIcon(pixmap)
+
+    def setup_tray(self):
+        try:
+            icon = self.make_app_icon()
+            self.setWindowIcon(icon)
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return
+            self.tray = QSystemTrayIcon(icon, self)
+            self.tray.setToolTip("Vision Studio")
+            menu = QMenu()
+            for text, handler in (("Show Vision Studio", self.show_from_tray),
+                                  ("Start rotation", self.start_rotation),
+                                  ("Stop rotation", self.rotation.stop),
+                                  ("Mute or unmute all audio", self.toggle_mute),
+                                  ("Exit Vision Studio", self.exit_program)):
+                action = menu.addAction(text)
+                action.triggered.connect(lambda _c=False, h=handler: h())
+            self.tray_menu = menu
+            self.tray.setContextMenu(menu)
+            self.tray.activated.connect(self.on_tray_activated)
+            self.tray.show()
+        except Exception as e:
+            self.tray = None
+            RUN_LOG.write("ERROR", f"System tray could not start: {e}")
+
+    def on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            if self.isVisible() and not self.isMinimized():
+                self.hide_to_tray()
+            else:
+                self.show_from_tray()
+
+    def hide_to_tray(self):
+        if self.tray is None:
+            self.showMinimized()
+            self.announce("No system tray is available, so the window was minimized instead.")
+            return
+        self.remember_window()
+        self.hide()
+        self.tray.showMessage("Vision Studio", "Still running in the system tray. Click the icon to open it.",
+                              QSystemTrayIcon.MessageIcon.Information, 4000)
+        RUN_LOG.write("TRAY", "Window sent to the system tray.")
+
+    def show_from_tray(self):
+        if str(self.settings.value("window_maximized", "true")).lower() in ("true", "1"):
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def start_in_tray(self):
+        """Opened by Windows at start-up: no window, just the tray icon (and optionally playing)."""
+        if self.tray is None:
+            self.showMinimized()
+        RUN_LOG.write("START", "Started with Windows, running in the system tray.")
+        if str(self.settings.value("autoplay_on_boot", "true")).lower() == "true":
+            QTimer.singleShot(8000, self.autoplay_after_boot)
+
+    def autoplay_after_boot(self):
+        if self.rotation.is_running:
+            return
+        if not self.rotation_library.rotations and not self.settings.value("music_library_folder", ""):
+            RUN_LOG.write("START", "Not starting automatically: no music folder is set.")
+            return
+        RUN_LOG.write("START", "Starting the rotation automatically after Windows started.")
+        self.start_rotation()
+
+    def exit_program(self):
+        """Really closes the program (asks first if audio is playing, then fades out)."""
+        self._quitting = True
+        if not self.isVisible():
+            self.show_from_tray()
+        self.close()
+        if not self._shutdown_done and not self._closing:
+            self._quitting = False     # the user said no to the close question
+
+    def quit_application(self):
+        try:
+            if self.tray is not None:
+                self.tray.hide()
+        except Exception:
+            pass
+        QTimer.singleShot(0, QApplication.quit)
+
+    # --- remote desktop and Windows sessions ---
+    SESSION_EVENTS = {1: "console connect", 2: "console disconnect", 3: "remote desktop connect",
+                      4: "remote desktop disconnect", 5: "logon", 6: "logoff", 7: "screen lock", 8: "screen unlock"}
+
+    def setup_session_watch(self):
+        """Remote Desktop connecting or disconnecting never stops the program. The sound output is simply
+        re-attached afterwards, because Windows swaps the audio devices when a remote session comes or goes."""
+        try:
+            self.media_devices = QMediaDevices(self)
+            self.media_devices.audioOutputsChanged.connect(lambda: QTimer.singleShot(1500, self.recover_audio))
+        except Exception:
+            self.media_devices = None
+        try:
+            import ctypes
+            ctypes.windll.wtsapi32.WTSRegisterSessionNotification(int(self.winId()), 0)
+        except Exception:
+            pass
+
+    def nativeEvent(self, eventType, message):
+        try:
+            if bytes(eventType) == b"windows_generic_MSG":
+                import ctypes.wintypes as wt
+                msg = wt.MSG.from_address(int(message))
+                if msg.message == 0x02B1:       # WM_WTSSESSION_CHANGE
+                    self.on_session_change(int(msg.wParam))
+        except Exception:
+            pass
+        return super().nativeEvent(eventType, message)
+
+    def on_session_change(self, code):
+        name = self.SESSION_EVENTS.get(code, f"event {code}")
+        RUN_LOG.write("SESSION", f"Windows session: {name}. Vision Studio keeps running.")
+        if code in (1, 2, 3, 4, 8):
+            QTimer.singleShot(2000, self.recover_audio)
+            QTimer.singleShot(8000, self.recover_audio)
+
+    def recover_audio(self):
+        try:
+            device = get_selected_output_device(self.settings)
+            if device is None:
+                return
+            self.rotation.apply_output_device(device)
+            self.sequence_player.apply_output_device(device)
+            for beep in (self.warning_beep, self.connect_beep, self.disconnect_beep):
+                beep.set_device(device)
+            RUN_LOG.write("SESSION", f"Sound output re-attached: {device.description()}.")
+        except Exception as e:
+            RUN_LOG.write("ERROR", f"Could not re-attach the sound output: {e}")
+
+    # --- voice tracking ---
+    def voice_track_before(self):
+        self.record_voice_track(after=False)
+
+    def voice_track_after(self):
+        self.record_voice_track(after=True)
+
+    def record_voice_track(self, after):
+        """Records a voice track and drops it into the queue before or after the selected item, like
+        Station Playlist. The music keeps playing while you talk; when the voice track is done the
+        next song fades in by itself."""
+        if self._voice_recording:
+            return
+        row = self.queue_list.currentRow()
+        header = self.queue_list.header_count
+        queue = self.rotation.shuffled_queue
+        if row >= header and row - header < len(queue):
+            index = row - header + (1 if after else 0)
+            where = f"{'after' if after else 'before'} {format_track_display(queue[row - header])}"
+        else:
+            index = 0
+            where = "as the next item, right after the song on air"
+        draft_path = os.path.join(get_voice_folder(), time.strftime("voicetrack_%Y-%m-%d_%H%M%S_draft.wav"))
+        recorder = VoiceRecorder(self.settings, self.update_status)
+        if not recorder.start(draft_path):
+            self.announce("The voice track could not start. Check the microphone in the Settings tab.")
+            return
+        self._voice_recording = True
+        RUN_LOG.write("VOICE", f"Recording a voice track {where}.")
+        try:
+            default_under = int(float(self.settings.value("voice_underlay_seconds", 6)))
+        except Exception:
+            default_under = 6
+        dialog = VoiceTrackDialog(self, recorder, where, self.settings, default_under)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._voice_recording = False
+        seconds = dialog.recorded_seconds
+        if not accepted or seconds < 0.5:
+            recorder.cancel()
+            self.announce("Voice track discarded." if not accepted else "Nothing was recorded, so no voice track was added.")
+            self.queue_list.setFocus()
+            return
+        underlay = dialog.underlay_spin.value()
+        self.settings.setValue("voice_underlay_seconds", underlay)
+        final_path = draft_path.replace("_draft.wav", f"_u{underlay}.wav")
+        try:
+            os.replace(draft_path, final_path)
+        except OSError:
+            final_path = draft_path
+        self.rotation.insert_queue_item(final_path, index)
+        RUN_LOG.write("VOICE", f"Voice track of {seconds:.0f} seconds saved: {final_path}")
+        self.announce(f"Voice track of {int(round(seconds))} seconds added {where}. "
+                      + (f"The next song's intro plays under its last {underlay} seconds."
+                         if underlay else "The next song starts as it ends."))
+        self.queue_list.setFocus()
+
     def audio_is_playing(self):
         playing = QMediaPlayer.PlaybackState.PlayingState
         try:
@@ -5047,10 +6073,16 @@ class BroadcastingApp(QWidget):
     def closeEvent(self, event):
         """Closing while audio is playing asks first, then fades out so nothing is cut off mid-sound."""
         if self._shutdown_done:
+            self.quit_application()
             event.accept()
             return
         if self._closing:
             event.ignore()
+            return
+        if (not self._quitting and self.tray is not None and self.tray.isVisible()
+                and str(self.settings.value("close_to_tray", "false")).lower() == "true"):
+            event.ignore()
+            self.hide_to_tray()
             return
         encoders = self.live_encoder_count()
         if self.audio_is_playing() or encoders:
@@ -5070,6 +6102,7 @@ class BroadcastingApp(QWidget):
             self.begin_graceful_close()
             return
         self.finish_shutdown()
+        self.quit_application()
         event.accept()
 
     def begin_graceful_close(self):
@@ -5230,6 +6263,7 @@ class BroadcastingApp(QWidget):
     # --- UI ---
     def setup_ui(self):
         layout = QVBoxLayout()
+        self.build_menus(layout)
 
         self.alert_label = QLabel("Alerts: none")
         self.alert_label.setAccessibleName("Alerts")
@@ -5331,6 +6365,9 @@ class BroadcastingApp(QWidget):
         player_display.addLayout(mixer_column)
         player_display.addLayout(self.build_deck_column("B"))
         layout_r.addLayout(player_display)
+
+        self.console = MixerConsole()
+        layout_r.addWidget(self.console)
 
         rotation_btn_row = QHBoxLayout()
         start_rotation_btn = QPushButton("Start Rotation")
@@ -5486,6 +6523,18 @@ class BroadcastingApp(QWidget):
         style_index = self.break_style_combo.findData(str(self.settings.value("break_style", "fade_at_mark")))
         self.break_style_combo.setCurrentIndex(max(0, style_index))
         layout_a.addRow("Break style:", self.break_style_combo)
+
+        self.top_hour_ads_check = QCheckBox("Also play a commercial break in the top of the hour (otherwise only its jingle plays)")
+        self.top_hour_ads_check.setChecked(str(self.settings.value("top_hour_ads", "false")).lower() == "true")
+        layout_a.addRow(self.top_hour_ads_check)
+
+        self.autostart_check = QCheckBox("Start Vision Studio when Windows starts (it opens in the system tray)")
+        self.autostart_check.setChecked(autostart_enabled())
+        self.autostart_check.toggled.connect(self.on_autostart_toggled)
+        layout_a.addRow(self.autostart_check)
+        self.autoplay_check = QCheckBox("When it starts with Windows, begin playing automatically")
+        self.autoplay_check.setChecked(str(self.settings.value("autoplay_on_boot", "true")).lower() == "true")
+        layout_a.addRow(self.autoplay_check)
 
         layout_a.addRow(self.live_mix_check)
 
@@ -5770,7 +6819,10 @@ class BroadcastingApp(QWidget):
                           f"Set it in the Jingles and Scheduler tab or run the setup wizard.")
         elif not scan_audio_files(jingle_folder):
             self.announce(f"The {slot} break folder has no audio files in it.")
-        self.sequence_player.play_sequence(slot, config["sequence"], jingle_folder)
+        sequence = config["sequence"]
+        if slot == ":00" and str(self.settings.value("top_hour_ads", "false")).lower() != "true":
+            sequence = "simple"      # the top of the hour is just its own jingle; commercials stay at :15 and :45
+        self.sequence_player.play_sequence(slot, sequence, jingle_folder)
 
     def on_break_upcoming(self, slot, target):
         """About two minutes before a mark: the engine starts protecting the song on air."""
@@ -5859,6 +6911,8 @@ class BroadcastingApp(QWidget):
     def save_audio_settings(self):
         self.settings.setValue("input_device", self.input_combo.currentText())
         self.settings.setValue("output_device", self.output_combo.currentText())
+        self.settings.setValue("autoplay_on_boot", "true" if self.autoplay_check.isChecked() else "false")
+        self.settings.setValue("top_hour_ads", "true" if self.top_hour_ads_check.isChecked() else "false")
         self.settings.setValue("use_live_mix", "true" if self.live_mix_check.isChecked() else "false")
         self.settings.setValue("playlist_mode", self.playlist_mode_combo.currentData())
         self.settings.setValue("playlist_lead_seconds", self.playlist_lead_spin.value())
@@ -5884,6 +6938,10 @@ class BroadcastingApp(QWidget):
 if __name__ == "__main__":
     install_crash_guard()
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)      # hiding to the system tray must not end the program
     window = BroadcastingApp()
-    window.show_remembered()
+    if "--tray" in sys.argv:
+        window.start_in_tray()
+    else:
+        window.show_remembered()
     sys.exit(app.exec())
