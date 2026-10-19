@@ -1,7 +1,7 @@
-; Inno Setup script for Vision Radio (VisionStudio).
+; Inno Setup script for Vision Studio (VisionStudio).
 ; Build with:  ISCC.exe VisionStudio.iss   (after PyInstaller has produced dist\VisionStudio.exe)
 
-#define MyAppName "Vision Radio"
+#define MyAppName "Vision Studio"
 #define MyAppVersion "2.0"
 #define MyAppPublisher "Vision Records"
 #define MyAppExeName "VisionStudio.exe"
@@ -31,6 +31,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
 
+[InstallDelete]
+; Remove shortcuts left by earlier builds that used the old name.
+Type: files; Name: "{autoprograms}\Vision Radio.lnk"
+Type: files; Name: "{autodesktop}\Vision Radio.lnk"
+
 [Dirs]
 ; The playlist folder lives in the user's Documents folder (follows OneDrive if Documents was moved).
 Name: "{userdocs}\VisionStudio\Playlists"
@@ -58,5 +63,5 @@ Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "categories
 Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "playlist_output_folder"; Flags: deletevalue
 
 [Run]
-; Launches the app right after install; the first launch opens the folder setup wizard.
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} and run the folder setup"; Flags: nowait postinstall skipifsilent
+; Launches the app right after install. Folders are then chosen in the Settings tab.
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

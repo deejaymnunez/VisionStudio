@@ -843,7 +843,16 @@ _DURATION_CACHE = {}
 
 
 def is_hour_marker(entry):
-    return entry == HOUR_MARKER_TOKEN
+    return isinstance(entry, str) and entry.startswith(HOUR_MARKER_TOKEN)
+
+
+def marker_for(day, hour):
+    """An hour marker that remembers which hour it opens, e.g. #HOURMARKER#2026101821."""
+    return f"{HOUR_MARKER_TOKEN}{day.strftime('%Y%m%d')}{hour:02d}"
+
+
+def marker_tag(entry):
+    return entry[len(HOUR_MARKER_TOKEN):] if is_hour_marker(entry) else ""
 
 
 def get_track_duration(path):
@@ -887,6 +896,9 @@ def hour_label(hour):
 
 def format_track_display(path):
     if is_hour_marker(path):
+        tag = marker_tag(path)
+        if len(tag) >= 2 and tag[-2:].isdigit():
+            return f"---- Hour marker: {hour_label(int(tag[-2:]) % 24)} ----"
         return "---- Hour marker ----"
     meta = get_track_metadata(path)
     if meta["artist"]:
@@ -1251,7 +1263,8 @@ def write_m3u(path, entries):
     lines = ["#EXTM3U"]
     for entry in entries:
         if is_hour_marker(entry):
-            lines.append("#VISIONSTUDIO-HOURMARKER")
+            tag = marker_tag(entry)
+            lines.append("#VISIONSTUDIO-HOURMARKER" + (f":{tag}" if tag else ""))
             continue
         meta = get_track_metadata(entry)
         label = f"{meta['artist']} - {meta['title']}" if meta["artist"] else meta["title"]
@@ -1281,8 +1294,9 @@ def read_m3u(path):
         line = line.strip()
         if not line:
             continue
-        if line == "#VISIONSTUDIO-HOURMARKER":
-            entries.append(HOUR_MARKER_TOKEN)
+        if line.startswith("#VISIONSTUDIO-HOURMARKER"):
+            tag = line.split(":", 1)[1].strip() if ":" in line else ""
+            entries.append(HOUR_MARKER_TOKEN + tag)
             continue
         if line.startswith("#"):
             continue
@@ -1324,17 +1338,20 @@ class PlaylistGenerator:
         self.schedule = schedule
         self.last_fire_key = None
         self._artist_cache = {}
+        self.carry_clock = [0.0]
+        self.carry_track = {}
+        self.carry_artist = {}
 
     # --- settings ---
     def mode(self):
-        mode = str(self.settings.value("playlist_mode", "midnight_full_day"))
-        return mode if mode in self.MODES else "midnight_full_day"
+        mode = str(self.settings.value("playlist_mode", "hour_lead"))
+        return mode if mode in self.MODES else "hour_lead"
 
     def lead_seconds(self):
         try:
-            return max(0, int(self.settings.value("playlist_lead_seconds", 0)))
+            return max(0, int(self.settings.value("playlist_lead_seconds", 600)))
         except Exception:
-            return 0
+            return 600
 
     def fixed_times(self):
         text = str(self.settings.value("playlist_fixed_times", "00:00"))
@@ -1355,11 +1372,12 @@ class PlaylistGenerator:
             self._artist_cache[path] = get_track_artist(path)
         return self._artist_cache[path]
 
-    def build_hour_entries(self, rotation, virtual_clock, last_track, last_artist, separation=None):
+    def build_hour_entries(self, rotation, virtual_clock, last_track, last_artist, separation=None,
+                           marker=HOUR_MARKER_TOKEN):
         """About an hour of tracks, starting with an hour marker. virtual_clock is advanced in place."""
         separation = DEFAULT_SEPARATION_SECONDS if separation is None else separation
         pool = rotation.track_paths() if rotation else []
-        entries = [HOUR_MARKER_TOKEN]
+        entries = [marker]
         if not pool:
             return entries
         random.shuffle(pool)
@@ -1401,9 +1419,12 @@ class PlaylistGenerator:
         rotation = self.library.find(self.schedule.rotation_id_for_hour(hour))
         if rotation is None:
             return None
+        # One continuous virtual clock and play history, so separation carries from hour to hour.
         entries = self.build_hour_entries(
-            rotation, virtual_clock if virtual_clock is not None else [0.0],
-            last_track if last_track is not None else {}, last_artist if last_artist is not None else {})
+            rotation, virtual_clock if virtual_clock is not None else self.carry_clock,
+            last_track if last_track is not None else self.carry_track,
+            last_artist if last_artist is not None else self.carry_artist,
+            marker=marker_for(day, hour))
         path = self.playlist_path(day, hour, rotation.name)
         write_m3u(path, entries)
         return path
@@ -1420,7 +1441,8 @@ class PlaylistGenerator:
             rotation = self.library.find(self.schedule.rotation_id_for_hour(hour))
             if rotation is None:
                 continue
-            entries = self.build_hour_entries(rotation, clock, last_track, last_artist)
+            entries = self.build_hour_entries(rotation, clock, last_track, last_artist,
+                                              marker=marker_for(day, hour))
             path = self.playlist_path(day, hour, rotation.name)
             write_m3u(path, entries)
             written.append(path)
@@ -1821,6 +1843,7 @@ class RotationEngine:
         self.on_rotation_swapped = None   # on_rotation_swapped(old_name, new_name)
         self.pinned_tracks = set()        # hand-inserted tracks skip the separation rule
         self.recently_added = []
+        self.playlist_driven = False      # True once the queue is fed by hourly playlists
 
         # Break protection (never cut a song for a scheduled break)
         self.break_target = None
@@ -1969,6 +1992,29 @@ class RotationEngine:
         self._queue_changed()
         return len(entries)
 
+    def queue_has_tag(self, tag):
+        return any(is_hour_marker(e) and marker_tag(e) == tag for e in self.shuffled_queue)
+
+    def drop_before_marker(self, tag):
+        """The hour has turned: remove what is left of the old hour, and the new hour's marker itself."""
+        for i, entry in enumerate(self.shuffled_queue):
+            if is_hour_marker(entry) and marker_tag(entry) == tag:
+                dropped = self.shuffled_queue[:i + 1]
+                self.shuffled_queue = self.shuffled_queue[i + 1:]
+                for item in dropped:
+                    self.pinned_tracks.discard(item)
+                self._queue_changed()
+                return len([d for d in dropped if not is_hour_marker(d)])
+        return 0
+
+    def drop_stale_cue(self):
+        """A track already cued from the old hour is thrown away so the new hour starts with its own music."""
+        if self.next_track_cued and not self.is_paused_for_sequence:
+            cued_deck = self.get_cued_deck()
+            cued_deck.stop()
+            self._notify_deck_update(cued_deck.name, None)
+            self.next_track_cued = False
+
     def add_new_tracks(self, rotation_id, paths):
         """New songs found in a rotation folder: join the live queue without touching the schedule."""
         if rotation_id != self.active_rotation_id or not paths:
@@ -1999,11 +2045,12 @@ class RotationEngine:
             return False
         old = self.rotation_library.find(self.active_rotation_id)
         self.active_rotation_id = new_id
-        random.shuffle(files)
-        keep = [p for p in self.shuffled_queue if p in self.pinned_tracks or is_hour_marker(p)]
-        self.shuffled_queue = keep + [f for f in files if f not in keep]
-        if self.is_running:
-            self.prefetch_upcoming()
+        if not self.playlist_driven:
+            random.shuffle(files)
+            keep = [p for p in self.shuffled_queue if p in self.pinned_tracks or is_hour_marker(p)]
+            self.shuffled_queue = keep + [f for f in files if f not in keep]
+            if self.is_running:
+                self.prefetch_upcoming()
         self._queue_changed()
         if self.on_rotation_swapped:
             self.on_rotation_swapped(old.name if old else "", new.name)
@@ -2071,15 +2118,20 @@ class RotationEngine:
         if not self.has_rotations() and (not folder or not os.path.isdir(folder)):
             self.on_status("No music library folder set. Rotation cannot start.")
             return
-        self.shuffled_queue = [p for p in self.shuffled_queue if p in self.pinned_tracks or is_hour_marker(p)]
-        count = self.build_shuffled_queue()
+        real_queued = [p for p in self.shuffled_queue if not is_hour_marker(p)]
+        if self.playlist_driven and real_queued:
+            count = len(real_queued)     # the hourly playlist is the queue: do not pile the library behind it
+            self.prefetch_upcoming()
+        else:
+            self.shuffled_queue = [p for p in self.shuffled_queue if p in self.pinned_tracks or is_hour_marker(p)]
+            count = self.build_shuffled_queue()
         if count == 0:
             self.on_status("Music library folder has no audio files, including its subfolders. Rotation cannot start.")
             return
         self.is_running = True
         self.is_paused_for_sequence = False
         self.live_deck_name = "A"
-        self.on_status(f"Rotation started, {count} track(s) shuffled from the library and its subfolders.")
+        self.on_status(f"Rotation started, {count} track(s) in the queue.")
         first_track = self.pick_next_valid_track()
         if first_track is None:
             self.on_status("Music library is empty. Rotation halted.")
@@ -3822,6 +3874,17 @@ WIZARD_STEPS = [
 ]
 
 
+FOLDER_SETTINGS = [
+    ("music_library_folder", "Music library"),
+    (":00", "Top of the hour jingles"),
+    (":15", "Quarter past jingles"),
+    (":30", "Station identifications (half past)"),
+    (":45", "Quarter to jingles"),
+    ("ad_break_folder", "Commercials"),
+    ("playlist_output_folder", "Playlist"),
+]
+
+
 class SetupIntroPage(QWizardPage):
     def __init__(self):
         super().__init__()
@@ -4010,8 +4073,10 @@ class BroadcastingApp(QWidget):
         self.apply_processing_settings()
         self.refresh_queue_list()
         self.refresh_status_tree()
-        if not self.setup_complete():
-            QTimer.singleShot(400, self.run_setup_wizard)   # first launch: ask for every folder
+        # Folders are set in the Settings tab. Once a music folder is known, the hour's playlist
+        # is built and shown in the queue right away (nothing starts playing by itself).
+        if self.setup_complete() and self.rotation_library.rotations:
+            QTimer.singleShot(1500, self.ensure_hour_playlists)
 
         self.vinyl_timer = QTimer()
         self.vinyl_timer.setInterval(30)
@@ -4085,7 +4150,7 @@ class BroadcastingApp(QWidget):
         return {
             "insert_tracks": self.insert_tracks,
             "insert_tracks_alt": self.insert_tracks,
-            "start_rotation": self.rotation.start,
+            "start_rotation": self.start_rotation,
             "stop_rotation": self.rotation.stop,
             "mute_all": self.toggle_mute,
             "open_options": self.open_options,
@@ -4451,8 +4516,7 @@ class BroadcastingApp(QWidget):
             if hour != self.last_schedule_hour:
                 self.last_schedule_hour = hour
                 self.schedule_tab.refresh()
-                if str(self.settings.value("playlist_autoload", "false")).lower() == "true" and self.rotation.is_running:
-                    self.load_current_hour_playlist(announce=False)
+                self.on_hour_changed()
             self.rescan_counter += 1
             if self.rescan_counter >= 60:
                 self.rescan_counter = 0
@@ -4496,16 +4560,72 @@ class BroadcastingApp(QWidget):
         try:
             if job[0] == "day":
                 files = self.playlist_generator.generate_full_day(job[1])
-                self.announce(f"Playlists generated for the day: {len(files)} files.")
+                self.announce(f"Playlists saved for the whole day: {len(files)} files in "
+                              f"{self.playlist_generator.output_folder()}.")
             else:
-                path = self.playlist_generator.generate_hour(job[1], job[2])
-                self.announce("Hour playlist generated." if path else "No rotation for that hour.")
+                self.append_hour(job[1], job[2])
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
             self.update_status(f"Playlist generation failed: {e}")
 
     def generate_now(self):
         self.run_generation_job(("day", datetime.now().date()))
+        self.ensure_hour_playlists(force=True)
+
+    def playlists_enabled(self):
+        return str(self.settings.value("playlist_autoload", "true")).lower() != "false"
+
+    def ensure_hour_playlists(self, force=False):
+        """Makes sure the queue holds this hour's playlist, and next hour's once the hour is near its end."""
+        if not self.rotation_library.rotations or not self.playlists_enabled():
+            return False
+        now = datetime.now()
+        tag = marker_for(now.date(), now.hour)[len(HOUR_MARKER_TOKEN):]
+        if force or not self.rotation.queue_has_tag(tag):
+            path = self.playlist_generator.generate_hour(now.date(), now.hour)
+            if not path:
+                self.update_status("Could not build this hour's playlist: no rotation is scheduled for it.")
+                return False
+            entries, _missing = read_m3u(path)
+            count = self.rotation.load_queue_entries(entries, replace=True)
+            self.rotation.playlist_driven = count > 0
+            self.update_status(f"This hour's playlist is ready: {count} entries, saved to {path}")
+        seconds_left = 3600 - (now.minute * 60 + now.second)
+        if seconds_left <= max(self.playlist_generator.lead_seconds(), 1):
+            nxt = now + timedelta(hours=1)
+            self.append_hour(nxt.date(), nxt.hour)
+        return True
+
+    def append_hour(self, day, hour):
+        """Builds that hour's playlist and puts it at the bottom of the queue."""
+        if not self.playlists_enabled():
+            return
+        tag = marker_for(day, hour)[len(HOUR_MARKER_TOKEN):]
+        if self.rotation.queue_has_tag(tag):
+            return
+        path = self.playlist_generator.generate_hour(day, hour)
+        if not path:
+            return
+        entries, _missing = read_m3u(path)
+        count = self.rotation.load_queue_entries(entries, replace=False)
+        self.rotation.playlist_driven = True
+        self.announce(f"The {hour_label(hour)} playlist is ready at the bottom of the queue: {count} entries.")
+
+    def on_hour_changed(self):
+        """The hour turned over: what is left of the old hour goes, the new hour's playlist leads."""
+        if not self.playlists_enabled() or not self.rotation_library.rotations:
+            return
+        now = datetime.now()
+        tag = marker_for(now.date(), now.hour)[len(HOUR_MARKER_TOKEN):]
+        if self.rotation.queue_has_tag(tag):
+            dropped = self.rotation.drop_before_marker(tag)
+            if dropped:
+                self.update_status(f"New hour: {dropped} unplayed track(s) from the last hour were removed.")
+        else:
+            self.ensure_hour_playlists(force=True)
+        if self.rotation.is_running:
+            self.rotation.drop_stale_cue()
+        self.refresh_status_tree()
 
     def load_current_hour_playlist(self, announce=True):
         path = self.playlist_generator.current_hour_playlist()
@@ -4763,7 +4883,7 @@ class BroadcastingApp(QWidget):
         rotation_btn_row = QHBoxLayout()
         start_rotation_btn = QPushButton("Start Rotation")
         start_rotation_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        start_rotation_btn.clicked.connect(self.rotation.start)
+        start_rotation_btn.clicked.connect(self.start_rotation)
         rotation_btn_row.addWidget(start_rotation_btn)
 
         stop_rotation_btn = QPushButton("Stop Rotation")
@@ -4867,6 +4987,22 @@ class BroadcastingApp(QWidget):
         self.input_combo.setCurrentText(self.settings.value("input_device", ""))
         self.output_combo.setCurrentText(self.settings.value("output_device", ""))
 
+        # Folders: set everything here, in any order.
+        self.folder_labels = {}
+        for key, title in FOLDER_SETTINGS:
+            value = self.settings.value(key, "") or ""
+            if key == "playlist_output_folder" and not value:
+                value = self.playlist_generator.output_folder() + " (default)"
+            label = QLabel(value or "not set")
+            label.setWordWrap(True)
+            label.setAccessibleName(f"{title} folder: {value or 'not set'}")
+            self.folder_labels[key] = label
+            layout_a.addRow(f"{title} folder:", label)
+            choose = QPushButton(f"Choose {title} Folder")
+            choose.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            choose.clicked.connect(lambda _checked=False, k=key, t=title: self.choose_folder_setting(k, t))
+            layout_a.addRow(choose)
+
         layout_a.addRow("Microphone/Line-In:", self.input_combo)
         layout_a.addRow("Speaker/Interface:", self.output_combo)
 
@@ -4877,11 +5013,11 @@ class BroadcastingApp(QWidget):
         # Playlist generation
         self.playlist_mode_combo = QComboBox()
         self.playlist_mode_combo.setAccessibleName("Playlist generation mode")
-        for label, value in (("Whole day at midnight (default)", "midnight_full_day"),
-                             ("Each hour, ahead of the hour", "hour_lead"),
+        for label, value in (("One hour at a time, ready before the hour ends (default)", "hour_lead"),
+                             ("Whole day at midnight", "midnight_full_day"),
                              ("At fixed times of day", "fixed_times")):
             self.playlist_mode_combo.addItem(label, value)
-        index = self.playlist_mode_combo.findData(str(self.settings.value("playlist_mode", "midnight_full_day")))
+        index = self.playlist_mode_combo.findData(str(self.settings.value("playlist_mode", "hour_lead")))
         self.playlist_mode_combo.setCurrentIndex(max(0, index))
         layout_a.addRow("Generate playlists:", self.playlist_mode_combo)
 
@@ -4889,25 +5025,19 @@ class BroadcastingApp(QWidget):
         self.playlist_lead_spin.setRange(0, 3600)
         self.playlist_lead_spin.setAccessibleName("Seconds before the target time to generate playlists")
         try:
-            self.playlist_lead_spin.setValue(int(self.settings.value("playlist_lead_seconds", 0)))
+            self.playlist_lead_spin.setValue(int(self.settings.value("playlist_lead_seconds", 600)))
         except Exception:
             pass
-        layout_a.addRow("Seconds early (0 = exactly on time):", self.playlist_lead_spin)
+        layout_a.addRow("Seconds before the hour ends to prepare the next playlist:", self.playlist_lead_spin)
 
         self.playlist_times_edit = QLineEdit(str(self.settings.value("playlist_fixed_times", "00:00")))
         self.playlist_times_edit.setAccessibleName("Fixed generation times, hours and minutes separated by commas")
         layout_a.addRow("Fixed times (for example 00:00, 12:00):", self.playlist_times_edit)
 
-        self.playlist_folder_label = QLabel(f"Playlist folder: {self.playlist_generator.output_folder()}")
-        self.playlist_folder_label.setWordWrap(True)
-        layout_a.addRow(self.playlist_folder_label)
-        folder_btn = QPushButton("Choose Playlist Folder")
-        folder_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        folder_btn.clicked.connect(self.choose_playlist_folder)
-        layout_a.addRow(folder_btn)
+        self.playlist_folder_label = self.folder_labels["playlist_output_folder"]
 
-        self.playlist_autoload_check = QCheckBox("Load each hour's playlist into the queue when the hour starts")
-        self.playlist_autoload_check.setChecked(str(self.settings.value("playlist_autoload", "false")).lower() == "true")
+        self.playlist_autoload_check = QCheckBox("Build hourly playlists and keep the queue filled from them")
+        self.playlist_autoload_check.setChecked(str(self.settings.value("playlist_autoload", "true")).lower() != "false")
         layout_a.addRow(self.playlist_autoload_check)
 
         wizard_btn = QPushButton("Run Setup Wizard Again")
@@ -5173,28 +5303,55 @@ class BroadcastingApp(QWidget):
 
     # --- Folder pickers: choosing a folder also starts loudness analysis right away ---
     def set_library_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Music Library Folder")
-        if folder:
-            self.settings.setValue("music_library_folder", folder)
-            files = scan_audio_files(folder)
-            self.update_status(f"Music library folder set: {folder} ({len(files)} tracks, including subfolders).")
-            self.normalizer.start(files)
+        self.choose_folder_setting("music_library_folder", "Music library")
 
     def set_jingle_folder(self, key):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if folder:
-            self.settings.setValue(key, folder)
-            files = scan_audio_files(folder)
-            self.update_status(f"Jingle folder for {key} set ({len(files)} files).")
-            self.normalizer.start(files)
+        titles = dict(FOLDER_SETTINGS)
+        self.choose_folder_setting(key, titles.get(key, key))
 
     def set_ad_break_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Ad Break Folder")
-        if folder:
-            self.settings.setValue("ad_break_folder", folder)
-            files = scan_audio_files(folder)
-            self.update_status(f"Ad break folder set: {folder} ({len(files)} files).")
-            self.normalizer.start(files)
+        self.choose_folder_setting("ad_break_folder", "Commercials")
+
+    def choose_folder_setting(self, key, title):
+        """One place that sets any folder: saves it, starts loudness analysis, and (for music) builds
+        the rotations, the schedule and this hour's playlist."""
+        start = self.settings.value(key, "") or ""
+        folder = QFileDialog.getExistingDirectory(self, f"Choose the {title} folder", start)
+        if not folder:
+            return
+        self.settings.setValue(key, folder)
+        if key in self.folder_labels:
+            self.folder_labels[key].setText(folder)
+            self.folder_labels[key].setAccessibleName(f"{title} folder: {folder}")
+        if key == "playlist_output_folder":
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as e:
+                self.update_status(f"Could not create that folder: {e}")
+            self.announce(f"Playlists will be saved in {folder}.")
+            self.ensure_hour_playlists(force=True)
+            return
+        files = scan_audio_files(folder)
+        self.normalizer.start(files)
+        if key == "music_library_folder":
+            self.settings.setValue("setup_complete", "true")
+            self._rescan_in_progress = False
+            self.rotation_library.sync_from_root(folder)
+            self.rotation_schedule.regenerate_even()
+            self.rotation_library.detect_new_files()
+            self.rotations_tab.refresh()
+            self.schedule_tab.refresh()
+            self.announce(f"Music library set: {len(files)} tracks and {len(self.rotation_library.rotations)} rotations found.")
+            self.ensure_hour_playlists(force=True)
+        else:
+            self.announce(f"{title} folder set: {len(files)} audio files found.")
+
+    def start_rotation(self):
+        if not self.rotation_library.rotations and not self.settings.value("music_library_folder", ""):
+            self.announce("No music folder is set. Open Settings with Control O and choose your music library folder.")
+            return
+        self.ensure_hour_playlists()
+        self.rotation.start()
 
     def save_audio_settings(self):
         self.settings.setValue("input_device", self.input_combo.currentText())
