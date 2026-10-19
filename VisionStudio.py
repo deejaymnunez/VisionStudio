@@ -4,6 +4,7 @@ import json
 import re
 import random
 import subprocess
+import shutil
 import tempfile
 import math
 import wave
@@ -78,7 +79,66 @@ SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform ==
 # Crash guard: in PyQt6 an unhandled Python exception inside a Qt callback can
 # abort the whole program. This logs the error to a file and keeps running.
 # ---------------------------------------------------------------------------
-ERROR_LOG_PATH = os.path.join(tempfile.gettempdir(), "visionstudio_errors.log")
+def _writable_dir(folder):
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write_test")
+        with open(probe, "w") as handle:
+            handle.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def get_logs_folder():
+    """Installed copy: a Logs folder inside the program folder, for example
+    C:\\Program Files (x86)\\Vision Studio\\Logs. Otherwise a folder under the user profile."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "Logs")
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Logs")
+    if _writable_dir(fallback):
+        return fallback
+    return tempfile.gettempdir()
+
+
+class RunLog:
+    """A plain text as-run log, one file per day: what played, which break items ran, alerts and errors."""
+
+    KEEP_DAYS = 60
+
+    def __init__(self):
+        self.folder = get_logs_folder()
+        self.lock = threading.Lock()
+        self.prune()
+
+    def path_for_today(self):
+        return os.path.join(self.folder, time.strftime("%Y-%m-%d") + ".log")
+
+    def write(self, kind, text):
+        try:
+            with self.lock:
+                os.makedirs(self.folder, exist_ok=True)
+                with open(self.path_for_today(), "a", encoding="utf-8") as handle:
+                    handle.write(f"{time.strftime('%H:%M:%S')}  {kind:<7} {text}\n")
+        except Exception:
+            pass
+
+    def prune(self):
+        cutoff = time.time() - self.KEEP_DAYS * 86400
+        try:
+            for name in os.listdir(self.folder):
+                full = os.path.join(self.folder, name)
+                if name.lower().endswith(".log") and os.path.isfile(full) and os.path.getmtime(full) < cutoff:
+                    os.remove(full)
+        except OSError:
+            pass
+
+
+RUN_LOG = RunLog()
+ERROR_LOG_PATH = os.path.join(RUN_LOG.folder, "errors.log")
 _CRASH_NOTIFIER = {"callback": None}
 
 
@@ -906,6 +966,18 @@ def format_track_display(path):
     return meta["title"]
 
 
+def describe_folder(path):
+    """Shows the folder path, how many audio files it holds, and the first one, so you can see it is being read."""
+    if not path:
+        return "not set"
+    if not os.path.isdir(path):
+        return f"{path} (folder not found)"
+    files = sorted(scan_audio_files(path), key=lambda p: p.lower())
+    if not files:
+        return f"{path} (no audio files found)"
+    return f"{path} ({len(files)} audio files, first: {os.path.basename(files[0])})"
+
+
 # ---------------------------------------------------------------------------
 # Rotations: unlimited named rotations, each backed by a folder
 # ---------------------------------------------------------------------------
@@ -1271,8 +1343,10 @@ def write_m3u(path, entries):
         lines.append(f"#EXTINF:{int(get_track_duration(entry))},{label}")
         lines.append(entry)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+    temp_path = path + ".tmp"          # written whole, then swapped in, so a playlist is never half-written
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(lines) + "\n")
+    os.replace(temp_path, path)
 
 
 def read_m3u(path):
@@ -1308,8 +1382,28 @@ def read_m3u(path):
     return entries, missing
 
 
+def _folder_is_writable(folder):
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write_test")
+        with open(probe, "w") as handle:
+            handle.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def default_playlist_folder():
-    """Documents\\VisionStudio\\Playlists, following the real Documents folder (even if OneDrive moved it)."""
+    """
+    Installed copy: a Playlists folder inside the program folder, for example
+    C:\\Program Files (x86)\\Vision Studio\\Playlists (the installer opens it up for writing).
+    Otherwise Documents\\VisionStudio\\Playlists.
+    """
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "Playlists")
+        if _folder_is_writable(candidate):
+            return candidate
     documents = ""
     try:
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
@@ -1338,20 +1432,21 @@ class PlaylistGenerator:
         self.schedule = schedule
         self.last_fire_key = None
         self._artist_cache = {}
+        self._pool_cache = {}
         self.carry_clock = [0.0]
         self.carry_track = {}
         self.carry_artist = {}
 
     # --- settings ---
     def mode(self):
-        mode = str(self.settings.value("playlist_mode", "hour_lead"))
-        return mode if mode in self.MODES else "hour_lead"
+        mode = str(self.settings.value("playlist_mode", "midnight_full_day"))
+        return mode if mode in self.MODES else "midnight_full_day"
 
     def lead_seconds(self):
         try:
-            return max(0, int(self.settings.value("playlist_lead_seconds", 600)))
+            return max(0, int(self.settings.value("playlist_lead_seconds", 0)))
         except Exception:
-            return 600
+            return 0
 
     def fixed_times(self):
         text = str(self.settings.value("playlist_fixed_times", "00:00"))
@@ -1376,7 +1471,12 @@ class PlaylistGenerator:
                            marker=HOUR_MARKER_TOKEN):
         """About an hour of tracks, starting with an hour marker. virtual_clock is advanced in place."""
         separation = DEFAULT_SEPARATION_SECONDS if separation is None else separation
-        pool = rotation.track_paths() if rotation else []
+        if rotation is None:
+            pool = []
+        elif rotation.id in self._pool_cache:
+            pool = list(self._pool_cache[rotation.id])
+        else:
+            pool = rotation.track_paths()
         entries = [marker]
         if not pool:
             return entries
@@ -1437,7 +1537,11 @@ class PlaylistGenerator:
         last_artist = {}
         written = []
         combined = []
-        for hour in range(24):
+        self.remove_day_playlists(day)    # whatever was written before for this day is replaced
+        self._pool_cache = {}
+        for rotation in self.library.rotations:
+            self._pool_cache[rotation.id] = rotation.track_paths()
+        for hour in range(24):            # 00:00 up to and including 23:00
             rotation = self.library.find(self.schedule.rotation_id_for_hour(hour))
             if rotation is None:
                 continue
@@ -1451,7 +1555,24 @@ class PlaylistGenerator:
             full_path = os.path.join(self.output_folder(), f"{day.strftime('%Y-%m-%d')}_fullday.m3u8")
             write_m3u(full_path, combined)
             written.append(full_path)
+        self._pool_cache = {}
         return written
+
+    def remove_day_playlists(self, day):
+        """Deletes every playlist already saved for that day, so corrected ones replace mistaken ones."""
+        prefix = f"{day.strftime('%Y-%m-%d')}_"
+        removed = 0
+        try:
+            for name in os.listdir(self.output_folder()):
+                if name.startswith(prefix) and name.lower().endswith((".m3u", ".m3u8")):
+                    try:
+                        os.remove(os.path.join(self.output_folder(), name))
+                        removed += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return removed
 
     def current_hour_playlist(self, day=None, hour=None):
         now = datetime.now()
@@ -1946,9 +2067,30 @@ class RotationEngine:
                 pass
 
     def queue_snapshot(self):
-        return list(self.shuffled_queue)
+        """What plays next, in order. A track already loaded onto the other deck is shown first."""
+        items = list(self.shuffled_queue)
+        if self.next_track_cued:
+            cued = self.get_cued_deck().current_track_path
+            if cued:
+                items.insert(0, cued)
+        return items
+
+    def uncue_to_front(self):
+        """Puts a track already loaded for the next crossfade back at the front of the queue, so edits
+        (an inserted jingle or ad, a move, a removal) decide what plays next."""
+        if not self.next_track_cued:
+            return
+        cued_deck = self.get_cued_deck()
+        path = cued_deck.current_track_path
+        cued_deck.stop()
+        self._notify_deck_update(cued_deck.name, None)
+        self.next_track_cued = False
+        if path:
+            self.shuffled_queue.insert(0, path)
+            self.pinned_tracks.add(path)
 
     def move_queue_item(self, index, delta):
+        self.uncue_to_front()
         new_index = index + delta
         if not (0 <= index < len(self.shuffled_queue)) or not (0 <= new_index < len(self.shuffled_queue)):
             return index
@@ -1960,6 +2102,7 @@ class RotationEngine:
         return new_index
 
     def remove_queue_item(self, index):
+        self.uncue_to_front()
         if not (0 <= index < len(self.shuffled_queue)):
             return None
         item = self.shuffled_queue.pop(index)
@@ -1968,7 +2111,9 @@ class RotationEngine:
         return item
 
     def insert_queue_item(self, path, index=None):
-        """Adds a track (or hour marker) to the queue. Never starts playback."""
+        """Adds a track (or hour marker) to the queue. Never starts playback. Inserted at the top, it
+        replaces whatever was about to play next."""
+        self.uncue_to_front()
         if index is None or index > len(self.shuffled_queue):
             index = len(self.shuffled_queue)
         index = max(0, index)
@@ -1983,6 +2128,11 @@ class RotationEngine:
     def load_queue_entries(self, entries, replace=True):
         entries = [e for e in entries if is_hour_marker(e) or os.path.isfile(e)]
         if replace:
+            if self.next_track_cued and not self.is_paused_for_sequence:
+                cued_deck = self.get_cued_deck()      # the new list decides what plays next
+                cued_deck.stop()
+                self._notify_deck_update(cued_deck.name, None)
+                self.next_track_cued = False
             self.shuffled_queue = []
         for e in entries:
             self.shuffled_queue.append(e)
@@ -2866,6 +3016,18 @@ class SequencePlayer:
 
         self.queue = []
         self.category_library = None  # set by the app: imported categories feed the sandwich
+        self.items = []               # the break in order, kept so the screen can show what is pulling
+        self.item_index = -1
+        self.active = False
+        self.slot = ""
+        self.on_changed = None        # on_changed(): the queue list and tree redraw
+
+    def _changed(self):
+        if self.on_changed:
+            try:
+                self.on_changed()
+            except Exception:
+                pass
 
     def apply_output_device(self, device):
         if device is not None:
@@ -2911,18 +3073,32 @@ class SequencePlayer:
         self.build_queue(sequence, jingle_folder)
         if not self.queue:
             self.on_status(f"No playable audio found for {slot} sequence.")
+            self.active = False
             self.on_sequence_done()
             return
+        self.items = list(self.queue)
+        self.item_index = -1
+        self.active = True
+        self.slot = slot
         self.on_status(f"Starting {slot} sequence, {len(self.queue)} item(s) queued.")
+        for i, item in enumerate(self.items, 1):
+            self.on_status(f"{slot} break item {i} of {len(self.items)}: {item}")
+        self._changed()
         self.play_next_in_queue()
 
     def play_next_in_queue(self):
         if not self.queue:
             self.on_status("Sequence finished.")
+            self.active = False
+            self.item_index = len(self.items)
+            self._changed()
             self.on_sequence_done()
             return
         next_file = self.queue.pop(0)
-        self.on_status(f"Playing: {os.path.basename(next_file)}")
+        self.item_index += 1
+        self.on_status(f"Playing {self.item_index + 1} of {len(self.items)}: {next_file}")
+        RUN_LOG.write("BREAK", f"{self.slot} item {self.item_index + 1} of {len(self.items)}: {next_file}")
+        self._changed()
         playback_path = normalize_file_loudness(next_file, self.on_status)
         self.player.setSource(QUrl.fromLocalFile(playback_path))
         self.player.play()
@@ -3425,50 +3601,66 @@ class EncoderBankWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class VinylWidget(QWidget):
-    """A record that spins while its deck has a playing track."""
+    """A record that spins while its deck has a playing track. Turns at 45 rpm, with bright sheen
+    wedges and a two-colour label so the turning is easy to see."""
 
-    def __init__(self, deck_name, size=96):
+    DEGREES_PER_SECOND = 270.0
+
+    def __init__(self, deck_name, size=120):
         super().__init__()
         self.deck_name = deck_name
         self.angle = 0.0
         self.spinning = False
+        self._last_tick = time.monotonic()
         self.setFixedSize(size, size)
         self.setAccessibleName(f"Deck {deck_name} record: stopped")
 
     def set_spinning(self, spinning):
         if spinning != self.spinning:
             self.spinning = spinning
+            self._last_tick = time.monotonic()
             self.setAccessibleName(f"Deck {self.deck_name} record: {'spinning' if spinning else 'stopped'}")
             self.update()
 
     def tick(self):
+        now = time.monotonic()
+        elapsed = min(now - self._last_tick, 0.2)
+        self._last_tick = now
         if self.spinning:
-            self.angle = (self.angle + 6.0) % 360.0  # 200 degrees a second, about 33 rpm at the app's 30 ms tick
+            self.angle = (self.angle + elapsed * self.DEGREES_PER_SECOND) % 360.0
             self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = self.width()
-        centre = QPointF(w / 2.0, w / 2.0)
         radius = w / 2.0 - 3
+        painter.translate(QPointF(w / 2.0, w / 2.0))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor("#0B0B0B")))
-        painter.drawEllipse(centre, radius, radius)
+        painter.drawEllipse(QPointF(0, 0), radius, radius)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#2A2A2A"), 1))
-        for frac in (0.9, 0.78, 0.66, 0.54):
-            painter.drawEllipse(centre, radius * frac, radius * frac)
-        painter.translate(centre)
+        painter.setPen(QPen(QColor("#2E2E2E"), 1))
+        for frac in (0.92, 0.82, 0.72, 0.62, 0.52):
+            painter.drawEllipse(QPointF(0, 0), radius * frac, radius * frac)
         painter.rotate(self.angle)
-        label_radius = radius * 0.36
+        # sheen wedges: bright, so the movement is obvious
+        box = QRectF(-radius, -radius, radius * 2, radius * 2)
         painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 70 if self.spinning else 30)))
+        painter.drawPie(box, 20 * 16, 38 * 16)
+        painter.drawPie(box, 200 * 16, 38 * 16)
+        # label: two colours, so one half sweeping round is easy to follow
+        label = radius * 0.42
+        label_box = QRectF(-label, -label, label * 2, label * 2)
         painter.setBrush(QBrush(QColor(COLOR_ACTIVE_BLUE if self.spinning else "#555555")))
-        painter.drawEllipse(QPointF(0, 0), label_radius, label_radius)
+        painter.drawPie(label_box, 0, 180 * 16)
+        painter.setBrush(QBrush(QColor(COLOR_WARNING_AMBER if self.spinning else "#777777")))
+        painter.drawPie(label_box, 180 * 16, 180 * 16)
         painter.setBrush(QBrush(QColor("#F0F0F0")))
-        painter.drawEllipse(QPointF(label_radius * 0.55, 0), 3.0, 3.0)  # marker dot shows the rotation
+        painter.drawEllipse(QPointF(label * 0.62, 0), 4.0, 4.0)
         painter.setBrush(QBrush(QColor("#0B0B0B")))
-        painter.drawEllipse(QPointF(0, 0), 3.0, 3.0)
+        painter.drawEllipse(QPointF(0, 0), 3.5, 3.5)
         painter.end()
 
 
@@ -3488,18 +3680,19 @@ class QueueList(QListWidget):
         self.setAccessibleName("Queue: upcoming tracks. Up and Down browse, Control Up and Down move the "
                                "selected track, Delete removes it, Insert adds tracks.")
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.header_count = 1   # rows above the queue itself: the song on air and any break items
 
     def keyPressEvent(self, event):
         key = event.key()
         ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         row = self.currentRow()
         if ctrl and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            if row >= 0:
+            if row >= self.header_count:
                 self.move_requested.emit(row, -1 if key == Qt.Key.Key_Up else 1)
             event.accept()
             return
         if key == Qt.Key.Key_Delete:
-            if row >= 0:
+            if row >= self.header_count:
                 self.remove_requested.emit(row)
             event.accept()
             return
@@ -3519,10 +3712,16 @@ class QueueList(QListWidget):
                 return True
         return super().event(e)
 
-    def show_queue(self, entries, select_row=None):
+    def show_queue(self, entries, headers=None, select_row=None):
+        """headers: rows shown above the queue (the song on air, then any break items). Insert with the
+        song on air selected puts tracks at the very top of the queue, ahead of what was about to play."""
+        headers = headers or []
+        self.header_count = len(headers)
         row = self.currentRow() if select_row is None else select_row
         self.blockSignals(True)
         self.clear()
+        for header in headers:
+            self.addItem(header)
         shown = entries[:QUEUE_DISPLAY_LIMIT]
         fresh_reads = 0
         for i, entry in enumerate(shown):
@@ -3544,8 +3743,8 @@ class QueueList(QListWidget):
         if len(entries) > len(shown):
             self.addItem(f"... and {len(entries) - len(shown)} more tracks")
         self.blockSignals(False)
-        if entries:
-            self.setCurrentRow(max(0, min(row, len(entries) - 1)))
+        if self.count():
+            self.setCurrentRow(max(0, min(row, self.count() - 1)))
 
 
 class RotationsTab(QWidget):
@@ -3729,8 +3928,7 @@ class CategoriesTab(QWidget):
         row = self.list.currentRow()
         self.list.clear()
         for category in self.app.category_library.categories:
-            count = len(scan_audio_files(category["folder"]))
-            self.list.addItem(f"{self.app.category_library.describe(category)}: {count} files")
+            self.list.addItem(f"{category['name']} ({category['type']}): {describe_folder(category['folder'])}")
         if self.list.count():
             self.list.setCurrentRow(max(0, min(row, self.list.count() - 1)))
 
@@ -4001,13 +4199,19 @@ class BroadcastingApp(QWidget):
         output_device = get_selected_output_device(self.settings)
 
         self._rescan_in_progress = False
+        self._closing = False
+        self._shutdown_done = False
+        self.day_generated = set()
+        self.append_attempted = set()
         self.last_schedule_hour = datetime.now().hour
         self.rescan_counter = 0
+        RUN_LOG.write("START", "Vision Studio started.")
         self.rotation_library = RotationLibrary(self.settings, on_changed=self.on_rotations_changed)
         self.rotation_schedule = RotationSchedule(self.settings, self.rotation_library)
         self.category_library = CategoryLibrary(self.settings, on_changed=self.on_categories_changed)
         self.playlist_generator = PlaylistGenerator(self.settings, self.rotation_library, self.rotation_schedule)
         self.shortcut_objects = []
+        self.migrate_old_playlists()
 
         self.normalizer = NormalizeManager(self)
         self.normalizer.progress.connect(self.on_normalize_progress)
@@ -4032,6 +4236,7 @@ class BroadcastingApp(QWidget):
             self.settings, self.update_status, self.on_sequence_done, output_device
         )
         self.sequence_player.category_library = self.category_library
+        self.sequence_player.on_changed = self.on_sequence_changed
         self.scheduler = SchedulerEngine(self.settings, self.on_crossfade_start, self.update_status)
         self.scheduler.on_break_upcoming = self.on_break_upcoming
         self.encoder_bank = EncoderBankWidget(
@@ -4076,7 +4281,7 @@ class BroadcastingApp(QWidget):
         # Folders are set in the Settings tab. Once a music folder is known, the hour's playlist
         # is built and shown in the queue right away (nothing starts playing by itself).
         if self.setup_complete() and self.rotation_library.rotations:
-            QTimer.singleShot(1500, self.ensure_hour_playlists)
+            QTimer.singleShot(1500, lambda: self.ensure_hour_playlists(force=True))
 
         self.vinyl_timer = QTimer()
         self.vinyl_timer.setInterval(30)
@@ -4186,6 +4391,40 @@ class BroadcastingApp(QWidget):
             shortcut.activated.connect(handler)
             self.shortcut_objects.append(shortcut)
 
+    def migrate_old_playlists(self):
+        """Earlier builds saved playlists in Documents\\VisionStudio. They move to the program folder
+        (Playlists next to Logs) and the Documents folder is removed."""
+        try:
+            documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+            if not documents or not isinstance(documents, str):
+                documents = os.path.join(os.path.expanduser("~"), "Documents")
+            old_root = os.path.join(documents, "VisionStudio")
+            old_playlists = os.path.join(old_root, "Playlists")
+            saved = str(self.settings.value("playlist_output_folder", "") or "")
+            if saved and os.path.normcase(os.path.normpath(saved)) == os.path.normcase(os.path.normpath(old_playlists)):
+                self.settings.setValue("playlist_output_folder", "")
+            new_folder = self.playlist_generator.output_folder()
+            if not os.path.isdir(old_root) or os.path.normcase(os.path.normpath(new_folder)) == \
+                    os.path.normcase(os.path.normpath(old_playlists)):
+                return
+            moved = 0
+            if os.path.isdir(old_playlists):
+                os.makedirs(new_folder, exist_ok=True)
+                for name in os.listdir(old_playlists):
+                    source = os.path.join(old_playlists, name)
+                    target = os.path.join(new_folder, name)
+                    if os.path.isfile(source) and not os.path.exists(target):
+                        shutil.copy2(source, target)
+                        moved += 1
+            # remove the old folders only if nothing but playlists was in them
+            leftovers = [f for _root, _dirs, files in os.walk(old_root) for f in files
+                         if not f.lower().endswith((".m3u", ".m3u8"))]
+            if not leftovers:
+                shutil.rmtree(old_root, ignore_errors=True)
+            RUN_LOG.write("MOVE", f"Moved {moved} playlist file(s) from {old_playlists} to {new_folder}.")
+        except Exception as e:
+            RUN_LOG.write("ERROR", f"Could not move the old playlist folder: {e}")
+
     # --- first-run setup wizard ---
     def setup_complete(self):
         return str(self.settings.value("setup_complete", "false")).lower() == "true"
@@ -4294,7 +4533,11 @@ class BroadcastingApp(QWidget):
             self._set_tree("deck_" + name.lower(), text)
         self._set_tree("rotation", f"Rotation: {rot.active_rotation_name() or 'none'}"
                        + (", running" if rot.is_running else ", stopped"))
-        if rot.is_paused_for_sequence:
+        sp = self.sequence_player
+        if sp.active and sp.items and 0 <= sp.item_index < len(sp.items):
+            break_text = (f"Break {sp.slot}: item {sp.item_index + 1} of {len(sp.items)}, "
+                          f"{os.path.basename(sp.items[sp.item_index])}")
+        elif rot.is_paused_for_sequence:
             break_text = "Break: playing now"
         elif rot.break_target is not None:
             seconds = max(0, int((rot.break_target - datetime.now()).total_seconds()))
@@ -4414,33 +4657,63 @@ class BroadcastingApp(QWidget):
             "Audio files (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.wma *.opus);;All files (*.*)")
         if not files:
             return
+        # Like Station Playlist: the song on air is the first row. Insert with it selected puts the new
+        # tracks straight after it, ahead of whatever was about to play. Insert on a later row goes
+        # right after that row. With nothing selected the tracks go to the end.
         row = self.queue_list.currentRow()
-        index = row + 1 if row >= 0 and self.rotation.shuffled_queue else None
+        header = self.queue_list.header_count
+        index = max(0, row - header + 1) if row >= 0 else None
         for offset, path in enumerate(files):
             self.rotation.insert_queue_item(path, None if index is None else index + offset)
         self.normalizer.start(files, priority=True)
-        self.announce(f"Inserted {len(files)} track(s) into the queue.")
+        where = "next, ahead of the song that was about to play" if index == 0 else (
+            f"at position {index + 1}" if index is not None else "at the end")
+        self.announce(f"Inserted {len(files)} track(s) {where}.")
         self.queue_list.setFocus()
 
     def insert_hour_marker(self):
         row = self.queue_list.currentRow()
-        self.rotation.insert_queue_item(HOUR_MARKER_TOKEN, row + 1 if row >= 0 else None)
+        header = self.queue_list.header_count
+        self.rotation.insert_queue_item(HOUR_MARKER_TOKEN, max(0, row - header + 1) if row >= 0 else None)
         self.announce("Hour marker inserted into the queue.")
 
     def refresh_queue_list(self):
         if hasattr(self, "queue_list"):
-            self.queue_list.show_queue(self.rotation.queue_snapshot())
+            self.queue_list.show_queue(self.rotation.queue_snapshot(), self.queue_headers())
             self.queue_label.setText(f"Queue: {len(self.rotation.shuffled_queue)} tracks"
                                      + (f", rotation {self.rotation.active_rotation_name()}"
                                         if self.rotation.active_rotation_name() else ""))
 
+    def queue_headers(self):
+        """Rows above the queue: the song on air, then each item of a break with its folder, so you can
+        see exactly which files are being pulled."""
+        rot = self.rotation
+        path = rot.current_track_path
+        now = f"Now playing: {self._track_text(path)}" if path else "Nothing is playing"
+        if rot.is_paused_for_sequence:
+            now += " (music paused for the break)"
+        headers = [now]
+        sp = self.sequence_player
+        if sp.active and sp.items:
+            for i, item in enumerate(sp.items):
+                state = "done" if i < sp.item_index else ("playing now" if i == sp.item_index else "waiting")
+                headers.append(f"{sp.slot} break {i + 1} of {len(sp.items)}, {state}: "
+                               f"{os.path.basename(item)} from {os.path.dirname(item)}")
+        return headers
+
     def on_queue_move(self, row, delta):
-        new_row = self.rotation.move_queue_item(row, delta)
-        self.queue_list.setCurrentRow(new_row)
-        self.update_status(f"Moved to position {new_row + 1}.")
+        index = row - self.queue_list.header_count
+        if index < 0:
+            return
+        new_index = self.rotation.move_queue_item(index, delta)
+        self.queue_list.setCurrentRow(new_index + self.queue_list.header_count)
+        self.update_status(f"Moved to position {new_index + 1}.")
 
     def on_queue_remove(self, row):
-        removed = self.rotation.remove_queue_item(row)
+        index = row - self.queue_list.header_count
+        if index < 0:
+            return
+        removed = self.rotation.remove_queue_item(index)
         if removed is not None:
             self.update_status(f"Removed {format_track_display(removed)} from the queue.")
 
@@ -4517,6 +4790,7 @@ class BroadcastingApp(QWidget):
                 self.last_schedule_hour = hour
                 self.schedule_tab.refresh()
                 self.on_hour_changed()
+            self.maybe_append_next_hour()
             self.rescan_counter += 1
             if self.rescan_counter >= 60:
                 self.rescan_counter = 0
@@ -4559,9 +4833,8 @@ class BroadcastingApp(QWidget):
     def run_generation_job(self, job):
         try:
             if job[0] == "day":
-                files = self.playlist_generator.generate_full_day(job[1])
-                self.announce(f"Playlists saved for the whole day: {len(files)} files in "
-                              f"{self.playlist_generator.output_folder()}.")
+                if job[1] not in self.day_generated:    # already made today (for example at 23:50)? keep it
+                    self.generate_day(job[1])
             else:
                 self.append_hour(job[1], job[2])
         except Exception as e:
@@ -4569,11 +4842,40 @@ class BroadcastingApp(QWidget):
             self.update_status(f"Playlist generation failed: {e}")
 
     def generate_now(self):
-        self.run_generation_job(("day", datetime.now().date()))
         self.ensure_hour_playlists(force=True)
 
     def playlists_enabled(self):
         return str(self.settings.value("playlist_autoload", "true")).lower() != "false"
+
+    def generate_day(self, day):
+        """Writes every hour from midnight through 11 PM for that day, replacing earlier playlists for it."""
+        files = self.playlist_generator.generate_full_day(day)
+        self.day_generated.add(day)
+        hourly = max(0, len(files) - 1)
+        self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, midnight through 11 PM: {hourly} hourly "
+                      f"files in {self.playlist_generator.output_folder()}. Earlier playlists for that day were replaced.")
+        return files
+
+    def queue_lead_seconds(self):
+        try:
+            return max(0, int(float(self.settings.value("queue_lead_seconds", 600))))
+        except Exception:
+            return 600
+
+    def maybe_append_next_hour(self):
+        """Near the end of the hour, the next hour's playlist is put at the bottom of the queue."""
+        if not self.rotation.playlist_driven or not self.playlists_enabled():
+            return
+        now = datetime.now()
+        if 3600 - (now.minute * 60 + now.second) > self.queue_lead_seconds():
+            return
+        nxt = now + timedelta(hours=1)
+        key = (nxt.date(), nxt.hour)
+        tag = marker_for(nxt.date(), nxt.hour)[len(HOUR_MARKER_TOKEN):]
+        if key in self.append_attempted or self.rotation.queue_has_tag(tag):
+            return
+        self.append_attempted.add(key)
+        self.append_hour(nxt.date(), nxt.hour)
 
     def ensure_hour_playlists(self, force=False):
         """Makes sure the queue holds this hour's playlist, and next hour's once the hour is near its end."""
@@ -4582,7 +4884,10 @@ class BroadcastingApp(QWidget):
         now = datetime.now()
         tag = marker_for(now.date(), now.hour)[len(HOUR_MARKER_TOKEN):]
         if force or not self.rotation.queue_has_tag(tag):
-            path = self.playlist_generator.generate_hour(now.date(), now.hour)
+            path = None if force else self.playlist_generator.current_hour_playlist()
+            if path is None:
+                self.generate_day(now.date())    # the whole day, replacing anything made before
+                path = self.playlist_generator.current_hour_playlist()
             if not path:
                 self.update_status("Could not build this hour's playlist: no rotation is scheduled for it.")
                 return False
@@ -4590,10 +4895,7 @@ class BroadcastingApp(QWidget):
             count = self.rotation.load_queue_entries(entries, replace=True)
             self.rotation.playlist_driven = count > 0
             self.update_status(f"This hour's playlist is ready: {count} entries, saved to {path}")
-        seconds_left = 3600 - (now.minute * 60 + now.second)
-        if seconds_left <= max(self.playlist_generator.lead_seconds(), 1):
-            nxt = now + timedelta(hours=1)
-            self.append_hour(nxt.date(), nxt.hour)
+        self.maybe_append_next_hour()
         return True
 
     def append_hour(self, day, hour):
@@ -4603,7 +4905,10 @@ class BroadcastingApp(QWidget):
         tag = marker_for(day, hour)[len(HOUR_MARKER_TOKEN):]
         if self.rotation.queue_has_tag(tag):
             return
-        path = self.playlist_generator.generate_hour(day, hour)
+        path = self.playlist_generator.current_hour_playlist(day, hour)
+        if not path:
+            self.generate_day(day)
+            path = self.playlist_generator.current_hour_playlist(day, hour)
         if not path:
             return
         entries, _missing = read_m3u(path)
@@ -4659,14 +4964,125 @@ class BroadcastingApp(QWidget):
             str(self.settings.value("proc_master", "true")).lower() != "false",
             str(self.settings.value("proc_preset", "Broadcast")), ceiling, per_source)
 
-    def closeEvent(self, event):
+    def show_remembered(self):
+        """Opens maximized the first time. After that it opens the way it was last closed."""
+        maximized = True
         try:
-            self.microphone.stop()
-            self.encoder_bank.shutdown()
-            self.normalizer.shutdown()
+            saved = self.settings.value("window_maximized", None)
+            if saved is not None:
+                maximized = str(saved).lower() in ("true", "1")
+                geometry = self.settings.value("window_geometry", None)
+                if not maximized and geometry:
+                    self.restoreGeometry(geometry)
+        except Exception:
+            maximized = True
+        if maximized:
+            self.showMaximized()
+        else:
+            self.show()
+
+    def remember_window(self):
+        try:
+            self.settings.setValue("window_maximized", self.isMaximized())
+            if not self.isMaximized():
+                self.settings.setValue("window_geometry", self.saveGeometry())
         except Exception:
             pass
-        super().closeEvent(event)
+
+    def audio_is_playing(self):
+        playing = QMediaPlayer.PlaybackState.PlayingState
+        try:
+            if any(deck.player.playbackState() == playing for deck in (self.rotation.deck_a, self.rotation.deck_b)):
+                return True
+            if self.sequence_player.player.playbackState() == playing:
+                return True
+            if self.microphone.is_live:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def live_encoder_count(self):
+        try:
+            return len([s for s in self.encoder_bank.slots if s.state == "live"])
+        except Exception:
+            return 0
+
+    def closeEvent(self, event):
+        """Closing while audio is playing asks first, then fades out so nothing is cut off mid-sound."""
+        if self._shutdown_done:
+            event.accept()
+            return
+        if self._closing:
+            event.ignore()
+            return
+        encoders = self.live_encoder_count()
+        if self.audio_is_playing() or encoders:
+            text = "Audio is playing. Are you sure you want to close Vision Studio?"
+            if encoders:
+                text += f" {encoders} encoder(s) are live and will go off the air."
+            text += " The sound will fade out first, so nothing is cut off."
+            box = QMessageBox(self)
+            box.setWindowTitle("Close Vision Studio?")
+            box.setText(text)
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            event.ignore()
+            self.begin_graceful_close()
+            return
+        self.finish_shutdown()
+        event.accept()
+
+    def begin_graceful_close(self):
+        self._closing = True
+        RUN_LOG.write("CLOSE", "Closing while audio was playing; fading out first.")
+        self.announce("Closing. Fading the sound out.")
+        rot = self.rotation
+        rot.is_running = False          # no new tracks, no crossfades, no breaks while closing
+        rot.disarm_break()
+        self.sequence_player.queue = []
+        self.microphone.set_muted(True)
+        for deck in (rot.deck_a, rot.deck_b):
+            deck.fader.fade_to(0.0, steps=15, interval_ms=100)
+        self._sequence_fade_step = 0
+        start_volume = self.sequence_player.audio_output.volume()
+
+        def fade_sequence():
+            self._sequence_fade_step += 1
+            level = max(0.0, start_volume * (1.0 - self._sequence_fade_step / 15.0))
+            self.sequence_player.audio_output.setVolume(level)
+            if self._sequence_fade_step >= 15:
+                self._sequence_fade_timer.stop()
+        self._sequence_fade_timer = QTimer(self)
+        self._sequence_fade_timer.setInterval(100)
+        self._sequence_fade_timer.timeout.connect(fade_sequence)
+        self._sequence_fade_timer.start()
+        QTimer.singleShot(1800, self.complete_close)
+
+    def complete_close(self):
+        self.finish_shutdown()
+        self.close()
+
+    def finish_shutdown(self):
+        """Stops everything in order so no file is left half-written."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self.remember_window()
+        for step in (lambda: self.rotation.stop(),
+                     lambda: self.sequence_player.player.stop(),
+                     lambda: self.microphone.stop(),
+                     lambda: self.encoder_bank.shutdown(),
+                     lambda: self.normalizer.shutdown(),
+                     lambda: self.settings.sync()):
+            try:
+                step()
+            except Exception:
+                pass
+        RUN_LOG.write("CLOSE", "Vision Studio closed.")
 
     # --- deck column ---
     def build_deck_column(self, deck_name):
@@ -4958,17 +5374,28 @@ class BroadcastingApp(QWidget):
         # --- Tab 2: Jingles & Scheduler ---
         self.tab_jingles = QWidget()
         layout_j = QVBoxLayout()
+        self.slot_labels = {}
         for label, key in {":00 (Top)": ":00", ":15 (Past)": ":15",
                             ":30 (Half)": ":30", ":45 (To)": ":45"}.items():
             btn = QPushButton(f"Set Folder for {label}")
             btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
             btn.clicked.connect(lambda checked, k=key: self.set_jingle_folder(k))
             layout_j.addWidget(btn)
+            info = QLabel(describe_folder(self.settings.value(key, "")))
+            info.setWordWrap(True)
+            info.setAccessibleName(f"{label} folder: {info.text()}")
+            self.slot_labels[key] = info
+            layout_j.addWidget(info)
 
         ad_btn = QPushButton("Set Ad Break Folder")
         ad_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         ad_btn.clicked.connect(self.set_ad_break_folder)
         layout_j.addWidget(ad_btn)
+        ad_info = QLabel(describe_folder(self.settings.value("ad_break_folder", "")))
+        ad_info.setWordWrap(True)
+        ad_info.setAccessibleName(f"Commercials folder: {ad_info.text()}")
+        self.slot_labels["ad_break_folder"] = ad_info
+        layout_j.addWidget(ad_info)
         layout_j.addStretch(1)
         self.tab_jingles.setLayout(layout_j)
 
@@ -4991,17 +5418,25 @@ class BroadcastingApp(QWidget):
         self.folder_labels = {}
         for key, title in FOLDER_SETTINGS:
             value = self.settings.value(key, "") or ""
-            if key == "playlist_output_folder" and not value:
-                value = self.playlist_generator.output_folder() + " (default)"
-            label = QLabel(value or "not set")
+            if key == "playlist_output_folder":
+                value = describe_folder(value or self.playlist_generator.output_folder())
+            else:
+                value = describe_folder(value)
+            label = QLabel(value)
             label.setWordWrap(True)
             label.setAccessibleName(f"{title} folder: {value or 'not set'}")
             self.folder_labels[key] = label
+            label.setAccessibleName(f"{title} folder: {value}")
             layout_a.addRow(f"{title} folder:", label)
             choose = QPushButton(f"Choose {title} Folder")
             choose.setStyleSheet(BUTTON_STYLE_CONSOLE)
             choose.clicked.connect(lambda _checked=False, k=key, t=title: self.choose_folder_setting(k, t))
             layout_a.addRow(choose)
+
+        log_label = QLabel(RUN_LOG.folder)
+        log_label.setWordWrap(True)
+        log_label.setAccessibleName(f"Log folder: {RUN_LOG.folder}")
+        layout_a.addRow("Log folder (one file per day, plus errors.log):", log_label)
 
         layout_a.addRow("Microphone/Line-In:", self.input_combo)
         layout_a.addRow("Speaker/Interface:", self.output_combo)
@@ -5013,11 +5448,11 @@ class BroadcastingApp(QWidget):
         # Playlist generation
         self.playlist_mode_combo = QComboBox()
         self.playlist_mode_combo.setAccessibleName("Playlist generation mode")
-        for label, value in (("One hour at a time, ready before the hour ends (default)", "hour_lead"),
-                             ("Whole day at midnight", "midnight_full_day"),
+        for label, value in (("Whole day at midnight, 12 AM through 11 PM (default)", "midnight_full_day"),
+                             ("One hour at a time, ahead of the hour", "hour_lead"),
                              ("At fixed times of day", "fixed_times")):
             self.playlist_mode_combo.addItem(label, value)
-        index = self.playlist_mode_combo.findData(str(self.settings.value("playlist_mode", "hour_lead")))
+        index = self.playlist_mode_combo.findData(str(self.settings.value("playlist_mode", "midnight_full_day")))
         self.playlist_mode_combo.setCurrentIndex(max(0, index))
         layout_a.addRow("Generate playlists:", self.playlist_mode_combo)
 
@@ -5025,10 +5460,16 @@ class BroadcastingApp(QWidget):
         self.playlist_lead_spin.setRange(0, 3600)
         self.playlist_lead_spin.setAccessibleName("Seconds before the target time to generate playlists")
         try:
-            self.playlist_lead_spin.setValue(int(self.settings.value("playlist_lead_seconds", 600)))
+            self.playlist_lead_spin.setValue(int(self.settings.value("playlist_lead_seconds", 0)))
         except Exception:
             pass
-        layout_a.addRow("Seconds before the hour ends to prepare the next playlist:", self.playlist_lead_spin)
+        layout_a.addRow("Seconds early to write playlists (0 = exactly at midnight):", self.playlist_lead_spin)
+
+        self.queue_lead_spin = QSpinBox()
+        self.queue_lead_spin.setRange(10, 3000)
+        self.queue_lead_spin.setAccessibleName("Seconds before the hour ends to add the next hour to the queue")
+        self.queue_lead_spin.setValue(self.queue_lead_seconds())
+        layout_a.addRow("Add the next hour to the queue this many seconds before the hour ends:", self.queue_lead_spin)
 
         self.playlist_times_edit = QLineEdit(str(self.settings.value("playlist_fixed_times", "00:00")))
         self.playlist_times_edit.setAccessibleName("Fixed generation times, hours and minutes separated by commas")
@@ -5123,16 +5564,19 @@ class BroadcastingApp(QWidget):
     # --- Status / rotation callbacks ---
     def update_status(self, message):
         self.status_label.setText(f"Status: {message}")
+        RUN_LOG.write("STATUS", str(message))
 
     def announce(self, message):
         announce_accessible(self.alert_label, f"Alert: {message}")
         self.update_status(message)
 
     def on_now_playing(self, track_path):
+        RUN_LOG.write("PLAY", f"{self._track_text(track_path)} | {track_path}")
         track_name = os.path.basename(track_path)
         self.now_playing_label.setText(f"Now Playing: {track_name}")
         self.onair_status_label.setText("On Air: music rotation playing.")
         self.refresh_live_indicators()
+        self.refresh_queue_list()
 
         upcoming_path = self.rotation.get_upcoming_track_path()
         if upcoming_path:
@@ -5298,6 +5742,10 @@ class BroadcastingApp(QWidget):
             return
         self.start_break(slot)
 
+    def on_sequence_changed(self):
+        self.refresh_queue_list()
+        self.refresh_status_tree()
+
     def on_sequence_done(self):
         self.rotation.resume_after_sequence()
 
@@ -5320,9 +5768,7 @@ class BroadcastingApp(QWidget):
         if not folder:
             return
         self.settings.setValue(key, folder)
-        if key in self.folder_labels:
-            self.folder_labels[key].setText(folder)
-            self.folder_labels[key].setAccessibleName(f"{title} folder: {folder}")
+        self.show_folder(key, title, folder)
         if key == "playlist_output_folder":
             try:
                 os.makedirs(folder, exist_ok=True)
@@ -5346,6 +5792,14 @@ class BroadcastingApp(QWidget):
         else:
             self.announce(f"{title} folder set: {len(files)} audio files found.")
 
+    def show_folder(self, key, title, folder):
+        text = describe_folder(folder)
+        for labels in (self.folder_labels, self.slot_labels):
+            label = labels.get(key)
+            if label is not None:
+                label.setText(text)
+                label.setAccessibleName(f"{title} folder: {text}")
+
     def start_rotation(self):
         if not self.rotation_library.rotations and not self.settings.value("music_library_folder", ""):
             self.announce("No music folder is set. Open Settings with Control O and choose your music library folder.")
@@ -5359,6 +5813,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("use_live_mix", "true" if self.live_mix_check.isChecked() else "false")
         self.settings.setValue("playlist_mode", self.playlist_mode_combo.currentData())
         self.settings.setValue("playlist_lead_seconds", self.playlist_lead_spin.value())
+        self.settings.setValue("queue_lead_seconds", self.queue_lead_spin.value())
         self.settings.setValue("playlist_fixed_times", self.playlist_times_edit.text())
         self.settings.setValue("playlist_autoload", "true" if self.playlist_autoload_check.isChecked() else "false")
         self.settings.setValue("break_window_seconds", self.break_hold_spin.value())
@@ -5380,5 +5835,5 @@ if __name__ == "__main__":
     install_crash_guard()
     app = QApplication(sys.argv)
     window = BroadcastingApp()
-    window.show()
+    window.show_remembered()
     sys.exit(app.exec())
