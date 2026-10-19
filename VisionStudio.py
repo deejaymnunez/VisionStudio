@@ -4986,10 +4986,11 @@ class BroadcastingApp(QWidget):
         self.rotation_library.detect_new_files()  # first look: remember what is already there
         self.setup_ui()
         self.setup_shortcuts()
-        self.setup_tray()
-        self.setup_session_watch()
-        refresh_autostart_path()
-        keep_system_awake()
+        for optional_step in (self.setup_tray, self.setup_session_watch, refresh_autostart_path, keep_system_awake):
+            try:                      # none of these may ever stop the program from opening
+                optional_step()
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
         self.apply_processing_settings()
         self.refresh_queue_list()
         self.refresh_status_tree()
@@ -5810,9 +5811,13 @@ class BroadcastingApp(QWidget):
         file_menu.addSeparator()
         add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
         act = add(file_menu, "close_to_tray", "Closing the window sends it to the system tray", self.on_close_to_tray_toggled, True)
+        act.blockSignals(True)
         act.setChecked(str(self.settings.value("close_to_tray", "false")).lower() == "true")
+        act.blockSignals(False)
         act = add(file_menu, "autostart", "Start Vision Studio when Windows starts", self.on_autostart_toggled, True)
+        act.blockSignals(True)
         act.setChecked(autostart_enabled())
+        act.blockSignals(False)
         file_menu.addSeparator()
         add(file_menu, "exit", "Exit Vision Studio", self.exit_program)
 
@@ -6263,7 +6268,11 @@ class BroadcastingApp(QWidget):
     # --- UI ---
     def setup_ui(self):
         layout = QVBoxLayout()
-        self.build_menus(layout)
+        try:
+            self.build_menus(layout)
+        except Exception as e:
+            self.menu_actions = {}
+            _log_exception(type(e), e, e.__traceback__)
 
         self.alert_label = QLabel("Alerts: none")
         self.alert_label.setAccessibleName("Alerts")
@@ -6366,8 +6375,12 @@ class BroadcastingApp(QWidget):
         player_display.addLayout(self.build_deck_column("B"))
         layout_r.addLayout(player_display)
 
-        self.console = MixerConsole()
-        layout_r.addWidget(self.console)
+        try:
+            console = MixerConsole()
+            layout_r.addWidget(console)
+            self.console = console
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
 
         rotation_btn_row = QHBoxLayout()
         start_rotation_btn = QPushButton("Start Rotation")
@@ -6939,9 +6952,16 @@ if __name__ == "__main__":
     install_crash_guard()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)      # hiding to the system tray must not end the program
-    window = BroadcastingApp()
-    if "--tray" in sys.argv:
-        window.start_in_tray()
-    else:
-        window.show_remembered()
+    try:
+        window = BroadcastingApp()
+        if "--tray" in sys.argv:
+            window.start_in_tray()
+        else:
+            window.show_remembered()
+    except Exception as e:
+        _log_exception(type(e), e, e.__traceback__)
+        QMessageBox.critical(None, "Vision Studio could not start",
+                             f"Vision Studio could not start.\n\n{type(e).__name__}: {e}\n\n"
+                             f"Details were saved to:\n{ERROR_LOG_PATH}")
+        sys.exit(1)
     sys.exit(app.exec())
