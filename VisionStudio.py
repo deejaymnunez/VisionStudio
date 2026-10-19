@@ -949,9 +949,7 @@ def speak_duration(seconds):
 
 
 def hour_label(hour):
-    suffix = "AM" if hour < 12 else "PM"
-    shown = hour % 12 or 12
-    return f"{shown}:00 {suffix}"
+    return f"{hour % 24:02d}00"
 
 
 def format_track_display(path):
@@ -1946,6 +1944,7 @@ class RotationEngine:
 
         self.shuffled_queue = []
         self.is_paused_for_sequence = False
+        self.break_fading = False      # a break has taken over; the song is fading and nothing else may start
         self.is_running = False
         self.next_track_cued = False
 
@@ -2228,13 +2227,29 @@ class RotationEngine:
         return (self.last_taken_slot == slot and self.last_taken_time is not None
                 and (datetime.now() - self.last_taken_time).total_seconds() < within_seconds)
 
-    def _take_break(self):
+    QUICK_BREAK_FADE_SECONDS = 3.0
+
+    def break_style(self):
+        """'fade_at_mark' (default): the music fades out just before the mark so the break starts exactly on it.
+        'finish_song': the song on air finishes and the break follows it."""
+        try:
+            value = str(self.settings.value("break_style", "fade_at_mark"))
+        except Exception:
+            value = "fade_at_mark"
+        return value if value in ("fade_at_mark", "finish_song") else "fade_at_mark"
+
+    def _seconds_to_mark(self):
+        if self.break_target is None:
+            return None
+        return (self.break_target - datetime.now()).total_seconds()
+
+    def _take_break(self, quick=False):
         callback = self.break_callback
         self.last_taken_slot = self.break_slot
         self.last_taken_time = datetime.now()
         self.break_started = True
         self.disarm_break()
-        self.begin_crossfade_out(callback)
+        self.begin_crossfade_out(callback, seconds=self.QUICK_BREAK_FADE_SECONDS if quick else None)
 
     def _break_gate(self, deck, position_ms, duration_ms, ended=False):
         """
@@ -2247,6 +2262,8 @@ class RotationEngine:
         if self.break_target is None or self.break_started:
             return False
         seconds_to_mark = (self.break_target - datetime.now()).total_seconds()
+        if self.break_style() == "fade_at_mark" and seconds_to_mark > self.QUICK_BREAK_FADE_SECONDS + 1:
+            return False        # not time yet: the song ends, the next one starts, and the break comes in at the mark
         if seconds_to_mark >= 0:
             self.on_status(f"Song finishing {int(seconds_to_mark)} seconds before the mark: starting the break now.")
         else:
@@ -2280,6 +2297,7 @@ class RotationEngine:
             return
         self.is_running = True
         self.is_paused_for_sequence = False
+        self.break_fading = False
         self.live_deck_name = "A"
         self.on_status(f"Rotation started, {count} track(s) in the queue.")
         first_track = self.pick_next_valid_track()
@@ -2298,6 +2316,7 @@ class RotationEngine:
 
     def stop(self):
         self.is_running = False
+        self.break_fading = False
         self.next_track_cued = False
         self.disarm_break()
         self.deck_a.stop()
@@ -2399,6 +2418,14 @@ class RotationEngine:
             self.ending_beep_fired = True
             self.on_track_ending()
 
+        if self.break_fading:
+            return          # the break owns the closing seconds: no cue, no crossfade
+        if (self.is_running and not self.is_paused_for_sequence and self.break_target is not None
+                and not self.break_started and self.break_style() == "fade_at_mark"
+                and self._seconds_to_mark() <= self.QUICK_BREAK_FADE_SECONDS):
+            self.on_status("Fading the music out so the break starts right on the mark.")
+            self._take_break(quick=True)
+            return
         if self.is_running and not self.is_paused_for_sequence:
             crossfade_lead_ms = max(FADE_STEPS * FADE_INTERVAL_MS, 4000)
             if remaining_ms <= crossfade_lead_ms + 2000 and self._break_gate(deck, position_ms, duration_ms):
@@ -2408,13 +2435,14 @@ class RotationEngine:
             if self.next_track_cued and 0 < remaining_ms <= crossfade_lead_ms:
                 self.crossfade_to_cued_deck()
 
-    def begin_crossfade_out(self, on_complete):
+    def begin_crossfade_out(self, on_complete, seconds=None):
         """Fades the live deck out ahead of a scheduled break."""
         if not self.is_running or self.is_paused_for_sequence:
             if on_complete:
                 on_complete()
             return
         self.on_status("Fading music out for upcoming scheduled break.")
+        self.break_fading = True
 
         # A track already loaded for the next crossfade goes back to the front of
         # the queue so it still plays after the break instead of being lost.
@@ -2429,12 +2457,17 @@ class RotationEngine:
         live_deck = self.get_live_deck()
 
         def after_fade():
+            self.break_fading = False
             self.is_paused_for_sequence = True
             live_deck.pause()
             if on_complete:
                 on_complete()
 
-        live_deck.fader.fade_to(0.0, on_complete=after_fade, steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS)
+        if seconds:
+            steps = 30
+            live_deck.fader.fade_to(0.0, on_complete=after_fade, steps=steps, interval_ms=int(seconds * 1000 / steps))
+        else:
+            live_deck.fader.fade_to(0.0, on_complete=after_fade, steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS)
 
     def resume_after_sequence(self):
         self.is_paused_for_sequence = False
@@ -2502,8 +2535,11 @@ class RotationEngine:
 
     def on_media_status_changed(self, status, deck):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and deck.name == self.live_deck_name:
+            if self.break_fading:
+                return
             if not self.is_paused_for_sequence and self.is_running:
-                if self.break_target is not None and not self.break_started:
+                if (self.break_target is not None and not self.break_started
+                        and (self.break_style() == "finish_song" or self._seconds_to_mark() <= self.QUICK_BREAK_FADE_SECONDS + 1)):
                     self._take_break()
                     return
                 if not self.next_track_cued:
@@ -4848,11 +4884,11 @@ class BroadcastingApp(QWidget):
         return str(self.settings.value("playlist_autoload", "true")).lower() != "false"
 
     def generate_day(self, day):
-        """Writes every hour from midnight through 11 PM for that day, replacing earlier playlists for it."""
+        """Writes every hour from 0000 through 2300 for that day, replacing earlier playlists for it."""
         files = self.playlist_generator.generate_full_day(day)
         self.day_generated.add(day)
         hourly = max(0, len(files) - 1)
-        self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, midnight through 11 PM: {hourly} hourly "
+        self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, 0000 through 2300: {hourly} hourly "
                       f"files in {self.playlist_generator.output_folder()}. Earlier playlists for that day were replaced.")
         return files
 
@@ -5443,12 +5479,20 @@ class BroadcastingApp(QWidget):
 
         self.live_mix_check = QCheckBox("Stream the live mix of music, jingles and microphone (restart to apply)")
         self.live_mix_check.setChecked(str(self.settings.value("use_live_mix", "true")).lower() != "false")
+        self.break_style_combo = QComboBox()
+        self.break_style_combo.setAccessibleName("Break style")
+        self.break_style_combo.addItem("Fade the music out so the break starts exactly on the mark (default)", "fade_at_mark")
+        self.break_style_combo.addItem("Let the song finish, then start the break", "finish_song")
+        style_index = self.break_style_combo.findData(str(self.settings.value("break_style", "fade_at_mark")))
+        self.break_style_combo.setCurrentIndex(max(0, style_index))
+        layout_a.addRow("Break style:", self.break_style_combo)
+
         layout_a.addRow(self.live_mix_check)
 
         # Playlist generation
         self.playlist_mode_combo = QComboBox()
         self.playlist_mode_combo.setAccessibleName("Playlist generation mode")
-        for label, value in (("Whole day at midnight, 12 AM through 11 PM (default)", "midnight_full_day"),
+        for label, value in (("Whole day at midnight, 0000 through 2300 (default)", "midnight_full_day"),
                              ("One hour at a time, ahead of the hour", "hour_lead"),
                              ("At fixed times of day", "fixed_times")):
             self.playlist_mode_combo.addItem(label, value)
@@ -5718,6 +5762,7 @@ class BroadcastingApp(QWidget):
         self.rotation.begin_crossfade_out(lambda: self.play_break_sequence(slot))
 
     def play_break_sequence(self, slot):
+        RUN_LOG.write("BREAK", f"{slot} break starting.")
         config = SLOT_CONFIG.get(slot, {"folder_key": slot, "sequence": "simple"})
         jingle_folder = self.settings.value(config["folder_key"], "")
         if not jingle_folder or not os.path.isdir(jingle_folder):
@@ -5736,7 +5781,11 @@ class BroadcastingApp(QWidget):
     def on_crossfade_start(self, slot):
         """The clock reached the mark. If the engine is already managing this break, leave it to the engine."""
         if self.rotation.break_is_armed(slot):
-            self.update_status(f"It is {slot}. The break starts as soon as the song on air finishes.")
+            if self.rotation.break_style() == "fade_at_mark" and not self.rotation.is_paused_for_sequence:
+                self.update_status(f"It is {slot}. Fading the music out for the break now.")
+                self.rotation._take_break(quick=True)
+            else:
+                self.update_status(f"It is {slot}. The break starts as soon as the song on air finishes.")
             return
         if self.rotation.break_recently_taken(slot):
             return
@@ -5817,6 +5866,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("playlist_fixed_times", self.playlist_times_edit.text())
         self.settings.setValue("playlist_autoload", "true" if self.playlist_autoload_check.isChecked() else "false")
         self.settings.setValue("break_window_seconds", self.break_hold_spin.value())
+        self.settings.setValue("break_style", self.break_style_combo.currentData())
         self.settings.setValue("proc_master", "true" if self.proc_master_check.isChecked() else "false")
         self.settings.setValue("proc_preset", self.proc_preset_combo.currentText())
         self.settings.setValue("proc_ceiling_db", self.proc_ceiling_spin.value())
