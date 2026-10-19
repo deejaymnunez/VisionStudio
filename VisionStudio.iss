@@ -42,6 +42,21 @@ Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
+[Registry]
+; A fresh install forgets the saved folder paths and setup choices, so the setup wizard asks for them again.
+; Encoder settings, shortcuts and other preferences are kept.
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "setup_complete"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "music_library_folder"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: ":00"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: ":15"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: ":30"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: ":45"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "ad_break_folder"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "rotations_json"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "schedule_json"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "categories_json"; Flags: deletevalue
+Root: HKCU; Subkey: "Software\VisionRecords\VisionRadio"; ValueName: "playlist_output_folder"; Flags: deletevalue
+
 [Run]
 ; Launches the app right after install; the first launch opens the folder setup wizard.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} and run the folder setup"; Flags: nowait postinstall skipifsilent
