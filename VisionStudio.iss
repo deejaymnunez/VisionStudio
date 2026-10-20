@@ -49,6 +49,8 @@ Name: "{app}\VoiceTracks"; Permissions: users-modify
 ; Live-show recordings (MP3 plus optional cue sheet) are saved here unless another folder is chosen in Settings.
 Name: "{app}\Recordings"; Permissions: users-modify
 Name: "{app}\Logos"; Permissions: users-modify
+; The daily folder report is saved here.
+Name: "{app}\Reports"; Permissions: users-modify
 ; Keyboard layout files (Station Playlist, other automation systems) are kept here.
 Name: "{app}\Layouts"; Permissions: users-modify
 

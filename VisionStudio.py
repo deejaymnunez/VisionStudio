@@ -19,7 +19,7 @@ import urllib.request
 import urllib.parse
 import base64
 from array import array
-from collections import deque
+from collections import deque, Counter
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
@@ -90,6 +90,18 @@ def _writable_dir(folder):
         return True
     except OSError:
         return False
+
+
+def get_reports_folder():
+    """Reports (the daily folder report) sit next to Logs, Playlists and VoiceTracks."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "Reports")
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Reports")
+    if _writable_dir(fallback):
+        return fallback
+    return tempfile.gettempdir()
 
 
 def get_logs_folder():
@@ -1952,15 +1964,15 @@ DEFAULT_SHORTCUTS = [
     ("toggle_recording", "Start or stop recording", "R", True),
     ("new_item", "New rotation, category or hour marker (depends on the tab)", "Ctrl+N", True),
     ("generate_now", "Generate playlists now", "Ctrl+Shift+G", True),
-    ("say_elapsed", "Announce elapsed time of the current track", "Alt+Shift+T", True),
+    ("say_elapsed", "Announce elapsed time of the current track", "Ctrl+Alt+Shift+T", True),
     ("say_remaining", "Announce time remaining on the current track", "Ctrl+Alt+T", True),
     ("say_current", "Announce the current track", "Ctrl+Alt+C", True),
     ("say_status", "Announce play status", "Ctrl+Alt+P", True),
     ("say_hour_remaining", "Announce time remaining in this hour", "Ctrl+Alt+H", True),
     ("say_mute", "Announce mute status", "Ctrl+Alt+M", True),
     ("say_encoders", "Announce encoder status", "Ctrl+Alt+E", True),
-    ("voice_track_before", "Voice track: record before the selected queue item", "Ctrl+T", True),
-    ("voice_track_after", "Voice track: record after the selected queue item", "Ctrl+Shift+T", True),
+    ("voice_track_before", "Voice track: record before the selected queue item", "V", True),
+    ("voice_track_after", "Voice track: record after the selected queue item", "Shift+V", True),
     ("queue_move_up", "Queue list: move the selected track up", "Ctrl+Up", False),
     ("queue_move_down", "Queue list: move the selected track down", "Ctrl+Down", False),
     ("queue_remove", "Queue list: remove the selected track", "Del", False),
@@ -2667,6 +2679,44 @@ def folder_report(rotation, rotor=None, now=None):
     return "\n".join(lines)
 
 
+def day_folder_report(rotation_library, rotor, day, playlist_files):
+    """The report saved with each day's playlists: every rotation's folders, plus how many songs of each
+    folder went into that day's playlists."""
+    used = {}
+    for path in playlist_files:
+        if path.lower().endswith("fullday.m3u8"):
+            continue
+        try:
+            entries, _missing = read_m3u(path)
+        except Exception:
+            continue
+        for entry in entries:
+            if is_hour_marker(entry):
+                continue
+            for rotation in rotation_library.rotations:
+                root = rotation.folder
+                if root and os.path.normcase(os.path.normpath(entry)).startswith(
+                        os.path.normcase(os.path.normpath(root)) + os.sep):
+                    used.setdefault(rotation.id, Counter())[folder_group(entry, root)] += 1
+                    break
+    lines = [f"Folder report for the playlists of {day.strftime('%A %B %d, %Y')}",
+             f"Made {time.strftime('%Y-%m-%d %I:%M %p')}", ""]
+    for rotation in rotation_library.rotations:
+        lines.append(folder_report(rotation, rotor))
+        counts = used.get(rotation.id)
+        if counts:
+            lines.append("")
+            lines.append(f"Songs from each folder in this day's playlists ({sum(counts.values())} songs):")
+            for name, number in sorted(counts.items(), key=lambda kv: kv[0].lower()):
+                lines.append(f"{name}: {number}")
+        else:
+            lines.append("No songs from this rotation were scheduled on this day.")
+        lines.append("")
+        lines.append("-" * 40)
+        lines.append("")
+    return "\n".join(lines)
+
+
 
 # ---------------------------------------------------------------------------
 # OctiMax-style stream processor: two-band AGC -> five-band compressor ->
@@ -2971,6 +3021,8 @@ class RotationEngine:
         self.apply_crossfade_setting()
         self.separation_seconds = self.separation_from_settings()
         self.play_history = PersistentPlayHistory(settings, max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS))
+        self.passed = []                  # songs of this hour already aired or skipped: [(path, "played" or "skipped")]
+        self.passed_hour = None
         self.replaceable = set()          # queued songs the end-of-hour fit may swap (playlist songs, not hand-placed ones)
         self._fit_pool = (None, [])
         self.ending_beep_fired = False
@@ -3305,11 +3357,22 @@ class RotationEngine:
     def is_replaceable(self, item):
         return is_song_entry(item) and (item in self.replaceable or item not in self.pinned_tracks)
 
-    def fit_before_mark(self, now=None):
+    def next_break_mark(self, now=None):
+        now = now or datetime.now()
+        best = None
+        for minute in (0, 15, 30, 45):
+            candidate = now.replace(minute=minute, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += timedelta(hours=1)
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+    def fit_before_mark(self, now=None, force_mark=False):
         """Called just before the next song is chosen. When the mark is near, the queued songs are swapped
         for ones that finish exactly on it, so the last song is never faded out. Voice tracked hours and
         hand-placed songs are never touched. Returns the replacement songs, or None."""
-        mark = self.next_fit_mark(now)
+        mark = self.next_break_mark(now) if force_mark else self.next_fit_mark(now)
         if mark is None or self.rotation_library is None:
             return None
         now = now or datetime.now()
@@ -3348,6 +3411,127 @@ class RotationEngine:
         RUN_LOG.write("FIT", message)
         self._queue_changed()
         return replacement
+
+    # --- played and skipped songs (unchecked), joining an hour partway, playing a song on Enter ---
+    def passed_rows(self):
+        if self.passed_hour is not None and self.passed_hour != datetime.now().hour:
+            self.passed = []
+            self.passed_hour = None
+        return list(self.passed)
+
+    def note_played(self, path):
+        """A song went on air: it stays in the list for the rest of the hour, unchecked."""
+        if not is_song_entry(path):
+            return
+        self.passed_rows()
+        self.passed = [(p, st) for p, st in self.passed if p != path]
+        self.passed.append((path, "played"))
+        self.passed = self.passed[-60:]
+        self.passed_hour = datetime.now().hour
+        self._queue_changed()
+
+    def uncheck_queue_item(self, index):
+        """Unchecking an upcoming song takes it out of the order; it stays listed as skipped."""
+        item = self.remove_queue_item(index)
+        if item is None:
+            return None
+        if is_song_entry(item):
+            self.passed_rows()
+            self.passed = [(p, st) for p, st in self.passed if p != item]
+            self.passed.append((item, "skipped"))
+            self.passed_hour = datetime.now().hour
+        else:
+            self.insert_queue_item(item, index)
+            return None
+        self._queue_changed()
+        return item
+
+    def recheck_passed(self, passed_index):
+        """Checking a played or skipped song again puts it next in line."""
+        rows = self.passed_rows()
+        if not (0 <= passed_index < len(rows)):
+            return None
+        path = rows[passed_index][0]
+        self.passed = [(p, st) for p, st in self.passed if p != path]
+        self.insert_queue_item(path, 0)
+        return path
+
+    def play_item_now(self, index):
+        """Enter on a queued song: it goes on air now. With automation off the music then waits for the next
+        Enter (live assist); with automation on the queue carries on after it."""
+        item = self.remove_queue_item(index)
+        if item is None:
+            return False
+        if not is_song_entry(item):
+            self.insert_queue_item(item, index)
+            return False
+        self.shuffled_queue.insert(0, item)
+        self.pinned_tracks.add(item)
+        path = self.pick_next_valid_track()
+        if path is None:
+            return False
+        cued_deck = self.get_cued_deck()
+        playback_path = normalize_file_loudness(path, self.on_status)
+        cued_deck.audio_output.setVolume(0.0)
+        cued_deck.load_paused(playback_path, path)
+        self.next_track_cued = True
+        self._notify_deck_update(cued_deck.name, path)
+        self.break_fading = False
+        self.is_paused_for_sequence = False
+        self.crossfade_to_cued_deck()
+        return True
+
+    def join_hour(self, entries, now=None, locked=False):
+        """Loads an hour's playlist at the right place when the clock is already partway through it. Songs
+        the clock has passed are unchecked (listed as skipped); the first song that can still start in time
+        and everything after it stay checked, and the stretch up to the next break is fitted so it lands
+        on the mark. Returns (entries loaded, songs passed)."""
+        now = now or datetime.now()
+        offset = now.minute * 60 + now.second
+        passed = []
+        keep = list(entries)
+        if offset >= 120:
+            try:
+                estimate = float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))
+            except Exception:
+                estimate = float(DEFAULT_BREAK_ESTIMATE_SECONDS)
+            clock = 0.0
+            next_mark = 900.0
+            keep = []
+            starting = False
+            for entry in entries:
+                if is_hour_marker(entry):
+                    if is_voice_marker(entry):
+                        if starting:
+                            keep.append(entry)
+                    else:
+                        keep.append(entry)
+                    continue
+                start = clock
+                clock += get_track_duration(entry)
+                while clock >= next_mark:
+                    clock += estimate
+                    next_mark += 900.0
+                if not starting and start >= offset - 10:
+                    starting = True
+                if starting:
+                    keep.append(entry)
+                else:
+                    passed.append(entry)
+        count = self.load_queue_entries(keep, replace=True, locked=locked)
+        self.passed = [(p, "skipped") for p in passed if is_song_entry(p)]
+        self.passed_hour = now.hour if self.passed else None
+        if not locked:
+            try:
+                if self.rotation_schedule is not None:
+                    rid = self.rotation_schedule.rotation_id_for_hour(now.hour)
+                    if rid:
+                        self.active_rotation_id = rid
+                self.fit_before_mark(now, force_mark=True)
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+        self._queue_changed()
+        return count, len(self.passed)
 
     # --- break protection ---
     def arm_break(self, target, slot, callback):
@@ -3469,6 +3653,7 @@ class RotationEngine:
             self.automation_on = False
             return
         self.play_history.record_play(first_track)
+        self.note_played(first_track)
         self.ending_beep_fired = False
         self.next_track_cued = False
         playback_path = normalize_file_loudness(first_track, self.on_status)
@@ -3624,6 +3809,7 @@ class RotationEngine:
         self.next_track_cued = False
         self.ending_beep_fired = False
         self.play_history.record_play(cued_deck.current_track_path)
+        self.note_played(cued_deck.current_track_path)
         self.on_now_playing(cued_deck.current_track_path)
 
     def get_upcoming_track_path(self):
@@ -3719,6 +3905,7 @@ class RotationEngine:
                 self.is_running = False
                 return
             self.play_history.record_play(next_track)
+            self.note_played(next_track)
             self.ending_beep_fired = False
             self.next_track_cued = False
             playback_path = normalize_file_loudness(next_track, self.on_status)
@@ -5348,13 +5535,21 @@ class QueueList(QListWidget):
     move_requested = pyqtSignal(int, int)
     remove_requested = pyqtSignal(int)
     insert_requested = pyqtSignal()
+    play_requested = pyqtSignal(int)
+    check_changed = pyqtSignal(int, bool)
 
     def __init__(self):
         super().__init__()
         self.setAccessibleName("Queue: upcoming tracks. Up and Down browse, Control Up and Down move the "
                                "selected track, Delete removes it, Insert adds tracks.")
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.header_count = 1   # rows above the queue itself: the song on air and any break items
+        self.header_count = 1   # rows above the queue itself: the song on air, break items, played and skipped songs
+        self.passed_start = 1   # the first played or skipped row (they sit at the end of the header rows)
+        self.itemChanged.connect(self._item_changed)
+
+    def _item_changed(self, item):
+        if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            self.check_changed.emit(self.row(item), item.checkState() == Qt.CheckState.Checked)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -5374,28 +5569,48 @@ class QueueList(QListWidget):
             self.insert_requested.emit()
             event.accept()
             return
+        if not ctrl and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if row >= self.header_count:
+                self.play_requested.emit(row)
+            event.accept()
+            return
+        if not ctrl and key == Qt.Key.Key_Space:
+            item = self.currentItem()
+            if item is not None and (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                item.setCheckState(Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked
+                                   else Qt.CheckState.Checked)
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def event(self, e):
         # Stop application-wide shortcuts from swallowing the keys this list owns.
         if e.type() == QEvent.Type.ShortcutOverride:
             ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Insert) or (
+            if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Insert, Qt.Key.Key_Return, Qt.Key.Key_Enter,
+                           Qt.Key.Key_Space) and not ctrl or e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Insert) or (
                     ctrl and e.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)):
                 e.accept()
                 return True
         return super().event(e)
 
-    def show_queue(self, entries, headers=None, select_row=None):
+    def show_queue(self, entries, headers=None, select_row=None, passed=None):
         """headers: rows shown above the queue (the song on air, then any break items). Insert with the
         song on air selected puts tracks at the very top of the queue, ahead of what was about to play."""
         headers = headers or []
-        self.header_count = len(headers)
+        passed = passed or []
+        self.passed_start = len(headers)
+        self.header_count = len(headers) + len(passed)
         row = self.currentRow() if select_row is None else select_row
         self.blockSignals(True)
         self.clear()
         for header in headers:
             self.addItem(header)
+        for text in passed:
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.addItem(item)
         shown = entries[:QUEUE_DISPLAY_LIMIT]
         fresh_reads = 0
         for i, entry in enumerate(shown):
@@ -5413,7 +5628,11 @@ class QueueList(QListWidget):
                     text = None
             if text is None:
                 text = os.path.splitext(os.path.basename(str(entry)))[0]
-            self.addItem(f"{i + 1}. {text}")
+            row_item = QListWidgetItem(f"{i + 1}. {text}")
+            if not is_hour_marker(entry):
+                row_item.setFlags(row_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                row_item.setCheckState(Qt.CheckState.Checked)
+            self.addItem(row_item)
         if len(entries) > len(shown):
             self.addItem(f"... and {len(entries) - len(shown)} more tracks")
         self.blockSignals(False)
@@ -9929,7 +10148,14 @@ class BroadcastingApp(QWidget):
 
     def refresh_queue_list(self):
         if hasattr(self, "queue_list"):
-            self.queue_list.show_queue(self.rotation.queue_snapshot(), self.queue_headers())
+            passed = []
+            for path, state in self.rotation.passed_rows():
+                try:
+                    title = format_track_display(path)
+                except Exception:
+                    title = os.path.basename(path)
+                passed.append(f"{'Played' if state == 'played' else 'Skipped'}: {title}")
+            self.queue_list.show_queue(self.rotation.queue_snapshot(), self.queue_headers(), passed=passed)
             self.queue_label.setText(f"Queue: {len(self.rotation.shuffled_queue)} tracks"
                                      + (f", rotation {self.rotation.active_rotation_name()}"
                                         if self.rotation.active_rotation_name() else ""))
@@ -9950,6 +10176,37 @@ class BroadcastingApp(QWidget):
                 headers.append(f"{sp.slot} break {i + 1} of {len(sp.items)}, {state}: "
                                f"{os.path.basename(item)} from {os.path.dirname(item)}")
         return headers
+
+    def on_queue_play(self, row):
+        index = row - self.queue_list.header_count
+        if index < 0:
+            return
+        if self.rotation.play_item_now(index):
+            self.announce("Playing the selected song now." + ("" if self.rotation.automation_on
+                          else " Automation is off, so the music waits for you after it."))
+        else:
+            self.update_status("That item cannot be played.")
+
+    def on_queue_check_changed(self, row, checked):
+        """Space on a row: unchecking an upcoming song skips it, checking a played or skipped song puts it next."""
+        header = self.queue_list.header_count
+        start = self.queue_list.passed_start
+        if row >= header and not checked:
+            QTimer.singleShot(0, lambda i=row - header: self._apply_uncheck(i))
+        elif start <= row < header and checked:
+            QTimer.singleShot(0, lambda i=row - start: self._apply_recheck(i))
+
+    def _apply_uncheck(self, index):
+        item = self.rotation.uncheck_queue_item(index)
+        if item is not None:
+            self.announce("Unchecked. This song will not play.")
+        self.refresh_queue_list()
+
+    def _apply_recheck(self, passed_index):
+        path = self.rotation.recheck_passed(passed_index)
+        if path is not None:
+            self.announce("Checked. This song plays next.")
+        self.refresh_queue_list()
 
     def on_queue_move(self, row, delta):
         index = row - self.queue_list.header_count
@@ -10193,10 +10450,22 @@ class BroadcastingApp(QWidget):
         """Writes every hour from 0000 through 2300 for that day, replacing earlier playlists for it."""
         files = self.playlist_generator.generate_full_day(day)
         self.day_generated.add(day)
+        self.write_day_report(day, files)
         hourly = max(0, len(files) - 1)
         self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, 0000 through 2300: {hourly} hourly "
                       f"files in {self.playlist_generator.output_folder()}. Earlier playlists for that day were replaced.")
         return files
+
+    def write_day_report(self, day, files):
+        """Saves the folder report for that day's playlists in the Reports folder."""
+        try:
+            folder = get_reports_folder()
+            os.makedirs(folder, exist_ok=True)
+            text = day_folder_report(self.rotation_library, self.playlist_generator.rotor, day, files)
+            with open(os.path.join(folder, f"{day.strftime('%Y-%m-%d')}_folder_report.txt"), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except Exception as e:
+            RUN_LOG.write("ERROR", f"Could not write the folder report: {e}")
 
     def queue_lead_seconds(self):
         try:
@@ -10234,10 +10503,11 @@ class BroadcastingApp(QWidget):
                 self.update_status("Could not build this hour's playlist: no rotation is scheduled for it.")
                 return False
             entries, _missing = read_m3u(path)
-            count = self.rotation.load_queue_entries(entries, replace=True,
-                                                     locked=is_hour_locked(self.settings, now.date(), now.hour))
+            count, passed = self.rotation.join_hour(entries, now, locked=is_hour_locked(self.settings, now.date(), now.hour))
             self.rotation.playlist_driven = count > 0
-            self.update_status(f"This hour's playlist is ready: {count} entries, saved to {path}")
+            self.update_status(f"This hour's playlist is ready: {count} entries"
+                               + (f", {passed} song(s) the clock has passed are unchecked" if passed else "")
+                               + f", saved to {path}")
         self.maybe_append_next_hour()
         return True
 
@@ -10284,9 +10554,9 @@ class BroadcastingApp(QWidget):
             return
         entries, _missing = read_m3u(path)
         now = datetime.now()
-        count = self.rotation.load_queue_entries(entries, replace=True,
-                                                 locked=is_hour_locked(self.settings, now.date(), now.hour))
-        self.announce(f"Loaded this hour's playlist: {count} entries.")
+        count, passed = self.rotation.join_hour(entries, now, locked=is_hour_locked(self.settings, now.date(), now.hour))
+        self.announce(f"Loaded this hour's playlist: {count} entries"
+                      + (f"; {passed} song(s) the clock has passed are unchecked." if passed else "."))
 
     def choose_playlist_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose the playlist output folder")
@@ -11280,6 +11550,8 @@ class BroadcastingApp(QWidget):
         self.queue_list.move_requested.connect(self.on_queue_move)
         self.queue_list.remove_requested.connect(self.on_queue_remove)
         self.queue_list.insert_requested.connect(self.insert_tracks)
+        self.queue_list.play_requested.connect(self.on_queue_play)
+        self.queue_list.check_changed.connect(self.on_queue_check_changed)
         layout_r.addWidget(self.queue_list)
         queue_buttons = QHBoxLayout()
         marker_btn = QPushButton("Insert Hour Marker")
