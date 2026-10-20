@@ -15,7 +15,6 @@ DefaultDirName={autopf32}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 SetupIconFile=VisionStudio.ico
-UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=installer
 OutputBaseFilename=VisionStudioSetup
 Compression=lzma2
