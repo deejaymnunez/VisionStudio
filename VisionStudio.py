@@ -4091,8 +4091,11 @@ class SequencePlayer:
             self.audio_output.setDevice(output_device)
         self.player.setAudioOutput(self.audio_output)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.positionChanged.connect(self.on_position_changed)
         self.is_muted = False
         self.audio_output.setVolume(1.0)
+        self.on_item_ending = None    # on_item_ending(): a warning beep shortly before a break item ends
+        self.item_beep_fired = False
 
         self.queue = []
         self.category_library = None  # set by the app: imported categories feed the sandwich
@@ -4238,9 +4241,28 @@ class SequencePlayer:
         self.on_status(f"Playing {self.item_index + 1} of {len(self.items)}: {next_file}")
         RUN_LOG.write("BREAK", f"{self.slot} item {self.item_index + 1} of {len(self.items)}: {next_file}")
         self._changed()
+        self.item_beep_fired = False
         playback_path = normalize_file_loudness(next_file, self.on_status)
         self.player.setSource(QUrl.fromLocalFile(playback_path))
         self.player.play()
+
+    ITEM_BEEP_LEAD_MS = 2000
+    ITEM_BEEP_MIN_MS = 3000
+
+    def on_position_changed(self, position_ms):
+        """One warning beep, 2 seconds before a jingle, ad or sweeper ends and another item follows it."""
+        if self.item_beep_fired or not self.active or not self.queue or self.on_item_ending is None:
+            return
+        try:
+            duration = self.player.duration()
+        except Exception:
+            return
+        if duration >= self.ITEM_BEEP_MIN_MS and 0 < duration - position_ms <= self.ITEM_BEEP_LEAD_MS:
+            self.item_beep_fired = True
+            try:
+                self.on_item_ending()
+            except Exception:
+                pass
 
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -8843,6 +8865,7 @@ class BroadcastingApp(QWidget):
         )
         self.sequence_player.category_library = self.category_library
         self.sequence_player.on_changed = self.on_sequence_changed
+        self.sequence_player.on_item_ending = self.on_item_ending
         self.sequence_player.event_provider = lambda: self.event_library.event_at(datetime.now())
         self.scheduler = SchedulerEngine(self.settings, self.on_crossfade_start, self.update_status)
         self.scheduler.on_break_upcoming = self.on_break_upcoming
@@ -11367,8 +11390,13 @@ class BroadcastingApp(QWidget):
         self.encoder_bank.push_metadata(get_track_metadata(track_path))
 
     def on_track_ending(self):
-        self.warning_beep.play()
+        if not self.is_muted:               # while muted nothing beeps, in the tray or out of it
+            self.warning_beep.play()
         self.update_status("Track ending in 5 seconds.")
+
+    def on_item_ending(self):
+        if not self.is_muted:
+            self.warning_beep.play()
 
     def on_crossfader_move(self, position_0_to_100):
         self.crossfader_slider.setValue(int(round(position_0_to_100)))
