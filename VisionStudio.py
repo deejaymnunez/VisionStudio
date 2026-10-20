@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
                              QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
-                             QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget, QAbstractSpinBox)
+                             QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget, QAbstractSpinBox, QPlainTextEdit)
 from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction, QKeyEvent
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
@@ -199,8 +199,8 @@ def get_layouts_folder():
 
 
 APP_VERSION = "26.0"             # the release number; changes only when Luis names a new one (26.1, 26.2 ... 27.0)
-BUILD_NUMBER = 1                  # goes up by one with every update; starts again at 1 with a new version
-BUILD_DATE = "2026-10-19"         # the day this build was made
+BUILD_NUMBER = 0                  # goes up by one with every update; starts again at 1 with a new version
+BUILD_DATE = "2026-10-20"         # the day this build was made
 BUILD_ID = f"{BUILD_DATE}.{BUILD_NUMBER}"      # kept for the log
 
 
@@ -1628,6 +1628,28 @@ class PlaylistGenerator:
         self.carry_artist = {}
         self.events = None            # EventLibrary, set by the app
         self.marks = None             # BreakMarks, set by the app
+        self.rotor = FolderRotor(settings)
+
+    def rotate_folders_on(self):
+        try:
+            return str(self.settings.value("rotate_folders", "true")).lower() != "false"
+        except Exception:
+            return True
+
+    def rotor_pick(self, rotation, pool, used, separation_ok):
+        """The next song from the next folder in the round, or None when folder rotation does not apply."""
+        if rotation is None or not self.rotate_folders_on():
+            return None
+        groups = group_by_folder(pool, rotation.folder)
+        if len(groups) < 2:
+            return None
+        eligible = {}
+        for folder, tracks in groups.items():
+            ok = [t for t in tracks if t not in used and separation_ok(t)]
+            if ok:
+                eligible[folder] = ok
+        folder = self.rotor.pick_folder(rotation.id, set(eligible), set(groups))
+        return random.choice(eligible[folder]) if folder else None
 
     # --- settings ---
     def mode(self):
@@ -1721,10 +1743,18 @@ class PlaylistGenerator:
             remaining = target - filled
             if FIT_MIN_SECONDS <= remaining <= 480:
                 candidates = [c for c in pool if c not in used and separation_ok(c)]
+                rotating = rotation is not None and self.rotate_folders_on()
+                if rotating:
+                    waiting = self.rotor.waiting_folders(rotation.id)
+                    preferred = [c for c in candidates if folder_group(c, rotation.folder) in waiting]
+                    if len(preferred) >= 4:
+                        candidates = preferred          # keep the round going: favor folders that have not had a turn
                 chosen, _score = choose_fill(remaining + overlap_seconds(), candidates,
                                              get_track_duration, self._artist, max_songs=2)
                 if chosen:
                     for track in chosen:
+                        if rotating:
+                            self.rotor.note_used(rotation.id, folder_group(track, rotation.folder))
                         entries.append(track)
                         used.add(track)
                         last_track[track] = virtual_clock[0]
@@ -1736,18 +1766,22 @@ class PlaylistGenerator:
             if not queue_items:
                 queue_items = list(pool)
                 random.shuffle(queue_items)
-            chosen_index = None
-            for i, candidate in enumerate(queue_items):
-                last = last_track.get(candidate)
-                artist = self._artist(candidate)
-                a_last = last_artist.get(artist) if artist else None
-                if (last is None or virtual_clock[0] - last >= separation) and \
-                   (a_last is None or virtual_clock[0] - a_last >= separation):
-                    chosen_index = i
-                    break
-            if chosen_index is None:
-                chosen_index = 0  # relax the rule when the rotation is too small
-            track = queue_items.pop(chosen_index)
+            track = self.rotor_pick(rotation, pool, used, separation_ok)
+            if track is not None and track in queue_items:
+                queue_items.remove(track)
+            elif track is None:
+                chosen_index = None
+                for i, candidate in enumerate(queue_items):
+                    last = last_track.get(candidate)
+                    artist = self._artist(candidate)
+                    a_last = last_artist.get(artist) if artist else None
+                    if (last is None or virtual_clock[0] - last >= separation) and \
+                       (a_last is None or virtual_clock[0] - a_last >= separation):
+                        chosen_index = i
+                        break
+                if chosen_index is None:
+                    chosen_index = 0  # relax the rule when the rotation is too small
+                track = queue_items.pop(chosen_index)
             used.add(track)
             entries.append(track)
             duration = get_track_duration(track)
@@ -2484,6 +2518,155 @@ class PersistentPlayHistory(PlayHistory):
         return sorted(rows, key=lambda r: -r[1])
 
 
+# ---------------------------------------------------------------------------
+# Folder rotation: every folder of a rotation takes a turn before any folder repeats.
+# ---------------------------------------------------------------------------
+
+ROOT_GROUP = "(top folder)"
+FOLDER_ROTOR_KEY = "folder_rotor_json"
+OTHER_AUDIO = (".wma", ".aiff", ".aif", ".ape", ".wv", ".mp2", ".mka", ".m4b", ".ac3", ".dsf", ".mpc")
+
+
+def folder_group(path, root):
+    """The folder directly under the rotation's folder that a song belongs to (songs in deeper folders
+    belong to that top folder)."""
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        return ROOT_GROUP
+    parts = rel.replace("\\", "/").split("/")
+    return parts[0] if len(parts) > 1 else ROOT_GROUP
+
+
+def group_by_folder(paths, root):
+    groups = {}
+    for path in paths:
+        groups.setdefault(folder_group(path, root), []).append(path)
+    return groups
+
+
+class FolderRotor:
+    """Remembers, for each rotation, which folders still wait for their turn in the current round. A round
+    uses every folder once, in a shuffled order, then starts again. The state is kept between hours, days
+    and restarts."""
+
+    def __init__(self, settings=None):
+        self.settings = settings
+        self.state = {}
+        try:
+            if settings is not None:
+                self.state = json.loads(str(settings.value(FOLDER_ROTOR_KEY, "{}")))
+        except Exception:
+            self.state = {}
+
+    def save(self):
+        if self.settings is None:
+            return
+        try:
+            self.settings.setValue(FOLDER_ROTOR_KEY, json.dumps(self.state))
+        except Exception:
+            pass
+
+    def entry(self, rotation_id):
+        e = self.state.setdefault(rotation_id, {})
+        e.setdefault("remaining", [])
+        e.setdefault("last", {})
+        e.setdefault("count", {})
+        e.setdefault("rounds", 0)
+        return e
+
+    def pick_folder(self, rotation_id, eligible, all_folders, stamp=None):
+        """The next folder in the round that has a song that can play now (`eligible`), or None. Folders
+        without a playable song are passed over for this round."""
+        if not eligible:
+            return None
+        e = self.entry(rotation_id)
+        for _attempt in range(2):
+            remaining = [f for f in e["remaining"] if f in all_folders]
+            while remaining:
+                folder = remaining.pop(0)
+                if folder in eligible:
+                    e["remaining"] = remaining
+                    e["last"][folder] = stamp if stamp is not None else time.time()
+                    e["count"][folder] = int(e["count"].get(folder, 0)) + 1
+                    self.save()
+                    return folder
+            order = list(all_folders)
+            random.shuffle(order)
+            e["remaining"] = order
+            e["rounds"] = int(e["rounds"]) + 1
+        return None
+
+    def waiting_folders(self, rotation_id):
+        return set(self.entry(rotation_id)["remaining"])
+
+    def note_used(self, rotation_id, folder, stamp=None):
+        """A song was chosen some other way (to fit the end of an hour): that folder has had its turn."""
+        e = self.entry(rotation_id)
+        if folder in e["remaining"]:
+            e["remaining"].remove(folder)
+        e["last"][folder] = stamp if stamp is not None else time.time()
+        e["count"][folder] = int(e["count"].get(folder, 0)) + 1
+        self.save()
+
+    def last_scheduled(self, rotation_id, folder):
+        return self.entry(rotation_id)["last"].get(folder, 0)
+
+
+def folder_report(rotation, rotor=None, now=None):
+    """A plain-text report of every folder in a rotation: how many songs were found, when the folder was
+    last scheduled, and anything that was not read and why."""
+    now = now or time.time()
+    lines = []
+    root = rotation.folder
+    if not root or not os.path.isdir(root):
+        return f"The folder for {rotation.name} was not found: {root}"
+    songs = rotation.track_paths()
+    groups = group_by_folder(songs, root)
+    other = {}
+    skipped_dirs = []
+    try:
+        for name in sorted(os.listdir(root), key=str.lower):
+            full = os.path.join(root, name)
+            if os.path.isdir(full) and (name.startswith(".") or os.path.islink(full)):
+                skipped_dirs.append(name + (" (starts with a period)" if name.startswith(".") else " (a shortcut or link)"))
+        for current, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                if name.lower().endswith(OTHER_AUDIO):
+                    other.setdefault(folder_group(os.path.join(current, name), root), []).append(name)
+    except OSError:
+        pass
+    real_dirs = []
+    try:
+        real_dirs = [n for n in os.listdir(root) if os.path.isdir(os.path.join(root, n)) and not n.startswith(".")
+                     and not os.path.islink(os.path.join(root, n))]
+    except OSError:
+        pass
+    names = sorted(set(groups) | set(real_dirs), key=str.lower)
+    empty = [n for n in names if not groups.get(n)]
+    entry = rotor.entry(rotation.id) if rotor is not None else {"last": {}, "count": {}, "rounds": 0}
+    never = [n for n in names if groups.get(n) and not entry["last"].get(n)]
+    lines.append(f"Rotation {rotation.name}: {len(songs)} songs in {len([n for n in names if groups.get(n)])} folders.")
+    if not rotation.recursive:
+        lines.append("Include subfolders is OFF for this rotation, so only the top folder is read.")
+    lines.append(f"Folders with no readable songs: {len(empty)}." + (" " + ", ".join(empty) if empty else ""))
+    lines.append(f"Folders not yet scheduled in a playlist: {len(never)}." + (" " + ", ".join(never[:40]) if never else ""))
+    lines.append(f"Rounds completed through all folders: {entry.get('rounds', 0)}.")
+    if skipped_dirs:
+        lines.append("Folders skipped: " + "; ".join(skipped_dirs) + ".")
+    lines.append("")
+    for name in names:
+        count = len(groups.get(name, []))
+        last = entry["last"].get(name, 0)
+        when = time.strftime("%b %d %I:%M %p", time.localtime(last)) if last else "not yet"
+        line = f"{name}: {count} songs, last scheduled {when}, scheduled {int(entry['count'].get(name, 0))} times."
+        if other.get(name):
+            line += f" Not read ({len(other[name])} files of a type the program does not play, such as {other[name][0]})."
+        lines.append(line)
+    return "\n".join(lines)
+
+
 
 # ---------------------------------------------------------------------------
 # OctiMax-style stream processor: two-band AGC -> five-band compressor ->
@@ -3108,9 +3291,16 @@ class RotationEngine:
             self._fit_pool = (rotation_id, rotation.track_paths() if rotation else [])
         busy = {self.deck_a.current_track_path, self.deck_b.current_track_path}
         queued = set(self.shuffled_queue) - set(prefix)
-        return [p for p in self._fit_pool[1]
-                if p not in busy and p not in queued
-                and not self.play_history.violates_separation(p, self.separation_seconds)]
+        found = [p for p in self._fit_pool[1]
+                 if p not in busy and p not in queued
+                 and not self.play_history.violates_separation(p, self.separation_seconds)]
+        rotor = getattr(self, "folder_rotor", None)
+        rotation = self.rotation_library.find(rotation_id) if self.rotation_library else None
+        if rotor is not None and rotation is not None and len(found) > 60:
+            # Favor songs from the folders that have waited longest, so the swaps keep every folder in turn.
+            waited = sorted(found, key=lambda p: rotor.last_scheduled(rotation.id, folder_group(p, rotation.folder)))
+            found = waited[:max(40, int(len(found) * 0.7))]
+        return found
 
     def is_replaceable(self, item):
         return is_song_entry(item) and (item in self.replaceable or item not in self.pinned_tracks)
@@ -8866,6 +9056,7 @@ class BroadcastingApp(QWidget):
         self.event_library = EventLibrary(self.settings, on_changed=self.refresh_schedule_views)
         self.rotation_schedule.events = self.event_library
         self.break_marks = BreakMarks(self.settings, self.event_library)
+        self.rotation.folder_rotor = self.playlist_generator.rotor
         self.playlist_generator.events = self.event_library
         self.playlist_generator.marks = self.break_marks
         self.shortcut_objects = []
@@ -10731,6 +10922,47 @@ class BroadcastingApp(QWidget):
             self.played_list.addItem(f"{format_track_display(path)}: played {clock(played)}, available again at {clock(available)}")
         self.played_label.setText(f"Played: {len(rows)} song(s) held back for {separation / 3600:g} hours")
 
+    def build_folder_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        self.rotate_folders_check = QCheckBox("Rotate through every folder: each folder takes a turn before any folder repeats")
+        self.rotate_folders_check.setChecked(str(self.settings.value("rotate_folders", "true")).lower() != "false")
+        self.rotate_folders_check.toggled.connect(
+            lambda on: self.settings.setValue("rotate_folders", "true" if on else "false"))
+        layout.addWidget(self.rotate_folders_check)
+        self.report_rotation_combo = QComboBox()
+        self.report_rotation_combo.setAccessibleName("Rotation to report on")
+        layout.addWidget(self.report_rotation_combo)
+        build_btn = QPushButton("Build Folder Report")
+        build_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        build_btn.clicked.connect(self.build_folder_report)
+        layout.addWidget(build_btn)
+        self.report_text = QPlainTextEdit()
+        self.report_text.setReadOnly(True)
+        self.report_text.setAccessibleName("Folder report")
+        layout.addWidget(self.report_text)
+        page.setLayout(layout)
+        self.refresh_report_rotations()
+        return page
+
+    def refresh_report_rotations(self):
+        current = self.report_rotation_combo.currentData()
+        self.report_rotation_combo.clear()
+        for rotation in self.rotation_library.rotations:
+            self.report_rotation_combo.addItem(rotation.name, rotation.id)
+        index = self.report_rotation_combo.findData(current)
+        self.report_rotation_combo.setCurrentIndex(max(0, index))
+
+    def build_folder_report(self):
+        self.refresh_report_rotations()
+        rotation = self.rotation_library.find(self.report_rotation_combo.currentData())
+        if rotation is None:
+            self.report_text.setPlainText("There is no rotation to report on yet.")
+            return
+        self.report_text.setPlainText(folder_report(rotation, self.playlist_generator.rotor))
+        self.report_text.setFocus()
+        self.announce("Folder report ready.")
+
     def build_version_tab(self):
         page = QWidget()
         layout = QVBoxLayout()
@@ -11366,13 +11598,14 @@ class BroadcastingApp(QWidget):
         self.logo_tab = self.build_logo_tab()
         self.crossfade_tab = self.build_crossfade_tab()
         self.version_tab = self.build_version_tab()
+        self.folder_tab = self.build_folder_tab()
         sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Logo", self.logo_tab),
-                    ("Version", self.version_tab))
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Folder Report", self.folder_tab),
+                    ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
         self.section_list.setMaximumWidth(220)
