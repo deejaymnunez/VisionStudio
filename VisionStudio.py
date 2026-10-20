@@ -199,7 +199,7 @@ def get_layouts_folder():
 
 
 APP_VERSION = "2.0"
-BUILD_ID = "2026-10-19.14"      # changes with every delivery; written to the first log line and shown in Settings
+BUILD_ID = "2026-10-19.15"      # changes with every delivery; written to the first log line and shown in Settings
 
 
 class RunLog:
@@ -1719,7 +1719,7 @@ class PlaylistGenerator:
             remaining = target - filled
             if FIT_MIN_SECONDS <= remaining <= 480:
                 candidates = [c for c in pool if c not in used and separation_ok(c)]
-                chosen, _score = choose_fill(remaining + CROSSFADE_OVERLAP_SECONDS, candidates,
+                chosen, _score = choose_fill(remaining + overlap_seconds(), candidates,
                                              get_track_duration, self._artist, max_songs=2)
                 if chosen:
                     for track in chosen:
@@ -2032,6 +2032,15 @@ DEFAULT_VOICE_SLOT_SECONDS = 15
 DEFAULT_SIGNOFF_SECONDS = 180
 DEFAULT_BREAK_ESTIMATE_SECONDS = 90
 CROSSFADE_OVERLAP_SECONDS = 4.0
+_OVERLAP = [CROSSFADE_OVERLAP_SECONDS]      # 0 when crossfading is off: songs play to their end
+
+
+def overlap_seconds():
+    return _OVERLAP[0]
+
+
+def set_crossfade_overlap(enabled):
+    _OVERLAP[0] = CROSSFADE_OVERLAP_SECONDS if enabled else 0.0
 FIT_WINDOW_SECONDS = 720          # start fitting this long before the mark
 FIT_MIN_SECONDS = 75              # too close to the mark to fit anything
 FIT_GOOD_ENOUGH_EARLY = 12        # ending up to this many seconds early counts as on time
@@ -2311,13 +2320,15 @@ class BreakMarks:
 
 # --- fitting the end of the hour ---
 
-def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=CROSSFADE_OVERLAP_SECONDS,
+def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=None,
                 sample=70):
     """Picks 1 to max_songs songs whose combined length (less the crossfade overlaps) comes closest to
     `gap` seconds, preferring to end a little early rather than late. Returns (songs, score) where the
     score is how far off it lands (lower is better), or (None, None)."""
     if gap < FIT_MIN_SECONDS or not candidates:
         return None, None
+    if overlap is None:
+        overlap = overlap_seconds()
     pool = list(candidates)
     if len(pool) > 400:
         pool = random.sample(pool, 400)
@@ -2381,7 +2392,9 @@ def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=CRO
     return best
 
 
-def timeline_length(songs, duration, overlap=CROSSFADE_OVERLAP_SECONDS):
+def timeline_length(songs, duration, overlap=None):
+    if overlap is None:
+        overlap = overlap_seconds()
     if not songs:
         return 0.0
     return sum(duration(s) for s in songs) - overlap * (len(songs) - 1)
@@ -2746,6 +2759,7 @@ class RotationEngine:
         self.is_running = False
         self.next_track_cued = False
 
+        self.apply_crossfade_setting()
         self.separation_seconds = self.separation_from_settings()
         self.play_history = PersistentPlayHistory(settings, max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS))
         self.replaceable = set()          # queued songs the end-of-hour fit may swap (playlist songs, not hand-placed ones)
@@ -2781,6 +2795,21 @@ class RotationEngine:
         except Exception:
             hours = 2.0
         return int(max(0.25, min(12.0, hours)) * 3600)
+
+    def crossfade_enabled(self):
+        try:
+            return str(self.settings.value("crossfade_enabled", "false")).lower() == "true"
+        except Exception:
+            return False
+
+    def apply_crossfade_setting(self):
+        try:
+            if str(self.settings.value("crossfade_tab_v1", "")) != "done":      # first run with the Crossfade section
+                self.settings.setValue("fit_quarter_marks", "true")
+                self.settings.setValue("crossfade_tab_v1", "done")
+        except Exception:
+            pass
+        set_crossfade_overlap(self.crossfade_enabled())
 
     def apply_separation_setting(self):
         self.separation_seconds = self.separation_from_settings()
@@ -3029,7 +3058,7 @@ class RotationEngine:
         slots = []
         if str(self.settings.value("fit_end_of_hour", "true")).lower() != "false":
             slots.append(0)
-        if str(self.settings.value("fit_quarter_marks", "false")).lower() == "true":
+        if str(self.settings.value("fit_quarter_marks", "true")).lower() != "false":
             slots += [15, 30, 45]
         return slots
 
@@ -3076,7 +3105,7 @@ class RotationEngine:
                 remaining = max(0.0, (live.player.duration() - live.player.position()) / 1000.0)
             except Exception:
                 remaining = 0.0
-        gap = (mark - now).total_seconds() - remaining + CROSSFADE_OVERLAP_SECONDS
+        gap = (mark - now).total_seconds() - remaining + overlap_seconds()
         if gap < FIT_MIN_SECONDS or gap > FIT_WINDOW_SECONDS:
             return None
         prefix = []
@@ -3096,6 +3125,8 @@ class RotationEngine:
             self.shuffled_queue.insert(index, song)
             self.replaceable.add(song)
         total = timeline_length(replacement, get_track_duration)
+        for item in prefix:
+            RUN_LOG.write("FIT", f"Removed from the queue to make the break land on time: {os.path.basename(item)}")
         message = (f"Swapped {len(prefix)} queued song(s) for {len(replacement)} so the hour ends on time "
                    f"(about {int(total)} seconds of music for {int(gap)} seconds left).")
         self.on_status(message)
@@ -3352,7 +3383,13 @@ class RotationEngine:
 
         target_level = self._effective_level()
         cued_deck.play()
-        if underlay_ms is not None:
+        if underlay_ms is None and not self.crossfade_enabled():
+            # The song on air has finished: the next one starts at full level, nothing overlaps.
+            cued_deck.fader.timer.stop()
+            cued_deck.audio_output.setVolume(target_level * cued_deck.manual_volume)
+            live_deck.fader.timer.stop()
+            self._retire_deck(live_deck)
+        elif underlay_ms is not None:
             full = target_level * cued_deck.manual_volume
             cued_deck.audio_output.setVolume(full * (self.VOICE_UNDERLAY_LEVEL if underlay_ms > 700 else 0.0))
             old_deck = live_deck
@@ -3413,6 +3450,8 @@ class RotationEngine:
             lead_ms = crossfade_lead_ms if underlay is None else max(underlay, 500)
             if not self.next_track_cued and 0 < remaining_ms <= max(crossfade_lead_ms, lead_ms) + 2000:
                 self.cue_next_track_if_needed()
+            if underlay is None and not self.crossfade_enabled():
+                return          # no overlap: the next song starts when this one finishes (see on_media_status_changed)
             if self.next_track_cued and 0 < remaining_ms <= lead_ms:
                 self.crossfade_to_cued_deck(underlay_ms=remaining_ms if underlay is not None else None)
 
@@ -7191,7 +7230,7 @@ class VoiceTrackHourTab(QWidget):
                 used += slot_seconds
             elif not is_hour_marker(e) and not is_song_entry(e):
                 used += get_track_duration(e)
-        gap = 3600.0 - break_seconds - used + CROSSFADE_OVERLAP_SECONDS
+        gap = 3600.0 - break_seconds - used + overlap_seconds()
         rotation = self.app.rotation_library.find(self.app.rotation_schedule.rotation_id_for(self.day, self.hour))
         if rotation is None or gap < FIT_MIN_SECONDS:
             return
@@ -7199,8 +7238,8 @@ class VoiceTrackHourTab(QWidget):
         candidates = [p for p in rotation.track_paths() if p not in taken]
         best, score = choose_fill(gap, candidates, get_track_duration, get_track_artist, max_songs=max(1, min(2, len(tail))))
         current = timeline_length(tail, get_track_duration)
-        current_score = (gap - CROSSFADE_OVERLAP_SECONDS - current) if gap - CROSSFADE_OVERLAP_SECONDS >= current \
-            else (current - (gap - CROSSFADE_OVERLAP_SECONDS)) * 3
+        current_score = (gap - overlap_seconds() - current) if gap - overlap_seconds() >= current \
+            else (current - (gap - overlap_seconds())) * 3
         if best and score is not None and score < current_score:
             self.entries = head + best
 
@@ -10607,6 +10646,32 @@ class BroadcastingApp(QWidget):
             self.played_list.addItem(f"{format_track_display(path)}: played {clock(played)}, available again at {clock(available)}")
         self.played_label.setText(f"Played: {len(rows)} song(s) held back for {separation / 3600:g} hours")
 
+    def build_crossfade_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("By default every song, jingle, ad and sweeper plays to its end and the next one starts right "
+                       "after it, with no overlap. The music is only faded out when a break cannot be reached any other way. "
+                       "Before each break the program removes queued songs that do not fit, even ones that have not played, "
+                       "and puts in songs that bring the break in on time.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.crossfade_check = QCheckBox("Crossfade songs: start the next song about 10 seconds before the current one ends")
+        self.crossfade_check.setChecked(str(self.settings.value("crossfade_enabled", "false")).lower() == "true")
+        layout.addWidget(self.crossfade_check)
+        self.fit_hour_check = QCheckBox("Swap queued songs so the last song ends exactly on the top of the hour")
+        self.fit_hour_check.setChecked(str(self.settings.value("fit_end_of_hour", "true")).lower() != "false")
+        layout.addWidget(self.fit_hour_check)
+        self.fit_quarter_check = QCheckBox("Do the same before the :15, :30 and :45 breaks")
+        self.fit_quarter_check.setChecked(str(self.settings.value("fit_quarter_marks", "true")).lower() != "false")
+        layout.addWidget(self.fit_quarter_check)
+        save_btn = QPushButton("Save Settings")
+        save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save_btn.clicked.connect(self.save_audio_settings)
+        layout.addWidget(save_btn)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return page
+
     # --- logo ---
     def apply_logo(self):
         pixmap, custom = load_banner_pixmap(self.settings)
@@ -11143,12 +11208,6 @@ class BroadcastingApp(QWidget):
         except Exception:
             self.separation_spin.setValue(2)
         layout_a.addRow("Hours before a played song or artist can play again:", self.separation_spin)
-        self.fit_hour_check = QCheckBox("Swap the last songs of each hour so the last song ends exactly on the top of the hour")
-        self.fit_hour_check.setChecked(str(self.settings.value("fit_end_of_hour", "true")).lower() != "false")
-        layout_a.addRow(self.fit_hour_check)
-        self.fit_quarter_check = QCheckBox("Also fit the songs before the :15, :30 and :45 breaks")
-        self.fit_quarter_check.setChecked(str(self.settings.value("fit_quarter_marks", "false")).lower() == "true")
-        layout_a.addRow(self.fit_quarter_check)
         self.break_estimate_spin = QSpinBox()
         self.break_estimate_spin.setRange(0, 600)
         self.break_estimate_spin.setAccessibleName("Estimated seconds one break takes, used when building an hour")
@@ -11195,12 +11254,13 @@ class BroadcastingApp(QWidget):
         self.tagging_tab = self.build_tagging_tab()
         self.vt_hour_tab = VoiceTrackHourTab(self)
         self.logo_tab = self.build_logo_tab()
+        self.crossfade_tab = self.build_crossfade_tab()
         sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Logo", self.logo_tab))
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Logo", self.logo_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
         self.section_list.setMaximumWidth(220)
@@ -11545,6 +11605,8 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("playlist_autoload", "true" if self.playlist_autoload_check.isChecked() else "false")
         self.settings.setValue("break_window_seconds", self.break_hold_spin.value())
         self.settings.setValue("break_style", self.break_style_combo.currentData())
+        self.settings.setValue("crossfade_enabled", "true" if self.crossfade_check.isChecked() else "false")
+        self.rotation.apply_crossfade_setting()
         self.settings.setValue("separation_hours", self.separation_spin.value())
         self.settings.setValue("fit_end_of_hour", "true" if self.fit_hour_check.isChecked() else "false")
         self.settings.setValue("fit_quarter_marks", "true" if self.fit_quarter_check.isChecked() else "false")
