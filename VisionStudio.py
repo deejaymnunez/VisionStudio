@@ -9275,7 +9275,6 @@ class BroadcastingApp(QWidget):
         self.event_library = EventLibrary(self.settings, on_changed=self.refresh_schedule_views)
         self.rotation_schedule.events = self.event_library
         self.break_marks = BreakMarks(self.settings, self.event_library)
-        self.rotation.folder_rotor = self.playlist_generator.rotor
         self.playlist_generator.events = self.event_library
         self.playlist_generator.marks = self.break_marks
         self.shortcut_objects = []
@@ -9303,6 +9302,7 @@ class BroadcastingApp(QWidget):
         self.rotation.rotation_schedule = self.rotation_schedule
         self.rotation.on_queue_changed = self.refresh_queue_list
         self.rotation.on_rotation_swapped = self.on_rotation_swapped
+        self.rotation.folder_rotor = self.playlist_generator.rotor
         RUN_LOG.write("START", "Step 4: decks ready.")
         self.sequence_player = SequencePlayer(
             self.settings, self.update_status, self.on_sequence_done, output_device
