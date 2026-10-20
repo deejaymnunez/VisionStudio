@@ -2,7 +2,7 @@
 ; Build with:  ISCC.exe VisionStudio.iss   (after PyInstaller has produced dist\VisionStudio.exe)
 
 #define MyAppName "Vision Studio"
-#define MyAppVersion "2.0"
+#define MyAppVersion "26.0"
 #define MyAppPublisher "Vision Records"
 #define MyAppExeName "VisionStudio.exe"
 
@@ -10,6 +10,7 @@
 AppId={{8D2F5B1A-3C47-4E6A-9B10-5F7A2C9E4D31}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+VersionInfoVersion=26.0.0.1
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf32}\{#MyAppName}
 DefaultGroupName={#MyAppName}

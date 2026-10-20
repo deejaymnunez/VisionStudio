@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
                              QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
-                             QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget)
+                             QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget, QAbstractSpinBox)
 from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction, QKeyEvent
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
@@ -198,8 +198,10 @@ def get_layouts_folder():
     return tempfile.gettempdir()
 
 
-APP_VERSION = "2.0"
-BUILD_ID = "2026-10-19.15"      # changes with every delivery; written to the first log line and shown in Settings
+APP_VERSION = "26.0"             # the release number; changes only when Luis names a new one (26.1, 26.2 ... 27.0)
+BUILD_NUMBER = 1                  # goes up by one with every update; starts again at 1 with a new version
+BUILD_DATE = "2026-10-19"         # the day this build was made
+BUILD_ID = f"{BUILD_DATE}.{BUILD_NUMBER}"      # kept for the log
 
 
 class RunLog:
@@ -8724,6 +8726,20 @@ class KeyboardNavigationFilter(QObject):
 
     def eventFilter(self, obj, event):
         try:
+            win = self.app_window
+            section_list = getattr(win, "section_list", None)
+            if (event.type() == QEvent.Type.KeyPress and section_list is not None
+                    and getattr(win, "pages", None) is not None and win.pages.currentIndex() == 1):
+                key = event.key()
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                if obj is section_list and ((key == Qt.Key.Key_Tab and not shift) or key in
+                                            (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Right)):
+                    if win.focus_settings_content():
+                        return True
+                elif (key == Qt.Key.Key_Escape and isinstance(obj, QWidget) and obj is not section_list
+                      and win.settings_page.isAncestorOf(obj) and not isinstance(obj, QComboBox)):
+                    section_list.setFocus()
+                    return True
             if event.type() != QEvent.Type.KeyPress or not isinstance(obj, self.MOVERS):
                 return False
             if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
@@ -8781,7 +8797,7 @@ class BroadcastingApp(QWidget):
         self.append_attempted = set()
         self.last_schedule_hour = datetime.now().hour
         self.rescan_counter = 0
-        RUN_LOG.write("START", f"Vision Studio started. Build {BUILD_ID}.")
+        RUN_LOG.write("START", f"Vision Studio started. Version {APP_VERSION}, build {BUILD_NUMBER} ({BUILD_ID}).")
         if str(self.settings.value("startup_defaults_v2", "")) != "done":
             # Earlier builds could save these two as ticked. They start unchecked now and stay that way until you tick them.
             self.settings.setValue("start_in_tray", "false")
@@ -10590,7 +10606,7 @@ class BroadcastingApp(QWidget):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
         column.addWidget(title)
-        vinyl = VinylWidget(deck_name, size=90)
+        vinyl = VinylWidget(deck_name)
         column.addWidget(vinyl, alignment=Qt.AlignmentFlag.AlignCenter)
         live_indicator = QLabel("")
         live_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -10645,6 +10661,32 @@ class BroadcastingApp(QWidget):
         for path, played, available in rows[:80]:
             self.played_list.addItem(f"{format_track_display(path)}: played {clock(played)}, available again at {clock(available)}")
         self.played_label.setText(f"Played: {len(rows)} song(s) held back for {separation / 3600:g} hours")
+
+    def build_version_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        for text in (f"Vision Studio version {APP_VERSION}", f"Build {BUILD_NUMBER}", f"Built on {BUILD_DATE}"):
+            label = QLabel(text)
+            label.setAccessibleName(text)
+            label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)      # so a screen reader can land on each line
+            label.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-size: 16px;")
+            layout.addWidget(label)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return page
+
+    def focus_settings_content(self):
+        """Moves focus from the list of sections to the first control of the section chosen."""
+        page = self.tabs.currentWidget()
+        if page is None:
+            return False
+        for child in page.findChildren(QWidget):
+            if (child.focusPolicy() != Qt.FocusPolicy.NoFocus and child.isVisibleTo(page) and child.isEnabled()
+                    and not (isinstance(child, QLineEdit) and isinstance(child.parent(), (QAbstractSpinBox, QComboBox)))
+                    and child.objectName() != "qt_scrollarea_viewport"):
+                child.setFocus(Qt.FocusReason.TabFocusReason)
+                return True
+        return False
 
     def build_crossfade_tab(self):
         page = QWidget()
@@ -10807,6 +10849,8 @@ class BroadcastingApp(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.tabBar().hide()
+        self.tabs.tabBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # --- Tab 1: Music Rotation ---
         self.tab_rotation = QWidget()
@@ -11085,9 +11129,6 @@ class BroadcastingApp(QWidget):
         self.close_to_tray_check.setChecked(str(self.settings.value("close_to_tray", "false")).lower() == "true")
         self.close_to_tray_check.toggled.connect(self.on_close_to_tray_toggled)
         layout_a.addRow(self.close_to_tray_check)
-        build_label = QLabel(f"Vision Studio {APP_VERSION}, build {BUILD_ID}")
-        build_label.setAccessibleName(f"About: Vision Studio {APP_VERSION}, build {BUILD_ID}")
-        layout_a.addRow(build_label)
         self.start_in_tray_check = QCheckBox("When it starts with Windows, open in the system tray instead of showing the window")
         self.start_in_tray_check.setChecked(str(self.settings.value("start_in_tray", "false")).lower() == "true")
         layout_a.addRow(self.start_in_tray_check)
@@ -11255,12 +11296,14 @@ class BroadcastingApp(QWidget):
         self.vt_hour_tab = VoiceTrackHourTab(self)
         self.logo_tab = self.build_logo_tab()
         self.crossfade_tab = self.build_crossfade_tab()
+        self.version_tab = self.build_version_tab()
         sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Logo", self.logo_tab))
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Logo", self.logo_tab),
+                    ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
         self.section_list.setMaximumWidth(220)
