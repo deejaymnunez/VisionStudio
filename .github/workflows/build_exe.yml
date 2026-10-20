@@ -32,9 +32,13 @@ jobs:
           Copy-Item $exe.FullName ffmpeg\ffmpeg.exe
           .\ffmpeg\ffmpeg.exe -version
 
+      - name: Make the program icon
+        run: |
+          python VisionStudio.py --make-icon VisionStudio.ico
+
       - name: Build with PyInstaller
         run: |
-          pyinstaller --noconfirm --onefile --windowed --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" VisionStudio.py
+          pyinstaller --noconfirm --onefile --windowed --icon VisionStudio.ico --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" VisionStudio.py
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

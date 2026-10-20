@@ -14,6 +14,8 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf32}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+SetupIconFile=VisionStudio.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=installer
 OutputBaseFilename=VisionStudioSetup
 Compression=lzma2
@@ -46,6 +48,7 @@ Name: "{app}\Logs"; Permissions: users-modify
 Name: "{app}\VoiceTracks"; Permissions: users-modify
 ; Live-show recordings (MP3 plus optional cue sheet) are saved here unless another folder is chosen in Settings.
 Name: "{app}\Recordings"; Permissions: users-modify
+Name: "{app}\Logos"; Permissions: users-modify
 ; Keyboard layout files (Station Playlist, other automation systems) are kept here.
 Name: "{app}\Layouts"; Permissions: users-modify
 

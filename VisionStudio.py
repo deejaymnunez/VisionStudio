@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
                              QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget)
 from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
-from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction
+from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction, QKeyEvent
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
                                  QAudioSink, QAudioFormat, QAudio, QSoundEffect)
 
@@ -199,7 +199,7 @@ def get_layouts_folder():
 
 
 APP_VERSION = "2.0"
-BUILD_ID = "2026-10-19.13"      # changes with every delivery; written to the first log line and shown in Settings
+BUILD_ID = "2026-10-19.14"      # changes with every delivery; written to the first log line and shown in Settings
 
 
 class RunLog:
@@ -1065,6 +1065,8 @@ def voice_underlay_ms(path):
 def format_track_display(path):
     if is_hour_marker(path):
         tag = marker_tag(path)
+        if tag == "VOICE":
+            return "---- Voice track slot (empty) ----"
         if len(tag) >= 2 and tag[-2:].isdigit():
             return f"---- Hour marker: {hour_label(int(tag[-2:]) % 24)} ----"
         return "---- Hour marker ----"
@@ -1103,8 +1105,9 @@ def pretty_folder_name(folder_name):
 
 
 class MusicRotation:
-    def __init__(self, name, folder, recursive=True, auto=False, rotation_id=None):
+    def __init__(self, name, folder, recursive=True, auto=False, rotation_id=None, regular=True):
         self.id = rotation_id or uuid.uuid4().hex[:8]
+        self.regular = regular      # part of the everyday schedule; holiday music is not until you schedule it
         self.name = name
         self.folder = folder
         self.recursive = recursive
@@ -1112,13 +1115,13 @@ class MusicRotation:
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "folder": self.folder,
-                "recursive": self.recursive, "auto": self.auto}
+                "recursive": self.recursive, "auto": self.auto, "regular": self.regular}
 
     @staticmethod
     def from_dict(data):
         return MusicRotation(data.get("name", "Rotation"), data.get("folder", ""),
                              bool(data.get("recursive", True)), bool(data.get("auto", False)),
-                             data.get("id"))
+                             data.get("id"), bool(data.get("regular", True)))
 
     def track_paths(self):
         return scan_audio_files(self.folder, self.recursive)
@@ -1172,8 +1175,10 @@ class RotationLibrary:
             number += 1
         return candidate
 
-    def add_rotation(self, name, folder, recursive=True, auto=False, notify=True):
-        rotation = MusicRotation(self.unique_name(name), folder, recursive, auto)
+    def add_rotation(self, name, folder, recursive=True, auto=False, notify=True, regular=None):
+        if regular is None:
+            regular = not self.rotations          # the very first rotations make the everyday schedule; later ones wait to be scheduled
+        rotation = MusicRotation(self.unique_name(name), folder, recursive, auto, regular=regular)
         self.rotations.append(rotation)
         if notify:
             self._changed("added")
@@ -1208,6 +1213,18 @@ class RotationLibrary:
         self._changed("folder")
         return True
 
+    def relink_folder(self, rotation_id, folder):
+        """A category's folder changed: the rotation follows it without rebuilding the schedule."""
+        rotation = self.find(rotation_id)
+        if rotation is None or not folder:
+            return False
+        rotation.folder = folder
+        rotation.recursive = True
+        rotation.auto = False
+        self.known_files.pop(rotation_id, None)
+        self._changed("linked")
+        return True
+
     def sync_from_root(self, root):
         """
         Builds rotations from the music library folder: every subfolder that holds
@@ -1232,6 +1249,7 @@ class RotationLibrary:
         if scan_audio_files(root, recursive=False):
             wanted.append(("Library" if not wanted else "Loose tracks", root, False))
 
+        first_build = not self.rotations
         existing = {r.folder: r for r in self.rotations if r.auto}
         wanted_folders = {folder for _, folder, _ in wanted}
         added = []
@@ -1240,7 +1258,8 @@ class RotationLibrary:
             if folder in existing:
                 existing[folder].recursive = recursive
             else:
-                rotation = self.add_rotation(name, folder, recursive, auto=True, notify=False)
+                rotation = self.add_rotation(name, folder, recursive, auto=True, notify=False,
+                                             regular=(not self.rotations) or first_build)
                 added.append(rotation.name)
         for rotation in list(self.rotations):
             if rotation.auto and rotation.folder not in wanted_folders:
@@ -1277,6 +1296,7 @@ class RotationSchedule:
         self.settings = settings
         self.library = library
         self.hours = [None] * 24
+        self.events = None          # the dated schedules (EventLibrary), set by the app
         self.load()
         self.ensure_valid()
 
@@ -1295,7 +1315,8 @@ class RotationSchedule:
             pass
 
     def regenerate_even(self):
-        ids = [r.id for r in self.library.rotations]
+        ids = [r.id for r in self.library.rotations if getattr(r, "regular", True)]
+        ids = ids or [r.id for r in self.library.rotations]
         self.hours = [ids[h % len(ids)] if ids else None for h in range(24)]
         self.save()
 
@@ -1306,8 +1327,19 @@ class RotationSchedule:
         elif not valid:
             self.hours = [None] * 24
 
-    def rotation_id_for_hour(self, hour):
+    def rotation_id_for(self, day, hour):
+        """The rotation for that hour on that day: a running dated schedule wins over the everyday one."""
+        if self.events is not None:
+            try:
+                event = self.events.event_for_hour(day, hour)
+            except Exception:
+                event = None
+            if event is not None and event.get("rotation_id") and self.library.find(event["rotation_id"]):
+                return event["rotation_id"]
         return self.hours[hour % 24]
+
+    def rotation_id_for_hour(self, hour):
+        return self.rotation_id_for(datetime.now().date(), hour)
 
     def set_hour(self, hour, rotation_id):
         self.hours[hour % 24] = rotation_id
@@ -1325,7 +1357,7 @@ class RotationSchedule:
 # Categories and spot groups (jingles, sweepers, ads) feeding the sandwich
 # ---------------------------------------------------------------------------
 
-CATEGORY_TYPES = ("jingle", "sweeper", "ad")
+CATEGORY_TYPES = ("jingle", "sweeper", "ad", "music")
 AD_WORDS = {"ad", "ads", "advert", "adverts", "advertisement", "advertisements", "commercial",
             "commercials", "spot", "spots", "sponsor", "sponsors", "underwriting"}
 SWEEPER_WORDS = {"sweeper", "sweepers", "liner", "liners", "imaging", "promo", "promos",
@@ -1381,30 +1413,36 @@ class CategoryLibrary:
                 return category
         return None
 
-    def add_category(self, folder, name=None, category_type=None):
+    def add_category(self, folder, name=None, category_type=None, active=False, rotation_id=None):
+        """New categories are listed but do not play anywhere until you switch them on or schedule them."""
         base = os.path.basename(os.path.normpath(folder))
         category = {"id": uuid.uuid4().hex[:8],
                     "name": name or pretty_folder_name(base),
                     "type": category_type or guess_category_type(base),
-                    "folder": folder}
+                    "folder": folder, "active": bool(active), "rotation_id": rotation_id}
         self.categories.append(category)
         return category
 
-    def import_folder(self, folder):
+    def audio_folders(self, folder):
+        """The folders a category import covers: the folder itself if it holds audio, otherwise each subfolder that does."""
+        if not folder or not os.path.isdir(folder):
+            return []
+        if scan_audio_files(folder, recursive=False):
+            return [folder]
+        found = []
+        for d in sorted(os.listdir(folder), key=str.lower):
+            path = os.path.join(folder, d)
+            if not d.startswith(".") and os.path.isdir(path) and scan_audio_files(path):
+                found.append(path)
+        return found
+
+    def import_folder(self, folder, forced_type=None):
         """
         One folder that holds audio becomes one category. A folder that holds only
         subfolders becomes one category per subfolder. Returns the categories added.
+        Imported categories are off until you switch them on.
         """
-        if not folder or not os.path.isdir(folder):
-            return []
-        added = []
-        if scan_audio_files(folder, recursive=False):
-            added.append(self.add_category(folder))
-        else:
-            for d in sorted(os.listdir(folder), key=str.lower):
-                path = os.path.join(folder, d)
-                if not d.startswith(".") and os.path.isdir(path) and scan_audio_files(path):
-                    added.append(self.add_category(path))
+        added = [self.add_category(path, category_type=forced_type) for path in self.audio_folders(folder)]
         if added:
             self._changed()
         return added
@@ -1427,15 +1465,53 @@ class CategoryLibrary:
             self.categories.remove(category)
             self._changed()
 
-    def files_for_types(self, types):
+    def is_active(self, category):
+        return bool(category.get("active", True))      # categories saved before this option existed stay on
+
+    def set_active(self, category_id, active):
+        category = self.find(category_id)
+        if category:
+            category["active"] = bool(active)
+            self._changed()
+
+    def files_for_types(self, types, only_active=True):
         files = []
         for category in self.categories:
-            if category["type"] in types:
+            if category["type"] in types and (not only_active or self.is_active(category)):
                 files += scan_audio_files(category["folder"])
         return files
 
+    def files_for_category(self, category_id):
+        category = self.find(category_id)
+        return scan_audio_files(category["folder"]) if category else []
+
+    def sync_music(self, rotation_library):
+        """Every rotation has a music category beside it, so the Categories tab shows everything that can
+        play. Returns True when something was added or updated."""
+        changed = False
+        linked = {c.get("rotation_id"): c for c in self.categories if c.get("rotation_id")}
+        for rotation in rotation_library.rotations:
+            category = linked.get(rotation.id)
+            if category is None:
+                self.add_category(rotation.folder, rotation.name, "music",
+                                  active=getattr(rotation, "regular", True), rotation_id=rotation.id)
+                changed = True
+            else:
+                if category["folder"] != rotation.folder or category["name"] != rotation.name:
+                    category["folder"], category["name"] = rotation.folder, rotation.name
+                    changed = True
+        valid = {r.id for r in rotation_library.rotations}
+        for category in list(self.categories):
+            if category.get("type") == "music" and category.get("rotation_id") and category["rotation_id"] not in valid:
+                self.categories.remove(category)
+                changed = True
+        if changed:
+            self._changed()
+        return changed
+
     def describe(self, category):
-        return f"{category['name']} ({category['type']}) - {category['folder']}"
+        state = "in the regular schedule" if self.is_active(category) else "not in the regular schedule"
+        return f"{category['name']} ({category['type']}, {state}) - {category['folder']}"
 
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +1624,8 @@ class PlaylistGenerator:
         self.carry_clock = [0.0]
         self.carry_track = {}
         self.carry_artist = {}
+        self.events = None            # EventLibrary, set by the app
+        self.marks = None             # BreakMarks, set by the app
 
     # --- settings ---
     def mode(self):
@@ -1579,9 +1657,36 @@ class PlaylistGenerator:
             self._artist_cache[path] = get_track_artist(path)
         return self._artist_cache[path]
 
+    def hour_options(self, day, hour):
+        """(voice tracked, last hour of the show, seconds of the hour taken by breaks) for that hour."""
+        voice = signoff = False
+        event = None
+        if self.events is not None:
+            try:
+                event = self.events.event_for_hour(day, hour)
+            except Exception:
+                event = None
+        if event is not None and event.get("voice"):
+            voice = True
+            signoff = self.events.is_last_hour_of_show(event, day, hour)
+        try:
+            estimate = int(float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS)))
+        except Exception:
+            estimate = DEFAULT_BREAK_ESTIMATE_SECONDS
+        slots = BreakMarks.SLOTS
+        count = sum(1 for sl in slots if (self.marks.enabled(day, hour, sl) if self.marks is not None else True))
+        return voice, signoff, count * estimate
+
+    def voice_slot_seconds(self):
+        try:
+            return int(float(self.settings.value("voice_slot_seconds", DEFAULT_VOICE_SLOT_SECONDS)))
+        except Exception:
+            return DEFAULT_VOICE_SLOT_SECONDS
+
     def build_hour_entries(self, rotation, virtual_clock, last_track, last_artist, separation=None,
-                           marker=HOUR_MARKER_TOKEN):
-        """About an hour of tracks, starting with an hour marker. virtual_clock is advanced in place."""
+                           marker=HOUR_MARKER_TOKEN, voice=False, signoff=False, break_seconds=0):
+        """About an hour of tracks, starting with an hour marker. virtual_clock is advanced in place.
+        The songs are chosen so the last one finishes at the end of the hour (less the breaks)."""
         separation = DEFAULT_SEPARATION_SECONDS if separation is None else separation
         if rotation is None:
             pool = []
@@ -1596,8 +1701,36 @@ class PlaylistGenerator:
         queue_items = list(pool)
         filled = 0.0
         guard = 0
-        while filled < 3600.0 and guard < 5000:
+        target = 3600.0 - float(break_seconds)
+        if voice:
+            target -= (target / AVERAGE_TRACK_SECONDS / VOICE_MARKER_EVERY) * self.voice_slot_seconds()
+        target = max(600.0, target)
+        used = set()
+
+        def separation_ok(candidate):
+            last = last_track.get(candidate)
+            artist = self._artist(candidate)
+            a_last = last_artist.get(artist) if artist else None
+            return ((last is None or virtual_clock[0] - last >= separation) and
+                    (a_last is None or virtual_clock[0] - a_last >= separation))
+
+        while filled < target and guard < 5000:
             guard += 1
+            remaining = target - filled
+            if FIT_MIN_SECONDS <= remaining <= 480:
+                candidates = [c for c in pool if c not in used and separation_ok(c)]
+                chosen, _score = choose_fill(remaining + CROSSFADE_OVERLAP_SECONDS, candidates,
+                                             get_track_duration, self._artist, max_songs=2)
+                if chosen:
+                    for track in chosen:
+                        entries.append(track)
+                        used.add(track)
+                        last_track[track] = virtual_clock[0]
+                        artist = self._artist(track)
+                        if artist:
+                            last_artist[artist] = virtual_clock[0]
+                        virtual_clock[0] += get_track_duration(track)
+                    break
             if not queue_items:
                 queue_items = list(pool)
                 random.shuffle(queue_items)
@@ -1613,6 +1746,7 @@ class PlaylistGenerator:
             if chosen_index is None:
                 chosen_index = 0  # relax the rule when the rotation is too small
             track = queue_items.pop(chosen_index)
+            used.add(track)
             entries.append(track)
             duration = get_track_duration(track)
             last_track[track] = virtual_clock[0]
@@ -1621,24 +1755,43 @@ class PlaylistGenerator:
                 last_artist[artist] = virtual_clock[0]
             virtual_clock[0] += duration
             filled += duration
+        if voice:
+            entries = insert_voice_markers(entries, VOICE_MARKER_EVERY, signoff)
         return entries
 
     def playlist_path(self, day, hour, rotation_name):
         safe = "".join(c for c in rotation_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
         return os.path.join(self.output_folder(), f"{day.strftime('%Y-%m-%d')}_{hour:02d}00_{safe or 'rotation'}.m3u8")
 
+    def locked_settings(self):
+        return self.settings
+
+    def hour_is_locked(self, day, hour):
+        return is_hour_locked(self.settings, day, hour)
+
     def generate_hour(self, day, hour, virtual_clock=None, last_track=None, last_artist=None):
-        rotation = self.library.find(self.schedule.rotation_id_for_hour(hour))
+        rotation = self.library.find(self.schedule.rotation_id_for(day, hour))
         if rotation is None:
             return None
+        if self.hour_is_locked(day, hour):
+            existing = self.current_hour_playlist(day, hour)
+            if existing:
+                return existing          # recorded voice tracks are never rebuilt away
+        voice, signoff, break_seconds = self.hour_options(day, hour)
         # One continuous virtual clock and play history, so separation carries from hour to hour.
         entries = self.build_hour_entries(
             rotation, virtual_clock if virtual_clock is not None else self.carry_clock,
             last_track if last_track is not None else self.carry_track,
             last_artist if last_artist is not None else self.carry_artist,
-            marker=marker_for(day, hour))
+            marker=marker_for(day, hour), voice=voice, signoff=signoff, break_seconds=break_seconds)
+        old = self.current_hour_playlist(day, hour)
         path = self.playlist_path(day, hour, rotation.name)
         write_m3u(path, entries)
+        if old and os.path.normcase(old) != os.path.normcase(path):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
         return path
 
     def generate_full_day(self, day=None):
@@ -1649,16 +1802,26 @@ class PlaylistGenerator:
         last_artist = {}
         written = []
         combined = []
-        self.remove_day_playlists(day)    # whatever was written before for this day is replaced
+        locked_hours = {h for h in range(24) if self.hour_is_locked(day, h)}
+        self.remove_day_playlists(day, keep_hours=locked_hours)    # replaced, except hours you voice tracked
         self._pool_cache = {}
         for rotation in self.library.rotations:
             self._pool_cache[rotation.id] = rotation.track_paths()
         for hour in range(24):            # 00:00 up to and including 23:00
-            rotation = self.library.find(self.schedule.rotation_id_for_hour(hour))
+            if hour in locked_hours:
+                existing = self.current_hour_playlist(day, hour)
+                if existing:
+                    kept, _missing = read_m3u(existing)
+                    combined += kept
+                    written.append(existing)
+                    continue
+            rotation = self.library.find(self.schedule.rotation_id_for(day, hour))
             if rotation is None:
                 continue
+            voice, signoff, break_seconds = self.hour_options(day, hour)
             entries = self.build_hour_entries(rotation, clock, last_track, last_artist,
-                                              marker=marker_for(day, hour))
+                                              marker=marker_for(day, hour), voice=voice, signoff=signoff,
+                                              break_seconds=break_seconds)
             path = self.playlist_path(day, hour, rotation.name)
             write_m3u(path, entries)
             written.append(path)
@@ -1670,13 +1833,17 @@ class PlaylistGenerator:
         self._pool_cache = {}
         return written
 
-    def remove_day_playlists(self, day):
-        """Deletes every playlist already saved for that day, so corrected ones replace mistaken ones."""
+    def remove_day_playlists(self, day, keep_hours=()):
+        """Deletes every playlist already saved for that day, so corrected ones replace mistaken ones.
+        Hours in keep_hours (voice tracked) are left alone."""
         prefix = f"{day.strftime('%Y-%m-%d')}_"
         removed = 0
+        keep_prefixes = tuple(f"{prefix}{h:02d}00_" for h in keep_hours)
         try:
             for name in os.listdir(self.output_folder()):
                 if name.startswith(prefix) and name.lower().endswith((".m3u", ".m3u8")):
+                    if keep_prefixes and name.startswith(keep_prefixes):
+                        continue
                     try:
                         os.remove(os.path.join(self.output_folder(), name))
                         removed += 1
@@ -1850,6 +2017,456 @@ def save_shortcut_override(settings, shortcut_id, key):
 
 def reset_shortcut_overrides(settings):
     settings.setValue("shortcut_overrides", "{}")
+
+
+# ---------------------------------------------------------------------------
+# Dated schedules (holidays, one-day shows), break marks, voice track markers, locked hours,
+# the played list, and fitting the end of an hour so the last song finishes on the mark.
+# ---------------------------------------------------------------------------
+
+# A voice track slot is an hour-marker-shaped entry, so every part of the queue that skips hour markers
+# also skips an empty slot. It is saved in playlists as a comment line, which other software ignores.
+VOICE_MARKER_TOKEN = HOUR_MARKER_TOKEN + "VOICE"
+VOICE_MARKER_EVERY = 3
+DEFAULT_VOICE_SLOT_SECONDS = 15
+DEFAULT_SIGNOFF_SECONDS = 180
+DEFAULT_BREAK_ESTIMATE_SECONDS = 90
+CROSSFADE_OVERLAP_SECONDS = 4.0
+FIT_WINDOW_SECONDS = 720          # start fitting this long before the mark
+FIT_MIN_SECONDS = 75              # too close to the mark to fit anything
+FIT_GOOD_ENOUGH_EARLY = 12        # ending up to this many seconds early counts as on time
+FIT_GOOD_ENOUGH_LATE = 2
+
+
+def is_voice_marker(entry):
+    return isinstance(entry, str) and entry.startswith(VOICE_MARKER_TOKEN)
+
+
+def is_song_entry(entry):
+    """A real music file: not a marker and not a recorded voice track."""
+    return (isinstance(entry, str) and not is_hour_marker(entry)
+            and not os.path.basename(entry).lower().startswith("voicetrack_"))
+
+
+def insert_voice_markers(entries, every=VOICE_MARKER_EVERY, signoff=False):
+    """A voice track slot after every `every` songs. With signoff=True the last song is always
+    preceded by a slot (the sign-off before the final song of a show)."""
+    out = []
+    count = 0
+    for entry in entries:
+        out.append(entry)
+        if not is_song_entry(entry):
+            continue
+        count += 1
+        if count % every == 0:
+            out.append(VOICE_MARKER_TOKEN)
+    while out and is_voice_marker(out[-1]):
+        out.pop()                       # nothing to introduce after the last song
+    if signoff:
+        last_song = max((i for i, e in enumerate(out) if is_song_entry(e)), default=None)
+        if last_song is not None and not (last_song > 0 and is_voice_marker(out[last_song - 1])):
+            out.insert(last_song, VOICE_MARKER_TOKEN)
+    return out
+
+
+# --- locked hours: an hour with recorded voice tracks is never rebuilt by accident ---
+
+def hour_key(day, hour):
+    return f"{day.strftime('%Y%m%d')}{int(hour):02d}"
+
+
+def load_locked_hours(settings):
+    try:
+        data = json.loads(str(settings.value("locked_hours_json", "[]")))
+        return set(str(x) for x in data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def save_locked_hours(settings, locked):
+    cutoff = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d00")
+    settings.setValue("locked_hours_json", json.dumps(sorted(k for k in locked if k >= cutoff)))
+
+
+def is_hour_locked(settings, day, hour):
+    return hour_key(day, hour) in load_locked_hours(settings)
+
+
+def set_hour_locked(settings, day, hour, locked=True):
+    keys = load_locked_hours(settings)
+    (keys.add if locked else keys.discard)(hour_key(day, hour))
+    save_locked_hours(settings, keys)
+
+
+# --- dated schedules ---
+
+def shift_years(moment, years):
+    try:
+        return moment.replace(year=moment.year + years)
+    except ValueError:                  # February 29
+        return moment.replace(year=moment.year + years, day=28)
+
+
+def parse_moment(text):
+    try:
+        return datetime.strptime(str(text), "%Y-%m-%dT%H:%M")
+    except Exception:
+        return None
+
+
+def format_moment(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+class EventLibrary:
+    """Named schedules that run between two dates and times and replace the regular schedule while
+    they do. A draft (no saved dates) is never active."""
+
+    def __init__(self, settings, on_changed=None):
+        self.settings = settings
+        self.on_changed = on_changed
+        self.events = []
+        self.load()
+
+    def load(self):
+        try:
+            data = json.loads(str(self.settings.value("event_schedules_json", "[]")))
+            self.events = [e for e in data if isinstance(e, dict) and e.get("id")]
+        except Exception:
+            self.events = []
+
+    def save(self):
+        try:
+            self.settings.setValue("event_schedules_json", json.dumps(self.events))
+        except Exception:
+            pass
+
+    def _changed(self):
+        self.save()
+        if self.on_changed:
+            self.on_changed()
+
+    def find(self, event_id):
+        for event in self.events:
+            if event["id"] == event_id:
+                return event
+        return None
+
+    def add_draft(self, name, rotation_id=None, jingle_category_id=None):
+        event = {"id": uuid.uuid4().hex[:8], "name": name, "rotation_id": rotation_id,
+                 "jingle_category_id": jingle_category_id, "ad_category_id": None,
+                 "start": "", "end": "", "repeat": False, "voice": False, "marks": [1, 1, 1, 1],
+                 "active": False, "created": time.time()}
+        self.events.append(event)
+        self._changed()
+        return event
+
+    def validate(self, event):
+        start, end = parse_moment(event.get("start")), parse_moment(event.get("end"))
+        if start is None or end is None:
+            return "Choose a start and an end."
+        if end <= start:
+            return "The end must be after the start."
+        return ""
+
+    def save_event(self, event):
+        """Saves dates and activates the schedule. Returns an error text, or '' when saved."""
+        problem = self.validate(event)
+        if problem:
+            return problem
+        event["active"] = True
+        if self.find(event["id"]) is None:
+            event["created"] = event.get("created", time.time())
+            self.events.append(event)
+        self._changed()
+        return ""
+
+    def update(self, event, **fields):
+        event.update(fields)
+        self._changed()
+
+    def remove(self, event_id):
+        event = self.find(event_id)
+        if event:
+            self.events.remove(event)
+            self._changed()
+
+    def occurrences(self, event, around):
+        start, end = parse_moment(event.get("start")), parse_moment(event.get("end"))
+        if start is None or end is None or end <= start:
+            return []
+        if not event.get("repeat"):
+            return [(start, end)]
+        base = around.year - start.year
+        return [(shift_years(start, k), shift_years(end, k)) for k in range(base - 1, base + 3)]
+
+    def is_running(self, event, now):
+        if not event.get("active"):
+            return False
+        return any(s <= now < e for s, e in self.occurrences(event, now))
+
+    def next_start(self, event, now):
+        if not event.get("active"):
+            return None
+        future = [s for s, _e in self.occurrences(event, now) if s > now]
+        return min(future) if future else None
+
+    def event_at(self, moment):
+        """The running schedule that wins at this moment: the one created last."""
+        winner = None
+        for event in self.events:
+            if self.is_running(event, moment):
+                if winner is None or event.get("created", 0) >= winner.get("created", 0):
+                    winner = event
+        return winner
+
+    def event_for_hour(self, day, hour):
+        return self.event_at(datetime(day.year, day.month, day.day, int(hour) % 24, 0))
+
+    def is_last_hour_of_show(self, event, day, hour):
+        hour_start = datetime(day.year, day.month, day.day, int(hour) % 24, 0)
+        hour_end = hour_start + timedelta(hours=1)
+        for s, e in self.occurrences(event, hour_start):
+            if s <= hour_start < e:
+                return e <= hour_end
+        return False
+
+    def overlaps(self, event):
+        """Other saved schedules that overlap this one (checked over the next two years)."""
+        mine = self.occurrences(event, datetime.now())
+        found = []
+        for other in self.events:
+            if other["id"] == event["id"] or not other.get("active"):
+                continue
+            for s1, e1 in mine:
+                if any(s1 < e2 and s2 < e1 for s2, e2 in self.occurrences(other, datetime.now())):
+                    found.append(other["name"])
+                    break
+        return found
+
+    def describe(self, event, now=None):
+        now = now or datetime.now()
+        if not event.get("active"):
+            return f"{event['name']}: draft, not scheduled yet"
+        start, end = parse_moment(event["start"]), parse_moment(event["end"])
+        text = f"{event['name']}: {start.strftime('%a %b %d %Y %I:%M %p')} to {end.strftime('%a %b %d %Y %I:%M %p')}"
+        if event.get("repeat"):
+            text += ", repeats every year"
+        if event.get("voice"):
+            text += ", voice tracked"
+        if self.is_running(event, now):
+            text += " (on air now)"
+        else:
+            nxt = self.next_start(event, now)
+            text += f" (next starts {nxt.strftime('%b %d %Y')})" if nxt else " (finished)"
+        return text
+
+
+class BreakMarks:
+    """Which of :00, :15, :30 and :45 run a break, hour by hour. A running dated schedule has its own set."""
+
+    SLOTS = (":00", ":15", ":30", ":45")
+
+    def __init__(self, settings, events=None):
+        self.settings = settings
+        self.events = events
+        self.grid = [[1, 1, 1, 1] for _ in range(24)]
+        self.load()
+
+    def load(self):
+        try:
+            data = json.loads(str(self.settings.value("break_marks_json", "[]")))
+            if isinstance(data, list) and len(data) == 24:
+                self.grid = [[1 if int(v) else 0 for v in (row + [1, 1, 1, 1])[:4]] for row in data]
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            self.settings.setValue("break_marks_json", json.dumps(self.grid))
+        except Exception:
+            pass
+
+    def set_mark(self, hour, slot, enabled):
+        self.grid[hour % 24][self.SLOTS.index(slot)] = 1 if enabled else 0
+        self.save()
+
+    def set_hour(self, hour, flags):
+        self.grid[hour % 24] = [1 if f else 0 for f in flags]
+        self.save()
+
+    def set_all(self, flags):
+        self.grid = [[1 if f else 0 for f in flags] for _ in range(24)]
+        self.save()
+
+    def enabled(self, day, hour, slot):
+        index = self.SLOTS.index(slot)
+        if self.events is not None:
+            event = self.events.event_for_hour(day, hour)
+            if event is not None:
+                marks = (list(event.get("marks", [1, 1, 1, 1])) + [1, 1, 1, 1])[:4]
+                return bool(marks[index])
+        return bool(self.grid[hour % 24][index])
+
+
+# --- fitting the end of the hour ---
+
+def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=CROSSFADE_OVERLAP_SECONDS,
+                sample=70):
+    """Picks 1 to max_songs songs whose combined length (less the crossfade overlaps) comes closest to
+    `gap` seconds, preferring to end a little early rather than late. Returns (songs, score) where the
+    score is how far off it lands (lower is better), or (None, None)."""
+    if gap < FIT_MIN_SECONDS or not candidates:
+        return None, None
+    pool = list(candidates)
+    if len(pool) > 400:
+        pool = random.sample(pool, 400)
+    lengths = {p: duration(p) for p in pool}
+
+    def score(total):
+        diff = gap - total
+        return diff if diff >= 0 else -diff * 3.0
+
+    def distinct(songs):
+        if artist is None:
+            return True
+        names = [artist(s) for s in songs]
+        names = [n for n in names if n]
+        return len(names) == len(set(names))
+
+    best = (None, None)
+    ordered = sorted(pool, key=lambda p: lengths[p])
+    # one song
+    for p in ordered:
+        s = score(lengths[p])
+        if best[1] is None or s < best[1]:
+            best = ([p], s)
+    # two songs: two-pointer over the sorted lengths
+    if max_songs >= 2:
+        lo, hi = 0, len(ordered) - 1
+        target = gap + overlap
+        while lo < hi:
+            total = lengths[ordered[lo]] + lengths[ordered[hi]]
+            pair = [ordered[hi], ordered[lo]]
+            s = score(total - overlap)
+            if (best[1] is None or s < best[1]) and distinct(pair):
+                best = (pair, s)
+            if total < target:
+                lo += 1
+            else:
+                hi -= 1
+    # three songs: first song from a random sample, best pair for the rest
+    if max_songs >= 3 and (best[1] is None or best[1] > FIT_GOOD_ENOUGH_EARLY):
+        firsts = random.sample(ordered, min(sample, len(ordered)))
+        for first in firsts:
+            rest_target = gap - lengths[first] + 2 * overlap
+            lo, hi = 0, len(ordered) - 1
+            while lo < hi:
+                a, b = ordered[lo], ordered[hi]
+                if first in (a, b):
+                    if a == first:
+                        lo += 1
+                    else:
+                        hi -= 1
+                    continue
+                total = lengths[first] + lengths[a] + lengths[b] - 2 * overlap
+                s = score(total)
+                trio = [first, b, a]
+                if (best[1] is None or s < best[1]) and distinct(trio):
+                    best = (trio, s)
+                if lengths[a] + lengths[b] < rest_target:
+                    lo += 1
+                else:
+                    hi -= 1
+    return best
+
+
+def timeline_length(songs, duration, overlap=CROSSFADE_OVERLAP_SECONDS):
+    if not songs:
+        return 0.0
+    return sum(duration(s) for s in songs) - overlap * (len(songs) - 1)
+
+
+def natural_fit(queue_songs, gap, duration):
+    """How the songs already queued would land. Returns (songs_used, score)."""
+    used = []
+    total = 0.0
+    for song in queue_songs:
+        used.append(song)
+        total = timeline_length(used, duration)
+        if total >= gap:
+            break
+    diff = gap - total
+    return used, (diff if diff >= 0 else -diff * 3.0)
+
+
+def plan_hour_end(queue_songs, gap, candidates, duration, artist=None):
+    """Decides whether to replace the queued songs so the hour ends on the mark.
+    Returns the replacement songs, or None to leave the queue alone."""
+    if gap < FIT_MIN_SECONDS or gap > FIT_WINDOW_SECONDS:
+        return None
+    used, natural = natural_fit(queue_songs, gap, duration)
+    overshoot = timeline_length(used, duration) - gap
+    if natural <= FIT_GOOD_ENOUGH_EARLY and overshoot <= FIT_GOOD_ENOUGH_LATE:
+        return None
+    songs, score = choose_fill(gap, candidates, duration, artist)
+    if songs is None or score >= natural:
+        return None
+    return songs
+
+
+# --- the played list ---
+
+class PersistentPlayHistory(PlayHistory):
+    """Remembers what played, saved to disk, so a restart does not forget the last two hours."""
+
+    KEY = "play_history_json"
+
+    def __init__(self, settings=None, keep_seconds=DEFAULT_SEPARATION_SECONDS):
+        super().__init__()
+        self.settings = settings
+        self.keep_seconds = keep_seconds
+        self.load()
+
+    def load(self):
+        if self.settings is None:
+            return
+        try:
+            data = json.loads(str(self.settings.value(self.KEY, "{}")))
+        except Exception:
+            data = {}
+        now = time.time()
+        for path, stamp in (data.items() if isinstance(data, dict) else []):
+            try:
+                stamp = float(stamp)
+            except Exception:
+                continue
+            if now - stamp < self.keep_seconds:
+                self.last_played_track[path] = stamp
+                artist = get_track_artist(path) if os.path.isfile(path) else ""
+                if artist and stamp > self.last_played_artist.get(artist, 0):
+                    self.last_played_artist[artist] = stamp
+
+    def save(self):
+        if self.settings is None:
+            return
+        now = time.time()
+        recent = {p: t for p, t in self.last_played_track.items() if now - t < self.keep_seconds}
+        try:
+            self.settings.setValue(self.KEY, json.dumps(recent))
+        except Exception:
+            pass
+
+    def record_play(self, file_path):
+        super().record_play(file_path)
+        self.save()
+
+    def recent(self, separation_seconds):
+        """(path, played_at, available_at) for everything still held back, newest first."""
+        now = time.time()
+        rows = [(p, t, t + separation_seconds) for p, t in self.last_played_track.items()
+                if now - t < separation_seconds and is_song_entry(p)]
+        return sorted(rows, key=lambda r: -r[1])
 
 
 
@@ -2129,8 +2746,10 @@ class RotationEngine:
         self.is_running = False
         self.next_track_cued = False
 
-        self.play_history = PlayHistory()
-        self.separation_seconds = DEFAULT_SEPARATION_SECONDS
+        self.separation_seconds = self.separation_from_settings()
+        self.play_history = PersistentPlayHistory(settings, max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS))
+        self.replaceable = set()          # queued songs the end-of-hour fit may swap (playlist songs, not hand-placed ones)
+        self._fit_pool = (None, [])
         self.ending_beep_fired = False
 
         self.is_ducked = False
@@ -2155,6 +2774,17 @@ class RotationEngine:
         self.last_tail_seek = 0.0
         self.last_taken_slot = None
         self.last_taken_time = None
+
+    def separation_from_settings(self):
+        try:
+            hours = float(self.settings.value("separation_hours", 2))
+        except Exception:
+            hours = 2.0
+        return int(max(0.25, min(12.0, hours)) * 3600)
+
+    def apply_separation_setting(self):
+        self.separation_seconds = self.separation_from_settings()
+        self.play_history.keep_seconds = max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS)
 
     # --- deck helpers ---
     def get_live_deck(self):
@@ -2276,6 +2906,7 @@ class RotationEngine:
             return index
         item = self.shuffled_queue.pop(index)
         self.shuffled_queue.insert(new_index, item)
+        self.replaceable.discard(item)
         if item not in self.pinned_tracks and not is_hour_marker(item):
             self.pinned_tracks.add(item)  # a hand-moved track plays where you put it
         self._queue_changed()
@@ -2298,6 +2929,7 @@ class RotationEngine:
             index = len(self.shuffled_queue)
         index = max(0, index)
         self.shuffled_queue.insert(index, path)
+        self.replaceable.discard(path)
         if not is_hour_marker(path):
             self.pinned_tracks.add(path)
             if self.normalizer is not None and index < 3:
@@ -2305,7 +2937,8 @@ class RotationEngine:
         self._queue_changed()
         return index
 
-    def load_queue_entries(self, entries, replace=True):
+    def load_queue_entries(self, entries, replace=True, locked=False):
+        """locked=True (an hour with recorded voice tracks) keeps every song exactly where it is."""
         entries = [e for e in entries if is_hour_marker(e) or os.path.isfile(e)]
         if replace:
             if self.next_track_cued and not self.is_paused_for_sequence:
@@ -2318,6 +2951,10 @@ class RotationEngine:
             self.shuffled_queue.append(e)
             if not is_hour_marker(e):
                 self.pinned_tracks.add(e)
+                if locked or not is_song_entry(e):
+                    self.replaceable.discard(e)
+                else:
+                    self.replaceable.add(e)
         self.prefetch_upcoming()
         self._queue_changed()
         return len(entries)
@@ -2385,6 +3022,86 @@ class RotationEngine:
         if self.on_rotation_swapped:
             self.on_rotation_swapped(old.name if old else "", new.name)
         return True
+
+    # --- fitting the end of the hour ---
+    def fit_slots(self):
+        """Which break marks the last song is fitted to: the top of the hour, and the others if you switch it on."""
+        slots = []
+        if str(self.settings.value("fit_end_of_hour", "true")).lower() != "false":
+            slots.append(0)
+        if str(self.settings.value("fit_quarter_marks", "false")).lower() == "true":
+            slots += [15, 30, 45]
+        return slots
+
+    def next_fit_mark(self, now=None):
+        now = now or datetime.now()
+        slots = self.fit_slots()
+        if not slots:
+            return None
+        best = None
+        for minute in slots:
+            candidate = now.replace(minute=minute, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += timedelta(hours=1)
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+    def fit_candidates(self, prefix):
+        rotation_id = self.active_rotation_id
+        if self._fit_pool[0] != rotation_id or not self._fit_pool[1]:
+            rotation = self.rotation_library.find(rotation_id) if self.rotation_library else None
+            self._fit_pool = (rotation_id, rotation.track_paths() if rotation else [])
+        busy = {self.deck_a.current_track_path, self.deck_b.current_track_path}
+        queued = set(self.shuffled_queue) - set(prefix)
+        return [p for p in self._fit_pool[1]
+                if p not in busy and p not in queued
+                and not self.play_history.violates_separation(p, self.separation_seconds)]
+
+    def is_replaceable(self, item):
+        return is_song_entry(item) and (item in self.replaceable or item not in self.pinned_tracks)
+
+    def fit_before_mark(self, now=None):
+        """Called just before the next song is chosen. When the mark is near, the queued songs are swapped
+        for ones that finish exactly on it, so the last song is never faded out. Voice tracked hours and
+        hand-placed songs are never touched. Returns the replacement songs, or None."""
+        mark = self.next_fit_mark(now)
+        if mark is None or self.rotation_library is None:
+            return None
+        now = now or datetime.now()
+        live = self.get_live_deck()
+        remaining = 0.0
+        if live.current_track_path:
+            try:
+                remaining = max(0.0, (live.player.duration() - live.player.position()) / 1000.0)
+            except Exception:
+                remaining = 0.0
+        gap = (mark - now).total_seconds() - remaining + CROSSFADE_OVERLAP_SECONDS
+        if gap < FIT_MIN_SECONDS or gap > FIT_WINDOW_SECONDS:
+            return None
+        prefix = []
+        for item in self.shuffled_queue:
+            if is_hour_marker(item) or not self.is_replaceable(item):
+                break
+            prefix.append(item)
+        if not prefix:
+            return None
+        replacement = plan_hour_end(prefix, gap, self.fit_candidates(prefix), get_track_duration, get_track_artist)
+        if not replacement:
+            return None
+        del self.shuffled_queue[:len(prefix)]
+        for item in prefix:
+            self.replaceable.discard(item)
+        for index, song in enumerate(replacement):
+            self.shuffled_queue.insert(index, song)
+            self.replaceable.add(song)
+        total = timeline_length(replacement, get_track_duration)
+        message = (f"Swapped {len(prefix)} queued song(s) for {len(replacement)} so the hour ends on time "
+                   f"(about {int(total)} seconds of music for {int(gap)} seconds left).")
+        self.on_status(message)
+        RUN_LOG.write("FIT", message)
+        self._queue_changed()
+        return replacement
 
     # --- break protection ---
     def arm_break(self, target, slot, callback):
@@ -2567,8 +3284,12 @@ class RotationEngine:
         """Next track from the queue. Hour markers are passed over; hand-placed tracks play where
         you put them; everything else must satisfy the artist/title separation rule."""
         while self.shuffled_queue and is_hour_marker(self.shuffled_queue[0]):
-            self.shuffled_queue.pop(0)
-            self.on_status("Hour marker passed.")
+            skipped = self.shuffled_queue.pop(0)
+            if is_voice_marker(skipped):
+                self.on_status("A voice track slot had no recording, so the music carries on.")
+                RUN_LOG.write("VOICE", "An empty voice track slot was skipped.")
+            else:
+                self.on_status("Hour marker passed.")
         if not self.shuffled_queue:
             if self.build_shuffled_queue() == 0:
                 return None
@@ -2588,6 +3309,7 @@ class RotationEngine:
             chosen = real[0]
             self.shuffled_queue.remove(chosen)
         self.pinned_tracks.discard(chosen)
+        self.replaceable.discard(chosen)
         self._queue_changed()
         return chosen
 
@@ -2595,6 +3317,10 @@ class RotationEngine:
         """Loads the next track, paused at its start, into the non-live deck."""
         if self.next_track_cued or not self.is_running or not self.automation_on or self.is_paused_for_sequence:
             return
+        try:
+            self.fit_before_mark()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
         next_track = self.pick_next_valid_track()
         if next_track is None:
             self.on_status("Music library is empty. Rotation halted.")
@@ -3334,6 +4060,47 @@ class SequencePlayer:
         self.active = False
         self.slot = ""
         self.on_changed = None        # on_changed(): the queue list and tree redraw
+        self.event_provider = None    # callable returning the running dated schedule (or None)
+        self.deck_names = ("C", "D")  # the break items alternate between these two decks on screen
+        self.gap_timer = QTimer()
+        self.gap_timer.setSingleShot(True)
+        self.gap_timer.timeout.connect(self.play_next_in_queue)
+
+    def gap_ms(self):
+        try:
+            return max(0, min(3000, int(float(self.settings.value("break_item_gap_ms", 250)))))
+        except Exception:
+            return 250
+
+    def current_deck_name(self):
+        """C or D: the deck the item now playing is on (items alternate)."""
+        if not self.active or self.item_index < 0 or self.item_index >= len(self.items):
+            return None
+        return self.deck_names[self.item_index % 2]
+
+    def stop_break(self):
+        """The break decks' Stop button: ends the break and hands the music back."""
+        if not self.active:
+            return False
+        self.gap_timer.stop()
+        self.queue = []
+        self.player.stop()
+        self.active = False
+        self.item_index = len(self.items)
+        self._changed()
+        self.on_status("Break stopped. The music comes back.")
+        self.on_sequence_done()
+        return True
+
+    def toggle_pause(self):
+        if not self.active:
+            return False
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+        self._changed()
+        return True
 
     def _changed(self):
         if self.on_changed:
@@ -3360,10 +4127,26 @@ class SequencePlayer:
         jingles = scan_audio_files(jingle_folder)
         ads_from_categories = []
         if self.category_library is not None and self.category_library.categories:
-            # Imported categories feed the break automatically: jingles and sweepers around the ad.
+            # Categories you switched on feed the break: jingles and sweepers around the ad.
             jingles = list(dict.fromkeys(
                 jingles + self.category_library.files_for_types(("jingle", "sweeper"))))
             ads_from_categories = self.category_library.files_for_types(("ad",))
+        event = None
+        try:
+            event = self.event_provider() if self.event_provider else None
+        except Exception:
+            event = None
+        override_ads = None
+        if event is not None and self.category_library is not None:
+            # A running dated schedule (holiday programming) uses its own jingles, and its own ads if it has them.
+            own_jingles = self.category_library.files_for_category(event.get("jingle_category_id"))
+            if own_jingles:
+                jingles = own_jingles
+                self.on_status(f"Using the jingles of the {event.get('name', 'dated')} schedule.")
+            if event.get("ad_category_id"):
+                own_ads = self.category_library.files_for_category(event["ad_category_id"])
+                if own_ads:
+                    override_ads = own_ads
         if sequence == "simple":
             if jingles:
                 self.queue.append(random.choice(jingles))
@@ -3371,6 +4154,8 @@ class SequencePlayer:
 
         ads = list(dict.fromkeys(scan_audio_files(self.settings.value("ad_break_folder", ""))
                                  + ads_from_categories))
+        if override_ads:
+            ads = override_ads
         if ads and jingles:
             first = random.choice(jingles)
             others = [j for j in jingles if j != first]
@@ -3418,9 +4203,17 @@ class SequencePlayer:
 
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.play_next_in_queue()
+            self._next_after_gap()
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
             self.on_status("Skipped an unreadable jingle or ad file.")
+            self.play_next_in_queue()
+
+    def _next_after_gap(self):
+        """A short silence between break items, so a jingle or an ad is never clipped by the next one."""
+        gap = self.gap_ms()
+        if gap > 0 and self.queue:
+            self.gap_timer.start(gap)
+        else:
             self.play_next_in_queue()
 
 
@@ -4495,19 +5288,25 @@ class ScheduleTab(QWidget):
 
 
 class CategoriesTab(QWidget):
+    TYPE_CHOICES = (("Music (makes a rotation and a dated schedule)", "music"), ("Jingles", "jingle"),
+                    ("Sweepers", "sweeper"), ("Ads", "ad"))
+
     def __init__(self, app):
         super().__init__()
         self.app = app
         layout = QVBoxLayout()
-        info = QLabel("Categories and spot groups: jingles, sweepers and ads. Import a folder and it is named and "
-                      "typed from the folder name. They feed the scheduled break: jingle or sweeper, ad, "
-                      "jingle or sweeper.")
+        info = QLabel("Categories: every folder of music, jingles, sweepers and ads. Music folders also make a "
+                      "rotation. A newly imported category plays nowhere until you switch it on or put it in a "
+                      "dated schedule, so holiday music and jingles stay off the air until you schedule them. "
+                      "Change a category's folder and everything that uses it follows.")
         info.setWordWrap(True)
         layout.addWidget(info)
         self.list = QListWidget()
         self.list.setAccessibleName("Categories list")
         layout.addWidget(self.list)
         for text, handler in (("Import Category Folder (Ctrl+N)", self.import_folder),
+                              ("Change Folder of Selected", self.change_folder),
+                              ("Switch Selected On Or Off In The Regular Schedule", self.toggle_active),
                               ("Rename Selected", self.rename_selected),
                               ("Change Type of Selected", self.change_type),
                               ("Remove Selected", self.remove_selected)):
@@ -4522,7 +5321,7 @@ class CategoriesTab(QWidget):
         row = self.list.currentRow()
         self.list.clear()
         for category in self.app.category_library.categories:
-            self.list.addItem(f"{category['name']} ({category['type']}): {describe_folder(category['folder'])}")
+            self.list.addItem(f"{self.app.category_library.describe(category)}: {describe_folder(category['folder'])}")
         if self.list.count():
             self.list.setCurrentRow(max(0, min(row, self.list.count() - 1)))
 
@@ -4535,14 +5334,35 @@ class CategoriesTab(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Import a category folder")
         if not folder:
             return
-        added = self.app.category_library.import_folder(folder)
+        guess = guess_category_type(os.path.basename(os.path.normpath(folder)))
+        labels = [label for label, _value in self.TYPE_CHOICES]
+        default_index = next((i for i, (_l, v) in enumerate(self.TYPE_CHOICES) if v == guess), 1)
+        choice, ok = QInputDialog.getItem(self, "What is in this folder?", "Type:", labels, default_index, False)
+        if not ok:
+            return
+        kind = dict(self.TYPE_CHOICES)[choice]
+        added = self.app.import_category_folder(folder, kind)
         if not added:
             self.app.update_status("No audio files found in that folder, so no category was made.")
             return
-        for category in added:
-            self.app.normalizer.start(scan_audio_files(category["folder"]))
         names = ", ".join(f"{c['name']} ({c['type']})" for c in added)
-        self.app.announce(f"Imported {names}.")
+        extra = " Each music folder also made a rotation and a draft dated schedule; nothing plays until you schedule it." \
+            if kind == "music" else " It stays off the air until you switch it on or use it in a dated schedule."
+        self.app.announce(f"Imported {names}.{extra}")
+
+    def change_folder(self):
+        category = self.selected()
+        if category is None:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose the new folder", category["folder"])
+        if folder:
+            self.app.change_category_folder(category, folder)
+
+    def toggle_active(self):
+        category = self.selected()
+        if category is None:
+            return
+        self.app.set_category_active(category, not self.app.category_library.is_active(category))
 
     def rename_selected(self):
         category = self.selected()
@@ -4556,8 +5376,12 @@ class CategoriesTab(QWidget):
         category = self.selected()
         if category is None:
             return
-        choice, ok = QInputDialog.getItem(self, "Category type", "Type:", list(CATEGORY_TYPES),
-                                          CATEGORY_TYPES.index(category["type"]), False)
+        types = [t for t in CATEGORY_TYPES if t != "music"]
+        if category["type"] == "music":
+            self.app.announce("A music category stays music. Remove it and import it again to change that.")
+            return
+        choice, ok = QInputDialog.getItem(self, "Category type", "Type:", types,
+                                          types.index(category["type"]) if category["type"] in types else 0, False)
         if ok:
             self.app.category_library.set_type(category["id"], choice)
 
@@ -5751,6 +6575,2140 @@ def describe_show(show):
     return f"{show['name']}: {days}, {clock(show['start'])} to {clock(show['end'])}"
 
 
+# ---------------------------------------------------------------------------
+# Schedule screens: hour detail, dated schedules, and voice tracking one hour at a time
+# ---------------------------------------------------------------------------
+
+def time_label(minutes):
+    return datetime(2000, 1, 1, minutes // 60 % 24, minutes % 60).strftime("%I:%M %p").lstrip("0")
+
+
+def date_label(day):
+    return day.strftime("%A, %B %d, %Y")
+
+
+class HourDetailDialog(QDialog):
+    """One hour of the everyday schedule: its rotation, which break marks run, and where the change applies."""
+
+    def __init__(self, app, hour):
+        super().__init__(app)
+        self.app = app
+        self.hour = hour
+        self.setWindowTitle(f"Schedule for {hour_label(hour)}")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        library = app.rotation_library
+        self.rotation_combo = QComboBox()
+        self.rotation_combo.setAccessibleName("Rotation for this hour")
+        for rotation in library.rotations:
+            self.rotation_combo.addItem(rotation.name, rotation.id)
+        current = app.rotation_schedule.hours[hour % 24]
+        self.rotation_combo.setCurrentIndex(max(0, self.rotation_combo.findData(current)))
+        form = QFormLayout()
+        form.addRow("Rotation:", self.rotation_combo)
+        self.scope_combo = QComboBox()
+        self.scope_combo.setAccessibleName("Where this change applies")
+        self.scope_combo.addItem("This hour only", "hour")
+        self.scope_combo.addItem("Entire schedule (all 24 hours)", "all")
+        self.scope_combo.addItem("A range of hours", "range")
+        form.addRow("Apply to:", self.scope_combo)
+        self.from_combo, self.to_combo = QComboBox(), QComboBox()
+        for combo, name in ((self.from_combo, "First hour of the range"), (self.to_combo, "Last hour of the range")):
+            combo.setAccessibleName(name)
+            for h in range(24):
+                combo.addItem(hour_label(h), h)
+        self.from_combo.setCurrentIndex(hour % 24)
+        self.to_combo.setCurrentIndex(hour % 24)
+        form.addRow("Range from:", self.from_combo)
+        form.addRow("Range to:", self.to_combo)
+        layout.addLayout(form)
+        marks_label = QLabel("Breaks (jingle, ads, jingle) that run in this hour:")
+        layout.addWidget(marks_label)
+        self.mark_checks = []
+        flags = app.break_marks.grid[hour % 24]
+        for slot, flag in zip(BreakMarks.SLOTS, flags):
+            check = QCheckBox(f"{slot} break")
+            check.setChecked(bool(flag))
+            self.mark_checks.append(check)
+            layout.addWidget(check)
+        summary = QLabel(self.summary_text())
+        summary.setWordWrap(True)
+        summary.setAccessibleName("What plays in this hour")
+        layout.addWidget(summary)
+        buttons = QHBoxLayout()
+        ok = QPushButton("Apply")
+        ok.setDefault(True)
+        ok.clicked.connect(self.apply)
+        cancel = QPushButton("Close")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def summary_text(self):
+        app = self.app
+        lines = []
+        day = datetime.now().date()
+        event = app.event_library.event_for_hour(day, self.hour)
+        if event is not None:
+            lines.append(f"Today this hour is covered by the dated schedule {event['name']}.")
+        jingles = [c["name"] for c in app.category_library.categories
+                   if c["type"] in ("jingle", "sweeper") and app.category_library.is_active(c)]
+        ads = [c["name"] for c in app.category_library.categories
+               if c["type"] == "ad" and app.category_library.is_active(c)]
+        lines.append("Jingle categories: " + (", ".join(jingles) if jingles else "the jingle folders set for each mark"))
+        lines.append("Ad categories: " + (", ".join(ads) if ads else "the commercials folder"))
+        return "\n".join(lines)
+
+    def hours_in_scope(self):
+        scope = self.scope_combo.currentData()
+        if scope == "all":
+            return list(range(24))
+        if scope == "range":
+            first, last = self.from_combo.currentData(), self.to_combo.currentData()
+            if first <= last:
+                return list(range(first, last + 1))
+            return list(range(first, 24)) + list(range(0, last + 1))     # a range that crosses midnight
+        return [self.hour]
+
+    def apply(self):
+        rotation_id = self.rotation_combo.currentData()
+        flags = [c.isChecked() for c in self.mark_checks]
+        hours = self.hours_in_scope()
+        for h in hours:
+            if rotation_id:
+                self.app.rotation_schedule.hours[h % 24] = rotation_id
+            self.app.break_marks.grid[h % 24] = [1 if f else 0 for f in flags]
+        self.app.rotation_schedule.save()
+        self.app.break_marks.save()
+        self.accept()
+        self.app.schedule_tab.refresh()
+        self.app.rotation.check_rotation_for_hour()
+        self.app.announce(f"Schedule updated for {len(hours)} hour(s).")
+
+
+class EventDialog(QDialog):
+    """A dated schedule: when it starts and ends, what plays, and whether it comes back every year."""
+
+    def __init__(self, app, event):
+        super().__init__(app)
+        self.app = app
+        self.event = event
+        self.setWindowTitle(f"Dated schedule: {event.get('name', '')}")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        self.name_edit = QLineEdit(event.get("name", ""))
+        self.name_edit.setAccessibleName("Schedule name")
+        form.addRow("Name:", self.name_edit)
+
+        self.rotation_combo = QComboBox()
+        self.rotation_combo.setAccessibleName("Rotation to play")
+        for rotation in app.rotation_library.rotations:
+            self.rotation_combo.addItem(rotation.name, rotation.id)
+        self.rotation_combo.setCurrentIndex(max(0, self.rotation_combo.findData(event.get("rotation_id"))))
+        form.addRow("Rotation:", self.rotation_combo)
+
+        self.jingle_combo = QComboBox()
+        self.jingle_combo.setAccessibleName("Jingles for this schedule")
+        self.jingle_combo.addItem("The regular jingles", None)
+        for c in app.category_library.categories:
+            if c["type"] in ("jingle", "sweeper"):
+                self.jingle_combo.addItem(c["name"], c["id"])
+        self.jingle_combo.setCurrentIndex(max(0, self.jingle_combo.findData(event.get("jingle_category_id"))))
+        form.addRow("Jingles:", self.jingle_combo)
+        self.ad_combo = QComboBox()
+        self.ad_combo.setAccessibleName("Ads for this schedule")
+        self.ad_combo.addItem("The regular ads", None)
+        for c in app.category_library.categories:
+            if c["type"] == "ad":
+                self.ad_combo.addItem(c["name"], c["id"])
+        self.ad_combo.setCurrentIndex(max(0, self.ad_combo.findData(event.get("ad_category_id"))))
+        form.addRow("Ads:", self.ad_combo)
+
+        start = parse_moment(event.get("start")) or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        end = parse_moment(event.get("end")) or start.replace(hour=23, minute=45)
+        self.start_date, self.start_time = QComboBox(), QComboBox()
+        self.end_date, self.end_time = QComboBox(), QComboBox()
+        today = datetime.now().date()
+        days = [today + timedelta(days=i) for i in range(731)]
+        for needed in (start.date(), end.date()):
+            if needed not in days:
+                days.append(needed)
+        days.sort()
+        for combo, name in ((self.start_date, "Start date"), (self.end_date, "End date")):
+            combo.setAccessibleName(name)
+            for day in days:
+                combo.addItem(date_label(day), day)
+        for combo, name in ((self.start_time, "Start time"), (self.end_time, "End time")):
+            combo.setAccessibleName(name)
+            for minutes in range(0, 24 * 60, 15):
+                combo.addItem(time_label(minutes), minutes)
+        self.start_date.setCurrentIndex(self.start_date.findData(start.date()))
+        self.end_date.setCurrentIndex(self.end_date.findData(end.date()))
+        self.start_time.setCurrentIndex(self.start_time.findData(start.hour * 60 + start.minute // 15 * 15))
+        self.end_time.setCurrentIndex(self.end_time.findData(end.hour * 60 + end.minute // 15 * 15))
+        form.addRow("Start date:", self.start_date)
+        form.addRow("Start time:", self.start_time)
+        form.addRow("End date:", self.end_date)
+        form.addRow("End time:", self.end_time)
+        layout.addLayout(form)
+
+        self.one_day_check = QCheckBox("Just one day (the end date follows the start date)")
+        self.one_day_check.setChecked(bool(event.get("start")) and start.date() == end.date())
+        self.one_day_check.toggled.connect(self.on_one_day)
+        self.start_date.currentIndexChanged.connect(self.on_start_date_changed)
+        layout.addWidget(self.one_day_check)
+        self.repeat_check = QCheckBox("Repeat every year (it comes back by itself as the season gets close)")
+        self.repeat_check.setChecked(bool(event.get("repeat")))
+        layout.addWidget(self.repeat_check)
+        voice_form = QFormLayout()
+        self.voice_combo = QComboBox()
+        self.voice_combo.setAccessibleName("Voice tracking")
+        self.voice_combo.addItem("No voice tracking", False)
+        self.voice_combo.addItem("Voice tracking: a voice track slot after every 3 songs", True)
+        self.voice_combo.setCurrentIndex(1 if event.get("voice") else 0)
+        voice_form.addRow("Voice tracking:", self.voice_combo)
+        layout.addLayout(voice_form)
+        layout.addWidget(QLabel("Breaks that run while this schedule is on:"))
+        self.mark_checks = []
+        marks = (list(event.get("marks", [1, 1, 1, 1])) + [1, 1, 1, 1])[:4]
+        for slot, flag in zip(BreakMarks.SLOTS, marks):
+            check = QCheckBox(f"{slot} break")
+            check.setChecked(bool(flag))
+            self.mark_checks.append(check)
+            layout.addWidget(check)
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAccessibleName("Problems")
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        ok = QPushButton("Save Schedule")
+        ok.setDefault(True)
+        ok.clicked.connect(self.try_save)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+        self.on_one_day(self.one_day_check.isChecked())
+
+    def on_one_day(self, checked):
+        self.end_date.setEnabled(not checked)
+        if checked:
+            self.end_date.setCurrentIndex(self.start_date.currentIndex())
+
+    def on_start_date_changed(self, _index):
+        if self.one_day_check.isChecked():
+            self.end_date.setCurrentIndex(self.start_date.currentIndex())
+
+    def build_values(self):
+        s_day, e_day = self.start_date.currentData(), self.end_date.currentData()
+        s_min, e_min = self.start_time.currentData(), self.end_time.currentData()
+        start = datetime(s_day.year, s_day.month, s_day.day, s_min // 60, s_min % 60)
+        end = datetime(e_day.year, e_day.month, e_day.day, e_min // 60, e_min % 60)
+        return {"name": self.name_edit.text().strip() or "Dated schedule",
+                "rotation_id": self.rotation_combo.currentData(),
+                "jingle_category_id": self.jingle_combo.currentData(),
+                "ad_category_id": self.ad_combo.currentData(),
+                "start": format_moment(start), "end": format_moment(end),
+                "repeat": self.repeat_check.isChecked(), "voice": bool(self.voice_combo.currentData()),
+                "marks": [1 if c.isChecked() else 0 for c in self.mark_checks]}
+
+    def try_save(self):
+        values = self.build_values()
+        probe = dict(self.event)
+        probe.update(values)
+        problem = self.app.event_library.validate(probe)
+        if problem:
+            self.error_label.setText(problem)
+            return
+        if not probe.get("rotation_id"):
+            self.error_label.setText("Choose a rotation.")
+            return
+        self.event.update(values)
+        self.accept()
+
+
+class ScheduleTab(QWidget):
+    """The everyday 24-hour schedule (press Enter on an hour for its detail) and the dated schedules."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        layout = QVBoxLayout()
+        self.live_label = QLabel("")
+        self.live_label.setWordWrap(True)
+        self.live_label.setStyleSheet(f"color: {COLOR_ON_AIR_GREEN}; font-weight: bold;")
+        layout.addWidget(self.live_label)
+        self.table = QTableWidget(24, 4)
+        self.table.setHorizontalHeaderLabels(["Hour", "Rotation", "Breaks", "On air"])
+        self.table.setAccessibleName("24 hour rotation schedule. Press Enter on an hour to change it.")
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.itemActivated.connect(lambda item: self.open_hour(item.row()))
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.hour_menu)
+        layout.addWidget(self.table)
+        row = QHBoxLayout()
+        self.rotation_combo = QComboBox()
+        self.rotation_combo.setAccessibleName("Rotation to assign")
+        row.addWidget(self.rotation_combo, 1)
+        assign = QPushButton("Assign To Selected Hour")
+        assign.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        assign.clicked.connect(self.assign_selected)
+        row.addWidget(assign)
+        assign_all = QPushButton("Assign To Entire Schedule")
+        assign_all.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        assign_all.clicked.connect(self.assign_all)
+        row.addWidget(assign_all)
+        layout.addLayout(row)
+        edit_hour = QPushButton("Edit Selected Hour (Enter)")
+        edit_hour.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        edit_hour.clicked.connect(lambda: self.open_hour(self.table.currentRow()))
+        layout.addWidget(edit_hour)
+        regen = QPushButton("Regenerate Schedule Evenly")
+        regen.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        regen.clicked.connect(self.regenerate)
+        layout.addWidget(regen)
+
+        heading = QLabel("Dated schedules: holidays and one-day shows. They replace the everyday schedule "
+                         "between their dates, then it comes back by itself. Press Enter to edit.")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.event_list = QListWidget()
+        self.event_list.setAccessibleName("Dated schedules")
+        self.event_list.itemActivated.connect(lambda _item: self.edit_event())
+        layout.addWidget(self.event_list)
+        buttons = QHBoxLayout()
+        for text, handler in (("Add Dated Schedule", self.add_event), ("Edit Selected (Enter)", self.edit_event),
+                              ("Remove Selected", self.remove_event)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            buttons.addWidget(btn)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+        self.refresh()
+
+    # --- everyday schedule ---
+    def refresh(self):
+        now = datetime.now()
+        now_hour = now.hour
+        schedule = self.app.rotation_schedule
+        library = self.app.rotation_library
+        selected = self.table.currentRow()
+        self.rotation_combo.clear()
+        for rotation in library.rotations:
+            self.rotation_combo.addItem(rotation.name, rotation.id)
+        for hour in range(24):
+            rotation = library.find(schedule.rotation_id_for(now.date(), hour))
+            live = hour == now_hour
+            flags = self.app.break_marks.grid[hour]
+            marks = " ".join(s for s, f in zip(BreakMarks.SLOTS, flags) if f) or "none"
+            cells = [hour_label(hour), rotation.name if rotation else "(none)", marks, "LIVE NOW" if live else ""]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if live:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QBrush(QColor(COLOR_ON_AIR_GREEN)))
+                self.table.setItem(hour, col, item)
+        self.table.setCurrentCell(selected if selected >= 0 else now_hour, 0)
+        live_rotation = library.find(schedule.rotation_id_for(now.date(), now_hour))
+        event = self.app.event_library.event_at(now)
+        self.live_label.setText(f"On air now: {hour_label(now_hour)}, "
+                                f"{live_rotation.name if live_rotation else 'no rotation'}"
+                                + (f" (dated schedule: {event['name']})" if event else ""))
+        self.live_label.setAccessibleName(self.live_label.text())
+        self.refresh_events()
+
+    def open_hour(self, hour):
+        if 0 <= hour < 24:
+            HourDetailDialog(self.app, hour).exec()
+            self.table.setFocus()
+
+    def hour_menu(self, position):
+        menu = QMenu(self)
+        row = self.table.currentRow()
+        menu.addAction("Edit this hour...", lambda: self.open_hour(row))
+        menu.addAction("Assign the chosen rotation to this hour", self.assign_selected)
+        menu.addAction("Assign the chosen rotation to the entire schedule", self.assign_all)
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def assign_selected(self):
+        hour = self.table.currentRow()
+        rotation_id = self.rotation_combo.currentData()
+        if hour >= 0 and rotation_id:
+            self.app.rotation_schedule.set_hour(hour, rotation_id)
+            self.refresh()
+            self.app.rotation.check_rotation_for_hour()
+            self.app.announce(f"Hour {hour_label(hour)} set.")
+
+    def assign_all(self):
+        rotation_id = self.rotation_combo.currentData()
+        if rotation_id:
+            for hour in range(24):
+                self.app.rotation_schedule.hours[hour] = rotation_id
+            self.app.rotation_schedule.save()
+            self.refresh()
+            self.app.rotation.check_rotation_for_hour()
+            self.app.announce("The entire schedule now plays that rotation.")
+
+    def regenerate(self):
+        self.app.rotation_schedule.regenerate_even()
+        self.refresh()
+        self.app.rotation.check_rotation_for_hour()
+        self.app.update_status("Schedule rebuilt evenly across the 24 hours.")
+
+    # --- dated schedules ---
+    def refresh_events(self):
+        row = self.event_list.currentRow()
+        self.event_list.clear()
+        for event in self.app.event_library.events:
+            self.event_list.addItem(self.app.event_library.describe(event))
+        if self.event_list.count():
+            self.event_list.setCurrentRow(max(0, min(row, self.event_list.count() - 1)))
+
+    def selected_event(self):
+        row = self.event_list.currentRow()
+        events = self.app.event_library.events
+        return events[row] if 0 <= row < len(events) else None
+
+    def add_event(self):
+        rotations = self.app.rotation_library.rotations
+        draft = {"id": uuid.uuid4().hex[:8], "name": "New schedule", "rotation_id": rotations[0].id if rotations else None,
+                 "jingle_category_id": None, "ad_category_id": None, "start": "", "end": "", "repeat": False,
+                 "voice": False, "marks": [1, 1, 1, 1], "active": False, "created": time.time()}
+        self.run_event_dialog(draft)
+
+    def edit_event(self):
+        event = self.selected_event()
+        if event is not None:
+            self.run_event_dialog(event)
+
+    def run_event_dialog(self, event):
+        if EventDialog(self.app, event).exec() != QDialog.DialogCode.Accepted:
+            return
+        library = self.app.event_library
+        was_new = library.find(event["id"]) is None
+        problem = library.save_event(event)
+        if problem:
+            self.app.announce(problem)
+            return
+        overlaps = library.overlaps(event)
+        note = f" It overlaps {', '.join(overlaps)}; the one created last wins." if overlaps else ""
+        self.app.announce(f"Schedule {event['name']} saved.{note}")
+        self.app.on_events_changed(event)
+
+    def remove_event(self):
+        event = self.selected_event()
+        if event is None:
+            return
+        answer = QMessageBox.question(self, "Remove schedule", f"Remove the schedule {event['name']}?")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.app.event_library.remove(event["id"])
+            self.app.announce("Schedule removed.")
+            self.app.on_events_changed(None)
+
+
+class VoiceTrackHourTab(QWidget):
+    """Voice track one hour at a time: pick the date and the hour, record into each slot, save."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.day = None
+        self.hour = None
+        self.path = None
+        self.entries = []
+        layout = QVBoxLayout()
+        intro = QLabel("Voice tracking one hour at a time. Choose the date and the hour, press Load, select a "
+                       "voice track slot and press Ctrl+T to record into it, then Save Hour. Saving fits the "
+                       "last song so the hour ends on the top of the hour.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.date_combo = QComboBox()
+        self.date_combo.setAccessibleName("Date of the hour to voice track")
+        today = datetime.now().date()
+        for i in range(15):
+            self.date_combo.addItem(date_label(today + timedelta(days=i)), today + timedelta(days=i))
+        self.hour_combo = QComboBox()
+        self.hour_combo.setAccessibleName("Hour to voice track")
+        for h in range(24):
+            self.hour_combo.addItem(time_label(h * 60), h)
+        self.hour_combo.setCurrentIndex((datetime.now().hour + 1) % 24)
+        form.addRow("Date:", self.date_combo)
+        form.addRow("Hour:", self.hour_combo)
+        layout.addLayout(form)
+        self.list = QListWidget()
+        self.list.setAccessibleName("Playlist for the chosen hour")
+        layout.addWidget(self.list, 1)
+        self.projected_label = QLabel("Choose a date and hour, then press Load This Hour.")
+        self.projected_label.setWordWrap(True)
+        self.projected_label.setAccessibleName("Projected end of the hour")
+        layout.addWidget(self.projected_label)
+        for text, handler in (("Load This Hour", self.load_hour),
+                              ("Record Into Selected Slot (Ctrl+T)", self.record_into_selected),
+                              ("Add Voice Track Slots (every 3 songs)", self.add_slots),
+                              ("Clear Selected Recording (back to an empty slot)", self.clear_selected),
+                              ("Save Hour", self.save_hour),
+                              ("Discard And Rebuild This Hour", self.rebuild_hour)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            layout.addWidget(btn)
+        self.setLayout(layout)
+
+    # --- loading ---
+    def chosen(self):
+        return self.date_combo.currentData(), self.hour_combo.currentData()
+
+    def load_hour(self):
+        day, hour = self.chosen()
+        generator = self.app.playlist_generator
+        path = generator.current_hour_playlist(day, hour)
+        if path is None:
+            path = generator.generate_hour(day, hour)
+        if not path:
+            self.app.announce("No rotation is scheduled for that hour, so there is nothing to load.")
+            return
+        self.day, self.hour, self.path = day, hour, path
+        self.entries, _missing = read_m3u(path)
+        self.refresh_list()
+        self.app.announce(f"Loaded {date_label(day)}, {time_label(hour * 60)}: {len(self.entries)} entries.")
+        self.list.setFocus()
+
+    def entry_text(self, entry):
+        if is_hour_marker(entry):
+            return format_track_display(entry)
+        return f"{format_track_display(entry)} ({int(get_track_duration(entry))} seconds)"
+
+    def refresh_list(self, keep_row=None):
+        row = self.list.currentRow() if keep_row is None else keep_row
+        self.list.clear()
+        for number, entry in enumerate(self.entries, 1):
+            self.list.addItem(f"{number}. {self.entry_text(entry)}")
+        if self.list.count():
+            self.list.setCurrentRow(max(0, min(row, self.list.count() - 1)))
+        self.update_projection()
+
+    def projected_total(self):
+        _voice, _signoff, break_seconds = self.app.playlist_generator.hour_options(self.day, self.hour)
+        slot_seconds = self.app.playlist_generator.voice_slot_seconds()
+        songs = [e for e in self.entries if is_song_entry(e)]
+        total = timeline_length(songs, get_track_duration)
+        for e in self.entries:
+            if is_voice_marker(e):
+                total += slot_seconds
+            elif not is_hour_marker(e) and not is_song_entry(e):
+                total += get_track_duration(e)
+        return total + break_seconds
+
+    def update_projection(self):
+        if self.day is None:
+            return
+        total = self.projected_total()
+        end = datetime(self.day.year, self.day.month, self.day.day, self.hour) + timedelta(seconds=total)
+        diff = int(round(total - 3600))
+        if abs(diff) <= 12:
+            verdict = "on the hour"
+        else:
+            verdict = f"{abs(diff)} seconds {'early' if diff < 0 else 'late'}"
+        self.projected_label.setText(f"This hour is projected to end at {end.strftime('%I:%M:%S %p').lstrip('0')}, {verdict}. "
+                                     f"Breaks are counted at about {int(self.app.playlist_generator.hour_options(self.day, self.hour)[2])} seconds.")
+
+    # --- editing ---
+    def selected_index(self):
+        row = self.list.currentRow()
+        return row if 0 <= row < len(self.entries) else None
+
+    def record_into_selected(self):
+        index = self.selected_index()
+        if index is None or self.day is None:
+            self.app.announce("Load an hour and select a slot first.")
+            return
+        entry = self.entries[index]
+        if is_voice_marker(entry):
+            where = "into the voice track slot"
+        elif is_song_entry(entry):
+            where = f"before {format_track_display(entry)}"
+        else:
+            self.app.announce("Select a voice track slot or a song.")
+            return
+        clip = self.app.capture_voice_clip(where)
+        if not clip:
+            return
+        if is_voice_marker(entry):
+            self.entries[index] = clip[0]
+        else:
+            self.entries.insert(index, clip[0])
+        self.refit_end()
+        self.refresh_list(keep_row=index)
+        self.list.setFocus()
+
+    def clear_selected(self):
+        index = self.selected_index()
+        if index is not None and not is_song_entry(self.entries[index]) and not is_hour_marker(self.entries[index]):
+            self.entries[index] = VOICE_MARKER_TOKEN
+            self.refit_end()
+            self.refresh_list(keep_row=index)
+
+    def add_slots(self):
+        if self.day is None:
+            return
+        base = [e for e in self.entries if not is_voice_marker(e)]
+        _voice, signoff_hint, _b = self.app.playlist_generator.hour_options(self.day, self.hour)
+        event = self.app.event_library.event_for_hour(self.day, self.hour)
+        signoff = bool(event and self.app.event_library.is_last_hour_of_show(event, self.day, self.hour))
+        self.entries = insert_voice_markers(base, VOICE_MARKER_EVERY, signoff)
+        self.refit_end()
+        self.refresh_list(keep_row=0)
+        self.app.announce("Voice track slots added after every 3 songs.")
+
+    def refit_end(self):
+        """Swaps the last song or two so the hour ends on the top of the hour, given what is recorded."""
+        if self.day is None:
+            return
+        tail_start = len(self.entries)
+        while tail_start > 0 and is_song_entry(self.entries[tail_start - 1]):
+            tail_start -= 1
+        tail = self.entries[tail_start:]
+        if not tail or tail_start == 0:
+            return
+        head = self.entries[:tail_start]
+        _v, _s, break_seconds = self.app.playlist_generator.hour_options(self.day, self.hour)
+        slot_seconds = self.app.playlist_generator.voice_slot_seconds()
+        used = timeline_length([e for e in head if is_song_entry(e)], get_track_duration)
+        for e in head:
+            if is_voice_marker(e):
+                used += slot_seconds
+            elif not is_hour_marker(e) and not is_song_entry(e):
+                used += get_track_duration(e)
+        gap = 3600.0 - break_seconds - used + CROSSFADE_OVERLAP_SECONDS
+        rotation = self.app.rotation_library.find(self.app.rotation_schedule.rotation_id_for(self.day, self.hour))
+        if rotation is None or gap < FIT_MIN_SECONDS:
+            return
+        taken = set(self.entries)
+        candidates = [p for p in rotation.track_paths() if p not in taken]
+        best, score = choose_fill(gap, candidates, get_track_duration, get_track_artist, max_songs=max(1, min(2, len(tail))))
+        current = timeline_length(tail, get_track_duration)
+        current_score = (gap - CROSSFADE_OVERLAP_SECONDS - current) if gap - CROSSFADE_OVERLAP_SECONDS >= current \
+            else (current - (gap - CROSSFADE_OVERLAP_SECONDS)) * 3
+        if best and score is not None and score < current_score:
+            self.entries = head + best
+
+    def save_hour(self):
+        if self.day is None or not self.path:
+            self.app.announce("Load an hour first.")
+            return
+        self.refit_end()
+        write_m3u(self.path, self.entries)
+        recorded = [e for e in self.entries if not is_hour_marker(e) and not is_song_entry(e)]
+        if recorded:
+            set_hour_locked(self.app.settings, self.day, self.hour, True)
+        self.refresh_list()
+        self.app.reload_hour_if_current(self.day, self.hour)
+        total = self.projected_total()
+        diff = int(round(total - 3600))
+        self.app.announce(f"Saved. {len(recorded)} voice track(s) recorded; the hour is "
+                          + ("locked so it will not be rebuilt. " if recorded else "not locked yet. ")
+                          + (f"Projected to end on the hour." if abs(diff) <= 12
+                             else f"Projected to end {abs(diff)} seconds {'early' if diff < 0 else 'late'}."))
+
+    def rebuild_hour(self):
+        if self.day is None:
+            return
+        answer = QMessageBox.question(self, "Discard and rebuild",
+                                      "Throw away this hour's playlist, including any voice tracks recorded in it, and build a new one?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        set_hour_locked(self.app.settings, self.day, self.hour, False)
+        self.path = self.app.playlist_generator.generate_hour(self.day, self.hour)
+        self.entries, _missing = read_m3u(self.path) if self.path else ([], 0)
+        self.refresh_list(keep_row=0)
+        self.app.announce("The hour was rebuilt.")
+
+
+# ---------------------------------------------------------------------------
+# Logo: the Vision Studio turntable (icon and banner are drawn into the program, no image files needed),
+# the station's own logo option, the Windows icon file, and keyboard navigation helpers
+# ---------------------------------------------------------------------------
+
+LOGO_PNG_B64 = {
+    "16": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACwElEQVR42o2TzWtcZRTGf+d933tnppkkM9NN/CgiiiDBjbRooJBF"
+        "hATElUIo4kIMCP0XXAVdiRu30kV14cqtqIUSF1JdKEEQtNoyWdhEHclk7nXuvTPvx3HTRJQu/K3P8/BwznOE+6ytrb1S1/XFlBIP"
+        "whiDqmqWZeKcu7O5uXl9d3c3yPr6uiuK4v0QwtUQwtnwfzk19t5jraXT6ey1Wq0rdmFh4eUQwrt1XccQgsYYtaoqLYpCJ5OJTqdT"
+        "9d6riKj3XldWVhSIdV0/MZ/Pl0wI4bkYYxIRnHPWOWePj49tNS1tDI2dNZUdj8d2NBpZY4zd2dmx29vbtqqqlFK65ETEq6oxxkTn"
+        "HNZaBoMev947AbXglKUOJFUODg7Y39+nKApSSkZEggMEQEQwxmBEIBvw0vMll1ZnfP295bNvHb0lIaVECIHhcEiWZcQYxaWUsNYy"
+        "Go2AhGsN2NkoeOf1EhYFyjlX3zNcu7mIESHPc1qtFqp6unCDqhKCp/yrZl79zpubnvFkkQ8/UsbFIm+92qNtG5IqqHJ4eEie56gq"
+        "7p9DCdZAkpw3fr6F5Mv8dPApH//wIn72Bxeeeo0nLzyGGMNkMqHb7RJCwA4GgxeMMZebptEQ1cS6pJjO6K5eYeWZZ5n+2aVe/Zzz"
+        "TzcMP/mOm199Sb/XVxERVT08S9DpdKiqCtta4GT/A+6WB3Qfv0wzvEX/m3sczTO8TTzy0MOIyFluZ4zRlBKdTufMxLWXmNy9wcnt"
+        "G2BBxo/S6y9juufw3hNjPNWrA1pAUlX6/T4AdV0jrovkBo2R4+kJ7aVzSORfYlXNnYj8KCImhOABGQwGzGYzmqYhxogxOXmeE7w/"
+        "i66qMcuyDPhFtra2WkdHR19479f/zzOdli7P89/a7fa6AGxsbJwvy/Ltpmku3i+I8GCSiIhz7s7y8vLu3t7e7b8B3tduDL+rAY4A"
+        "AAAASUVORK5CYII="
+    ),
+    "32": (
+        "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"
+    ),
+    "48": (
+        "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"
+    ),
+    "64": (
+        "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"
+        "vGIt839WLZow+gJSgwAAAABJRU5ErkJggg=="
+    ),
+    "128": (
+        "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"
+    ),
+    "256": (
+        "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"
+    ),
+    "banner": (
+        "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"
+    ),
+}
+
+
+def logo_png(key):
+    return base64.b64decode("".join(LOGO_PNG_B64[str(key)]))
+
+
+ICON_SIZES = (16, 32, 48, 64, 128, 256)
+
+
+def write_icon_file(path):
+    """Writes a Windows .ico holding the logo at every size (PNG inside). Used by the build."""
+    images = [logo_png(size) for size in ICON_SIZES]
+    header = struct.pack("<HHH", 0, 1, len(images))
+    offset = 6 + 16 * len(images)
+    entries = b""
+    for size, data in zip(ICON_SIZES, images):
+        dim = 0 if size >= 256 else size
+        entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    with open(path, "wb") as handle:
+        handle.write(header + entries + b"".join(images))
+
+
+def default_app_icon():
+    icon = QIcon()
+    for size in ICON_SIZES:
+        pixmap = QPixmap()
+        if pixmap.loadFromData(logo_png(size), "PNG"):
+            icon.addPixmap(pixmap)
+    return icon
+
+
+def get_logo_folder():
+    """A copy of the station's own logo is kept here, next to Logs and Playlists."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), "Logos")
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Logos")
+    if _writable_dir(fallback):
+        return fallback
+    return tempfile.gettempdir()
+
+
+LOGO_BANNER_HEIGHT = 72
+
+
+def load_banner_pixmap(settings):
+    """The picture shown across the top of the program: the station's logo when chosen, else the default."""
+    custom = str(settings.value("logo_custom_path", "") or "")
+    if str(settings.value("logo_mode", "default")) == "custom" and custom and os.path.isfile(custom):
+        pixmap = QPixmap(custom)
+        if not pixmap.isNull():
+            return pixmap.scaledToHeight(LOGO_BANNER_HEIGHT, Qt.TransformationMode.SmoothTransformation), True
+    pixmap = QPixmap()
+    pixmap.loadFromData(logo_png("banner"), "PNG")
+    return pixmap.scaledToHeight(LOGO_BANNER_HEIGHT, Qt.TransformationMode.SmoothTransformation), False
+
+
+def load_window_icon(settings):
+    custom = str(settings.value("logo_custom_path", "") or "")
+    if str(settings.value("logo_mode", "default")) == "custom" and custom and os.path.isfile(custom):
+        icon = QIcon(custom)
+        if not icon.isNull():
+            return icon
+    return default_app_icon()
+
+
+class KeyboardNavigationFilter(QObject):
+    """Up and Down move between controls in Settings and in dialogs, the way Tab and Shift+Tab do.
+    Space or Enter opens a combo box's list. Lists, tables, number boxes and sliders keep their own arrows."""
+
+    MOVERS = (QCheckBox, QPushButton, QComboBox, QLineEdit)
+
+    def __init__(self, app_window):
+        super().__init__()
+        self.app_window = app_window
+
+    def in_scope(self, widget):
+        window = widget.window()
+        if isinstance(window, QDialog):
+            return True
+        page = getattr(self.app_window, "settings_page", None)
+        pages = getattr(self.app_window, "pages", None)
+        try:
+            return (page is not None and pages is not None and pages.currentIndex() == 1
+                    and page.isAncestorOf(widget))
+        except Exception:
+            return False
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() != QEvent.Type.KeyPress or not isinstance(obj, self.MOVERS):
+                return False
+            if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
+                return False
+            key = event.key()
+            if isinstance(obj, QComboBox) and key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                obj.showPopup()
+                return True
+            if not self.in_scope(obj):
+                return False
+            if isinstance(obj, QPushButton) and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                obj.click()
+                return True
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                going_down = key == Qt.Key.Key_Down
+                tab = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Tab if going_down else Qt.Key.Key_Backtab,
+                                Qt.KeyboardModifier.NoModifier if going_down else Qt.KeyboardModifier.ShiftModifier)
+                QApplication.sendEvent(obj, tab)
+                return True
+        except Exception:
+            return False
+        return False
+
+
 
 # ---------------------------------------------------------------------------
 # Main application window
@@ -5779,6 +8737,7 @@ class BroadcastingApp(QWidget):
         self._voice_recording = False
         self.tray = None
         self.menu_actions = {}
+        self.break_deck_widgets = {}
         self.day_generated = set()
         self.append_attempted = set()
         self.last_schedule_hour = datetime.now().hour
@@ -5793,6 +8752,11 @@ class BroadcastingApp(QWidget):
         self.rotation_schedule = RotationSchedule(self.settings, self.rotation_library)
         self.category_library = CategoryLibrary(self.settings, on_changed=self.on_categories_changed)
         self.playlist_generator = PlaylistGenerator(self.settings, self.rotation_library, self.rotation_schedule)
+        self.event_library = EventLibrary(self.settings, on_changed=self.refresh_schedule_views)
+        self.rotation_schedule.events = self.event_library
+        self.break_marks = BreakMarks(self.settings, self.event_library)
+        self.playlist_generator.events = self.event_library
+        self.playlist_generator.marks = self.break_marks
         self.shortcut_objects = []
         RUN_LOG.write("START", "Step 1: libraries loaded.")
         self.migrate_old_playlists()
@@ -5824,6 +8788,7 @@ class BroadcastingApp(QWidget):
         )
         self.sequence_player.category_library = self.category_library
         self.sequence_player.on_changed = self.on_sequence_changed
+        self.sequence_player.event_provider = lambda: self.event_library.event_at(datetime.now())
         self.scheduler = SchedulerEngine(self.settings, self.on_crossfade_start, self.update_status)
         self.scheduler.on_break_upcoming = self.on_break_upcoming
         self.encoder_bank = EncoderBankWidget(
@@ -5873,9 +8838,19 @@ class BroadcastingApp(QWidget):
                 self._rescan_in_progress = False
         self.rotation_schedule.ensure_valid()
         self.rotation_library.detect_new_files()  # first look: remember what is already there
+        try:
+            self.category_library.sync_music(self.rotation_library)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
         RUN_LOG.write("START", "Building the window.")
         self.setup_ui()
         RUN_LOG.write("START", "Window built.")
+        try:
+            self.nav_filter = KeyboardNavigationFilter(self)
+            QApplication.instance().installEventFilter(self.nav_filter)
+            self.apply_logo()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
         self.setup_shortcuts()
         RUN_LOG.write("START", "Shortcuts ready.")
         for optional_step in (self.setup_tray, refresh_autostart_path, keep_system_awake):
@@ -6699,6 +9674,11 @@ class BroadcastingApp(QWidget):
             self.rotation_schedule.regenerate_even()   # editing a rotation rebuilds the day
         else:
             self.rotation_schedule.ensure_valid()
+        try:
+            if getattr(self, "category_library", None) is not None:
+                self.category_library.sync_music(self.rotation_library)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
         if hasattr(self, "rotations_tab"):
             self.rotations_tab.refresh()
             self.schedule_tab.refresh()
@@ -6751,6 +9731,10 @@ class BroadcastingApp(QWidget):
                 self.schedule_tab.refresh()
                 self.on_hour_changed()
             self.maybe_append_next_hour()
+            self.played_counter = getattr(self, "played_counter", 0) + 1
+            if self.played_counter >= 30:
+                self.played_counter = 0
+                self.refresh_played_list()
             self.rescan_counter += 1
             if self.rescan_counter >= 60:
                 self.rescan_counter = 0
@@ -6856,6 +9840,12 @@ class BroadcastingApp(QWidget):
             _log_exception(type(e), e, e.__traceback__)
 
     def _vinyl_tick(self):
+        sp = self.sequence_player
+        current = sp.current_deck_name()
+        playing_now = bool(sp.active and sp.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
+        for name, widgets in self.break_deck_widgets.items():
+            widgets["vinyl"].set_spinning(playing_now and current == name)
+            widgets["vinyl"].tick()
         for name, deck in (("A", self.rotation.deck_a), ("B", self.rotation.deck_b)):
             widgets = self.deck_widgets.get(name)
             if not widgets:
@@ -6929,7 +9919,8 @@ class BroadcastingApp(QWidget):
                 self.update_status("Could not build this hour's playlist: no rotation is scheduled for it.")
                 return False
             entries, _missing = read_m3u(path)
-            count = self.rotation.load_queue_entries(entries, replace=True)
+            count = self.rotation.load_queue_entries(entries, replace=True,
+                                                     locked=is_hour_locked(self.settings, now.date(), now.hour))
             self.rotation.playlist_driven = count > 0
             self.update_status(f"This hour's playlist is ready: {count} entries, saved to {path}")
         self.maybe_append_next_hour()
@@ -6949,7 +9940,8 @@ class BroadcastingApp(QWidget):
         if not path:
             return
         entries, _missing = read_m3u(path)
-        count = self.rotation.load_queue_entries(entries, replace=False)
+        count = self.rotation.load_queue_entries(entries, replace=False,
+                                                 locked=is_hour_locked(self.settings, day, hour))
         self.rotation.playlist_driven = True
         self.announce(f"The {hour_label(hour)} playlist is ready at the bottom of the queue: {count} entries.")
 
@@ -6976,7 +9968,9 @@ class BroadcastingApp(QWidget):
                 self.announce("No generated playlist for this hour yet. Choose Generate Now first.")
             return
         entries, _missing = read_m3u(path)
-        count = self.rotation.load_queue_entries(entries, replace=True)
+        now = datetime.now()
+        count = self.rotation.load_queue_entries(entries, replace=True,
+                                                 locked=is_hour_locked(self.settings, now.date(), now.hour))
         self.announce(f"Loaded this hour's playlist: {count} entries.")
 
     def choose_playlist_folder(self):
@@ -7221,26 +10215,16 @@ class BroadcastingApp(QWidget):
     def voice_track_after(self):
         self.record_voice_track(after=True)
 
-    def record_voice_track(self, after):
-        """Records a voice track and drops it into the queue before or after the selected item, like
-        Station Playlist. The music keeps playing while you talk; when the voice track is done the
-        next song fades in by itself."""
+    def capture_voice_clip(self, where):
+        """Records one voice track with the preview, re-record and underlay dialog. Returns
+        (file path, seconds, underlay seconds), or None when it was discarded."""
         if self._voice_recording:
-            return
-        row = self.queue_list.currentRow()
-        header = self.queue_list.header_count
-        queue = self.rotation.shuffled_queue
-        if row >= header and row - header < len(queue):
-            index = row - header + (1 if after else 0)
-            where = f"{'after' if after else 'before'} {format_track_display(queue[row - header])}"
-        else:
-            index = 0
-            where = "as the next item, right after the song on air"
+            return None
         draft_path = os.path.join(get_voice_folder(), time.strftime("voicetrack_%Y-%m-%d_%H%M%S_draft.wav"))
         recorder = VoiceRecorder(self.settings, self.update_status)
         if not recorder.start(draft_path):
             self.announce("The voice track could not start. Check the microphone in the Settings tab.")
-            return
+            return None
         self._voice_recording = True
         RUN_LOG.write("VOICE", f"Recording a voice track {where}.")
         try:
@@ -7264,8 +10248,7 @@ class BroadcastingApp(QWidget):
         if not accepted or seconds < 0.5:
             recorder.cancel()
             self.announce("Voice track discarded." if not accepted else "Nothing was recorded, so no voice track was added.")
-            self.queue_list.setFocus()
-            return
+            return None
         underlay = dialog.underlay_spin.value()
         self.settings.setValue("voice_underlay_seconds", underlay)
         final_path = draft_path.replace("_draft.wav", f"_u{underlay}.wav")
@@ -7273,12 +10256,110 @@ class BroadcastingApp(QWidget):
             os.replace(draft_path, final_path)
         except OSError:
             final_path = draft_path
-        self.rotation.insert_queue_item(final_path, index)
         RUN_LOG.write("VOICE", f"Voice track of {seconds:.0f} seconds saved: {final_path}")
+        return final_path, seconds, underlay
+
+    def record_voice_track(self, after):
+        """Records a voice track and drops it into the queue before or after the selected item, like
+        Station Playlist. A selected voice track slot is filled instead. The music keeps playing while
+        you talk; when the voice track is done the next song fades in by itself."""
+        if self._voice_recording:
+            return
+        if (self.pages.currentIndex() == 1 and self.tabs.currentWidget() is self.vt_hour_tab):
+            self.vt_hour_tab.record_into_selected()          # on the Voice Track Hour screen the keys fill its slots
+            return
+        row = self.queue_list.currentRow()
+        header = self.queue_list.header_count
+        queue = self.rotation.shuffled_queue
+        fill_slot = False
+        if row >= header and row - header < len(queue):
+            if is_voice_marker(queue[row - header]):
+                fill_slot = True
+                index = row - header
+                where = "into the voice track slot"
+            else:
+                index = row - header + (1 if after else 0)
+                where = f"{'after' if after else 'before'} {format_track_display(queue[row - header])}"
+        else:
+            index = 0
+            where = "as the next item, right after the song on air"
+        clip = self.capture_voice_clip(where)
+        if clip is None:
+            self.queue_list.setFocus()
+            return
+        final_path, seconds, underlay = clip
+        if fill_slot:
+            self.rotation.remove_queue_item(index)
+        self.rotation.insert_queue_item(final_path, index)
         self.announce(f"Voice track of {int(round(seconds))} seconds added {where}. "
                       + (f"The next song's intro plays under its last {underlay} seconds."
                          if underlay else "The next song starts as it ends."))
         self.queue_list.setFocus()
+
+    def reload_hour_if_current(self, day, hour):
+        """After saving a voice tracked hour that is on air right now or next, make sure the queue uses it."""
+        now = datetime.now()
+        if (day, hour) == (now.date(), now.hour):
+            self.announce("That hour is on air now. The saved version plays from the next hour change; "
+                          "use Load This Hour's Playlist in the queue area to bring it in now.")
+
+    # --- categories ---
+    def import_category_folder(self, folder, kind):
+        """Music folders also make a rotation and a draft dated schedule. Nothing is switched on."""
+        library = self.category_library
+        if kind != "music":
+            added = library.import_folder(folder, kind)
+            for category in added:
+                self.normalizer.start(scan_audio_files(category["folder"]))
+            return added
+        added = []
+        for path in library.audio_folders(folder):
+            name = pretty_folder_name(os.path.basename(os.path.normpath(path)))
+            rotation = self.rotation_library.add_rotation(name, path, True, auto=False, notify=False, regular=False)
+            category = library.add_category(path, rotation.name, "music", active=False, rotation_id=rotation.id)
+            added.append(category)
+            self.event_library.add_draft(rotation.name, rotation.id)
+            self.normalizer.start(rotation.track_paths())
+        if added:
+            library._changed()
+            self.rotation_library._changed("linked")       # no rebuild of the schedule you made
+        return added
+
+    def change_category_folder(self, category, folder):
+        category["folder"] = folder
+        if category.get("type") == "music" and category.get("rotation_id"):
+            self.rotation_library.relink_folder(category["rotation_id"], folder)
+            rotation = self.rotation_library.find(category["rotation_id"])
+            if rotation:
+                self.normalizer.start(rotation.track_paths())
+        else:
+            self.normalizer.start(scan_audio_files(folder))
+        self.category_library._changed()
+        self.announce(f"{category['name']} now uses {folder}.")
+
+    def set_category_active(self, category, active):
+        self.category_library.set_active(category["id"], active)
+        rotation = self.rotation_library.find(category.get("rotation_id")) if category.get("rotation_id") else None
+        if rotation is not None:
+            rotation.regular = bool(active)
+            self.rotation_library.save()
+        self.announce(f"{category['name']} is now " + ("in the regular schedule." if active else "off the regular schedule."))
+
+    # --- dated schedules ---
+    def refresh_schedule_views(self):
+        if hasattr(self, "schedule_tab"):
+            self.schedule_tab.refresh()
+
+    def on_events_changed(self, event):
+        """A dated schedule was saved or removed: playlists for today are rebuilt so they follow it."""
+        self.refresh_schedule_views()
+        try:
+            if event is None or self.event_library.event_for_hour(datetime.now().date(), datetime.now().hour) is not None \
+                    or any(self.event_library.event_for_hour(datetime.now().date(), h) for h in range(24)):
+                self.generate_day(datetime.now().date())
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.rotation.check_rotation_for_hour()
 
     def audio_is_playing(self):
         playing = QMediaPlayer.PlaybackState.PlayingState
@@ -7463,6 +10544,140 @@ class BroadcastingApp(QWidget):
         }
         return column
 
+    def build_break_deck_column(self, deck_name):
+        """Decks C and D: the jingle, the ad break and the closing jingle alternate between them."""
+        column = QVBoxLayout()
+        title = QLabel(f"Deck {deck_name} (jingles and ads)")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
+        column.addWidget(title)
+        vinyl = VinylWidget(deck_name, size=90)
+        column.addWidget(vinyl, alignment=Qt.AlignmentFlag.AlignCenter)
+        live_indicator = QLabel("")
+        live_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        live_indicator.setAccessibleName(f"Deck {deck_name} on-air indicator")
+        live_indicator.setStyleSheet(f"color: {COLOR_LIVE_RED}; font-weight: bold;")
+        column.addWidget(live_indicator)
+        item_label = QLabel("(idle)")
+        item_label.setAccessibleName(f"Deck {deck_name}: break item")
+        item_label.setWordWrap(True)
+        item_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        item_label.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
+        column.addWidget(item_label)
+        row = QHBoxLayout()
+        play_btn = QPushButton("Play/Pause")
+        play_btn.setAccessibleName(f"Deck {deck_name}: play or pause the break")
+        play_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        play_btn.clicked.connect(lambda: self.sequence_player.toggle_pause())
+        row.addWidget(play_btn)
+        stop_btn = QPushButton("Stop")
+        stop_btn.setAccessibleName(f"Deck {deck_name}: stop the break and bring the music back")
+        stop_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        stop_btn.clicked.connect(lambda: self.sequence_player.stop_break())
+        row.addWidget(stop_btn)
+        column.addLayout(row)
+        self.break_deck_widgets[deck_name] = {"vinyl": vinyl, "live_indicator": live_indicator, "item_label": item_label}
+        return column
+
+    def refresh_break_decks(self):
+        sp = self.sequence_player
+        for index, name in enumerate(sp.deck_names):
+            widgets = self.break_deck_widgets.get(name)
+            if not widgets:
+                continue
+            mine = list(range(index, len(sp.items), 2)) if sp.active else []
+            if sp.active and sp.item_index in mine:
+                widgets["live_indicator"].setText("● ON AIR")
+                widgets["item_label"].setText(os.path.basename(sp.items[sp.item_index]))
+            else:
+                widgets["live_indicator"].setText("")
+                waiting = [i for i in mine if i > sp.item_index]
+                widgets["item_label"].setText(f"Next: {os.path.basename(sp.items[waiting[0]])}" if waiting else "(idle)")
+
+    def refresh_played_list(self):
+        if not hasattr(self, "played_list"):
+            return
+        separation = self.rotation.separation_seconds
+        rows = self.rotation.play_history.recent(separation)
+        self.played_list.clear()
+
+        def clock(stamp):
+            return time.strftime("%I:%M %p", time.localtime(stamp)).lstrip("0")
+        for path, played, available in rows[:80]:
+            self.played_list.addItem(f"{format_track_display(path)}: played {clock(played)}, available again at {clock(available)}")
+        self.played_label.setText(f"Played: {len(rows)} song(s) held back for {separation / 3600:g} hours")
+
+    # --- logo ---
+    def apply_logo(self):
+        pixmap, custom = load_banner_pixmap(self.settings)
+        self.logo_label.setPixmap(pixmap)
+        self.logo_label.setAccessibleName("Station logo" if custom else "Vision Studio logo")
+        icon = load_window_icon(self.settings)
+        self.setWindowIcon(icon)
+        if self.tray is not None:
+            try:
+                self.tray.setIcon(icon)
+            except Exception:
+                pass
+        if hasattr(self, "logo_status_label"):
+            self.logo_status_label.setText("Using your station logo." if custom else "Using the default Vision Studio logo.")
+
+    def build_logo_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("The logo across the top of the program and in the window and tray icons. You can use your "
+                       "own station logo, and switch back to the Vision Studio logo whenever you like. The desktop "
+                       "shortcut icon is set when the program is installed and does not change.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.logo_status_label = QLabel("")
+        self.logo_status_label.setAccessibleName("Which logo is in use")
+        layout.addWidget(self.logo_status_label)
+        for text, handler in (("Choose My Station Logo...", self.choose_station_logo),
+                              ("Use My Station Logo", self.use_station_logo),
+                              ("Revert To The Default Vision Studio Logo", self.use_default_logo)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            layout.addWidget(btn)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return page
+
+    def choose_station_logo(self):
+        path, _filter = QFileDialog.getOpenFileName(self, "Choose your station logo", "",
+                                                    "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
+        if not path:
+            return
+        if QPixmap(path).isNull():
+            self.announce("That file could not be read as a picture.")
+            return
+        extension = os.path.splitext(path)[1].lower() or ".png"
+        target = os.path.join(get_logo_folder(), "station_logo" + extension)
+        try:
+            shutil.copyfile(path, target)
+        except OSError as e:
+            self.announce(f"The logo could not be saved: {e}")
+            return
+        self.settings.setValue("logo_custom_path", target)
+        self.settings.setValue("logo_mode", "custom")
+        self.apply_logo()
+        self.announce("Your station logo is now in use. Use Revert To The Default Vision Studio Logo to go back.")
+
+    def use_station_logo(self):
+        custom = str(self.settings.value("logo_custom_path", "") or "")
+        if not (custom and os.path.isfile(custom)):
+            self.announce("No station logo has been chosen yet. Choose one first.")
+            return
+        self.settings.setValue("logo_mode", "custom")
+        self.apply_logo()
+        self.announce("Your station logo is now in use.")
+
+    def use_default_logo(self):
+        self.settings.setValue("logo_mode", "default")
+        self.apply_logo()
+        self.announce("The default Vision Studio logo is back.")
+
     def on_deck_update(self, deck_name, track_path):
         widgets = self.deck_widgets.get(deck_name)
         if not widgets:
@@ -7509,6 +10724,9 @@ class BroadcastingApp(QWidget):
         layout.addWidget(self.alert_label)
 
         top_row = QHBoxLayout()
+        self.logo_label = QLabel()
+        self.logo_label.setAccessibleName("Vision Studio logo")
+        top_row.addWidget(self.logo_label)
         self.settings_btn = QPushButton("Settings (Ctrl+O)")
         self.settings_btn.setAccessibleName("Settings. Keyboard shortcut Control O.")
         self.settings_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
@@ -7528,6 +10746,14 @@ class BroadcastingApp(QWidget):
         # --- Tab 1: Music Rotation ---
         self.tab_rotation = QWidget()
         layout_r = QVBoxLayout()
+
+        break_row = QHBoxLayout()
+        break_row.addStretch(1)
+        break_row.addLayout(self.build_break_deck_column("C"))
+        break_row.addSpacing(40)
+        break_row.addLayout(self.build_break_deck_column("D"))
+        break_row.addStretch(1)
+        layout_r.addLayout(break_row)
 
         player_display = QHBoxLayout()
         player_display.addLayout(self.build_deck_column("A"))
@@ -7655,6 +10881,14 @@ class BroadcastingApp(QWidget):
         load_hour_btn.clicked.connect(self.load_current_hour_playlist)
         queue_buttons.addWidget(load_hour_btn)
         layout_r.addLayout(queue_buttons)
+
+        self.played_label = QLabel("Played: nothing yet")
+        self.played_label.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
+        layout_r.addWidget(self.played_label)
+        self.played_list = QListWidget()
+        self.played_list.setAccessibleName("Played songs, held back from airing again")
+        self.played_list.setMaximumHeight(130)
+        layout_r.addWidget(self.played_list)
 
         mic_row = QHBoxLayout()
         start_mic_btn = QPushButton("Start Microphone")
@@ -7901,6 +11135,46 @@ class BroadcastingApp(QWidget):
         note.setWordWrap(True)
         layout_a.addRow(note)
 
+        self.separation_spin = QSpinBox()
+        self.separation_spin.setRange(1, 12)
+        self.separation_spin.setAccessibleName("Hours a played song and its artist are held back")
+        try:
+            self.separation_spin.setValue(int(float(self.settings.value("separation_hours", 2))))
+        except Exception:
+            self.separation_spin.setValue(2)
+        layout_a.addRow("Hours before a played song or artist can play again:", self.separation_spin)
+        self.fit_hour_check = QCheckBox("Swap the last songs of each hour so the last song ends exactly on the top of the hour")
+        self.fit_hour_check.setChecked(str(self.settings.value("fit_end_of_hour", "true")).lower() != "false")
+        layout_a.addRow(self.fit_hour_check)
+        self.fit_quarter_check = QCheckBox("Also fit the songs before the :15, :30 and :45 breaks")
+        self.fit_quarter_check.setChecked(str(self.settings.value("fit_quarter_marks", "false")).lower() == "true")
+        layout_a.addRow(self.fit_quarter_check)
+        self.break_estimate_spin = QSpinBox()
+        self.break_estimate_spin.setRange(0, 600)
+        self.break_estimate_spin.setAccessibleName("Estimated seconds one break takes, used when building an hour")
+        try:
+            self.break_estimate_spin.setValue(int(float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))))
+        except Exception:
+            self.break_estimate_spin.setValue(DEFAULT_BREAK_ESTIMATE_SECONDS)
+        layout_a.addRow("Estimated length of one break, seconds (used to fit a built hour):", self.break_estimate_spin)
+        self.voice_slot_spin = QSpinBox()
+        self.voice_slot_spin.setRange(5, 120)
+        self.voice_slot_spin.setAccessibleName("Seconds reserved for each empty voice track slot")
+        try:
+            self.voice_slot_spin.setValue(int(float(self.settings.value("voice_slot_seconds", DEFAULT_VOICE_SLOT_SECONDS))))
+        except Exception:
+            self.voice_slot_spin.setValue(DEFAULT_VOICE_SLOT_SECONDS)
+        layout_a.addRow("Seconds reserved for each voice track slot:", self.voice_slot_spin)
+        self.break_gap_spin = QSpinBox()
+        self.break_gap_spin.setRange(0, 3000)
+        self.break_gap_spin.setSingleStep(50)
+        self.break_gap_spin.setAccessibleName("Silence in milliseconds between jingle and ad items in a break")
+        try:
+            self.break_gap_spin.setValue(int(float(self.settings.value("break_item_gap_ms", 250))))
+        except Exception:
+            self.break_gap_spin.setValue(250)
+        layout_a.addRow("Silence between break items, milliseconds:", self.break_gap_spin)
+
         save_audio_btn = QPushButton("Save Settings")
         save_audio_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save_audio_btn.clicked.connect(self.save_audio_settings)
@@ -7919,11 +11193,14 @@ class BroadcastingApp(QWidget):
         # --- Settings sections (the old tabs now live here) ---
         self.recording_tab = self.build_recording_tab()
         self.tagging_tab = self.build_tagging_tab()
+        self.vt_hour_tab = VoiceTrackHourTab(self)
+        self.logo_tab = self.build_logo_tab()
         sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
+                    ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab))
+                    ("Tagging", self.tagging_tab), ("Logo", self.logo_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
         self.section_list.setMaximumWidth(220)
@@ -7934,6 +11211,7 @@ class BroadcastingApp(QWidget):
         self.section_list.setCurrentRow(0)
 
         settings_page = QWidget()
+        self.settings_page = settings_page
         settings_layout = QVBoxLayout()
         back_btn = QPushButton("Back To The On-Air Screen (Ctrl+O or Escape)")
         back_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
@@ -7974,6 +11252,7 @@ class BroadcastingApp(QWidget):
         self.onair_status_label.setText("On Air: music rotation playing.")
         self.refresh_live_indicators()
         self.refresh_queue_list()
+        self.refresh_played_list()
 
         upcoming_path = self.rotation.get_upcoming_track_path()
         if upcoming_path:
@@ -8130,6 +11409,8 @@ class BroadcastingApp(QWidget):
 
     def on_break_upcoming(self, slot, target):
         """About two minutes before a mark: the engine starts protecting the song on air."""
+        if not self.break_marks.enabled(target.date(), target.hour, slot):
+            return          # this mark is switched off for that hour
         if self.rotation.is_running and self.rotation.automation_on and not self.rotation.is_paused_for_sequence:
             self.rotation.arm_break(target, slot, lambda s=slot: self.play_break_sequence(s))
             self.update_status(f"{slot} break coming up. The song on air will not be cut.")
@@ -8138,6 +11419,10 @@ class BroadcastingApp(QWidget):
         """The clock reached the mark. If the engine is already managing this break, leave it to the engine."""
         if not self.rotation.automation_on:
             return          # automation is off: no jingles or breaks fire by themselves
+        now = datetime.now()
+        if not self.break_marks.enabled(now.date(), now.hour, slot):
+            self.update_status(f"The {slot} break is switched off for this hour.")
+            return
         if self.rotation.break_is_armed(slot):
             if self.rotation.break_style() == "fade_at_mark" and not self.rotation.is_paused_for_sequence:
                 self.update_status(f"It is {slot}. Fading the music out for the break now.")
@@ -8155,6 +11440,7 @@ class BroadcastingApp(QWidget):
             if active and not self._seq_was_active and self.recorder.recording:
                 self.recorder.note_other(f"Jingles and ads ({self.sequence_player.slot})")
             self._seq_was_active = active
+            self.refresh_break_decks()
         except Exception:
             pass
         self.refresh_queue_list()
@@ -8259,6 +11545,14 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("playlist_autoload", "true" if self.playlist_autoload_check.isChecked() else "false")
         self.settings.setValue("break_window_seconds", self.break_hold_spin.value())
         self.settings.setValue("break_style", self.break_style_combo.currentData())
+        self.settings.setValue("separation_hours", self.separation_spin.value())
+        self.settings.setValue("fit_end_of_hour", "true" if self.fit_hour_check.isChecked() else "false")
+        self.settings.setValue("fit_quarter_marks", "true" if self.fit_quarter_check.isChecked() else "false")
+        self.settings.setValue("break_estimate_seconds", self.break_estimate_spin.value())
+        self.settings.setValue("voice_slot_seconds", self.voice_slot_spin.value())
+        self.settings.setValue("break_item_gap_ms", self.break_gap_spin.value())
+        self.rotation.apply_separation_setting()
+        self.refresh_played_list()
         self.settings.setValue("proc_master", "true" if self.proc_master_check.isChecked() else "false")
         self.settings.setValue("proc_preset", self.proc_preset_combo.currentText())
         self.settings.setValue("proc_ceiling_db", self.proc_ceiling_spin.value())
@@ -8274,6 +11568,10 @@ class BroadcastingApp(QWidget):
 
 
 if __name__ == "__main__":
+    if "--make-icon" in sys.argv:             # used by the build: writes the Windows icon file and exits
+        _target = sys.argv[sys.argv.index("--make-icon") + 1] if len(sys.argv) > sys.argv.index("--make-icon") + 1 else "VisionStudio.ico"
+        write_icon_file(_target)
+        sys.exit(0)
     install_crash_guard()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)      # hiding to the system tray must not end the program
