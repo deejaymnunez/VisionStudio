@@ -4403,6 +4403,7 @@ class EncoderSlot(QObject):
         self.server_host = ""
         self.server_port = ""
         self.mount_point = ""
+        self.username = "source"
         self.server_password = ""
         self.source_password = ""
         self.audio_format = "MP3"
@@ -4423,7 +4424,7 @@ class EncoderSlot(QObject):
 
     # --- persistence ---
     FIELDS = ("stream_name", "protocol", "server_host", "server_port", "mount_point",
-              "server_password", "source_password", "audio_format", "bitrate_kbps")
+              "username", "server_password", "source_password", "audio_format", "bitrate_kbps")
 
     def to_dict(self):
         return {name: getattr(self, name) for name in self.FIELDS}
@@ -4463,7 +4464,8 @@ class EncoderSlot(QObject):
         if not mount.startswith("/"):
             mount = "/" + mount
         password = urllib.parse.quote(self.source_password, safe="")
-        url = f"icecast://source:{password}@{self.server_host.strip()}:{self.server_port.strip()}{mount}"
+        user = urllib.parse.quote((self.username or "source").strip() or "source", safe="")
+        url = f"icecast://{user}:{password}@{self.server_host.strip()}:{self.server_port.strip()}{mount}"
 
         cmd = [get_ffmpeg_path(), "-hide_banner", "-loglevel", "warning"]
         if use_pipe:
@@ -4612,7 +4614,7 @@ class EncoderSlot(QObject):
                      "artist": meta.get("artist", ""), "album": meta.get("album", ""), "charset": "UTF-8"},
                     quote_via=urllib.parse.quote)
                 url = f"http://{host}:{port}/admin/metadata?{params}"
-                credentials = base64.b64encode(f"source:{self.source_password}".encode("utf-8")).decode("ascii")
+                credentials = base64.b64encode(f"{(self.username or 'source').strip() or 'source'}:{self.source_password}".encode("utf-8")).decode("ascii")
                 request = urllib.request.Request(url)
                 request.add_header("Authorization", "Basic " + credentials)
             elif self.protocol == "Shoutcast":
@@ -4658,10 +4660,19 @@ class EncoderSlotWidget(QWidget):
         layout.addRow("Protocol:", self.protocol_combo)
 
         self.host_edit = QLineEdit(self.slot.server_host)
-        layout.addRow("Server Host:", self.host_edit)
+        layout.addRow("Host Address:", self.host_edit)
 
         self.port_edit = QLineEdit(self.slot.server_port)
-        layout.addRow("Server Port:", self.port_edit)
+        layout.addRow("Port:", self.port_edit)
+
+        self.username_edit = QLineEdit(self.slot.username or "source")
+        self.username_edit.setAccessibleName(f"Encoder {self.slot.slot_number} username")
+        layout.addRow("Username:", self.username_edit)
+
+        self.source_password_edit = QLineEdit(self.slot.source_password)
+        self.source_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.source_password_edit.setAccessibleName(f"Encoder {self.slot.slot_number} password")
+        layout.addRow("Password:", self.source_password_edit)
 
         self.mount_edit = QLineEdit(self.slot.mount_point)
         layout.addRow("Mount Point:", self.mount_edit)
@@ -4676,11 +4687,11 @@ class EncoderSlotWidget(QWidget):
 
         self.server_password_edit = QLineEdit(self.slot.server_password)
         self.server_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("Server Password:", self.server_password_edit)
-
-        self.source_password_edit = QLineEdit(self.slot.source_password)
-        self.source_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("Source Password:", self.source_password_edit)
+        self.server_password_edit.setAccessibleName(f"Encoder {self.slot.slot_number} Shoutcast admin password")
+        layout.addRow("Shoutcast Admin Password:", self.server_password_edit)
+        self.encoder_form = layout
+        self.protocol_combo.currentTextChanged.connect(self.update_protocol_rows)
+        self.update_protocol_rows()
 
         save_btn = QPushButton("Save")
         save_btn.setAccessibleName(f"Save encoder {self.slot.slot_number}")
@@ -4728,6 +4739,15 @@ class EncoderSlotWidget(QWidget):
         self.on_state_changed(self.slot, self.slot.state, "")
         self.set_collapsed(False)
 
+    def update_protocol_rows(self, *_args):
+        """Icecast logs in with a username and password; the admin password row is only for Shoutcast."""
+        icecast = self.protocol_combo.currentText() == "Icecast"
+        for widget, shown in ((self.username_edit, icecast), (self.server_password_edit, not icecast)):
+            try:
+                self.encoder_form.setRowVisible(widget, shown)
+            except Exception:
+                widget.setVisible(shown)
+
     def refresh_accessible_names(self):
         name = self.slot.stream_name
         self.edit_btn.setAccessibleName(f"Edit {name}")
@@ -4753,6 +4773,7 @@ class EncoderSlotWidget(QWidget):
         self.slot.server_host = self.host_edit.text().strip()
         self.slot.server_port = self.port_edit.text().strip()
         self.slot.mount_point = self.mount_edit.text().strip()
+        self.slot.username = self.username_edit.text().strip() or "source"
         self.slot.audio_format = self.format_combo.currentText()
         self.slot.bitrate_kbps = self.bitrate_edit.text().strip() or "128"
         self.slot.server_password = self.server_password_edit.text()
