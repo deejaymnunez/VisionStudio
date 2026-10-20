@@ -2675,6 +2675,33 @@ class StreamProcessor:
 # Rotation engine: two alternating decks, crossfading like a DJ automation
 # ---------------------------------------------------------------------------
 
+class SplitOutput:
+    """A deck's audio output with two levels: `volume()` is the level the program means (it feeds the
+    stream mix and follows fades and ducking), while the real output to the speakers is set to silence
+    when the speakers are muted. Muting never reaches the stream."""
+
+    def __init__(self, device=None):
+        self.real = QAudioOutput()
+        if device is not None:
+            self.real.setDevice(device)
+        self.logical = float(self.real.volume())
+        self.muted = False
+
+    def setDevice(self, device):
+        self.real.setDevice(device)
+
+    def setVolume(self, value):
+        self.logical = float(value)
+        self.real.setVolume(0.0 if self.muted else self.logical)
+
+    def volume(self):
+        return self.logical
+
+    def set_muted(self, muted):
+        self.muted = bool(muted)
+        self.real.setVolume(0.0 if self.muted else self.logical)
+
+
 class Deck:
     """
     One playback deck: its own QMediaPlayer, QAudioOutput, and FadeController.
@@ -2685,11 +2712,9 @@ class Deck:
     def __init__(self, name, on_fade_progress=None, output_device=None):
         self.name = name  # "A" or "B"
         self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        if output_device is not None:
-            self.audio_output.setDevice(output_device)
+        self.audio_output = SplitOutput(output_device)
         self.audio_output.setVolume(0.0)
-        self.player.setAudioOutput(self.audio_output)
+        self.player.setAudioOutput(self.audio_output.real)
         self.fader = FadeController(self.audio_output, on_progress=on_fade_progress)
         self.current_track_path = None
         self.manual_volume = 1.0  # the deck's own fader level, independent of ducking/mute
@@ -2746,7 +2771,6 @@ class RotationEngine:
         self.live_deck_name = "A"
 
         for deck in (self.deck_a, self.deck_b):
-            deck.fader.mute_check = lambda: self.is_muted
             deck.player.mediaStatusChanged.connect(
                 lambda status, d=deck: self.on_media_status_changed(status, d)
             )
@@ -2835,8 +2859,7 @@ class RotationEngine:
         self.deck_b.audio_output.setDevice(device)
 
     def _effective_level(self):
-        if self.is_muted:
-            return 0.0
+        # Muting the speakers is handled by each deck's SplitOutput; the stream is never muted.
         if self.is_ducked:
             return MIC_DUCKING_LEVEL
         return 1.0
@@ -3517,8 +3540,6 @@ class RotationEngine:
             live_deck.fader.fade_to(target, steps=FADE_STEPS, interval_ms=FADE_INTERVAL_MS)
 
     def duck_for_microphone(self):
-        if self.is_muted:
-            return
         self.is_ducked = True
         self.on_status("Ducking music under live microphone.")
         live_deck = self.get_live_deck()
@@ -3527,25 +3548,21 @@ class RotationEngine:
 
     def unduck_after_microphone(self):
         self.is_ducked = False
-        if self.is_muted:
-            return
         self.on_status("Microphone off, bringing music back up.")
         live_deck = self.get_live_deck()
         live_deck.fader.fade_to(1.0 * live_deck.manual_volume,
                                  steps=DUCK_FADE_STEPS, interval_ms=DUCK_FADE_INTERVAL_MS)
 
     def set_muted(self, muted):
+        """Silences (or restores) the speakers only. The stream mix keeps the full program."""
         self.is_muted = muted
-        live_deck = self.get_live_deck()
-        if muted:
-            live_deck.audio_output.setVolume(0.0)
-        else:
-            live_deck.audio_output.setVolume(self._effective_level() * live_deck.manual_volume)
+        for deck in (self.deck_a, self.deck_b):
+            deck.audio_output.set_muted(muted)
 
     def set_deck_volume(self, deck_name, level):
         deck = self.deck_a if deck_name == "A" else self.deck_b
         deck.set_manual_volume(level)
-        if deck.name == self.live_deck_name and not self.is_muted:
+        if deck.name == self.live_deck_name:
             deck.audio_output.setVolume(self._effective_level() * deck.manual_volume)
 
     def play_pause_deck(self, deck_name):
@@ -3965,10 +3982,8 @@ class MicrophoneEngine:
                 level = max(max(samples), -min(samples))
                 if level > self.peak:
                     self.peak = level
-        if self.is_muted:
-            return
-        if self.monitor_enabled and self.sink_io is not None and self.sink is not None:
-            if self.sink.bytesFree() >= len(data):
+        if not self.is_muted and self.monitor_enabled and self.sink_io is not None and self.sink is not None:
+            if self.sink.bytesFree() >= len(data):          # muted: nothing on the speakers, the stream still gets it
                 self.sink_io.write(data)
         if self.on_audio_chunk and self.format is not None:
             self.on_audio_chunk(data, self.format)
@@ -4086,10 +4101,8 @@ class SequencePlayer:
         self.on_sequence_done = on_sequence_done
 
         self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        if output_device is not None:
-            self.audio_output.setDevice(output_device)
-        self.player.setAudioOutput(self.audio_output)
+        self.audio_output = SplitOutput(output_device)
+        self.player.setAudioOutput(self.audio_output.real)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.positionChanged.connect(self.on_position_changed)
         self.is_muted = False
@@ -4158,8 +4171,8 @@ class SequencePlayer:
             self.audio_output.setDevice(device)
 
     def set_muted(self, muted):
-        self.is_muted = muted
-        self.audio_output.setVolume(0.0 if muted else 1.0)
+        self.is_muted = muted                # speakers only: the stream still carries jingles and ads
+        self.audio_output.set_muted(muted)
 
     def build_queue(self, sequence, jingle_folder):
         """
@@ -8917,7 +8930,7 @@ class BroadcastingApp(QWidget):
                                      lambda: self.rotation.deck_b.audio_output.volume())
             self.mixer.attach_player("sequence", self.sequence_player.player,
                                      lambda: self.sequence_player.audio_output.volume())
-            self.mixer.add_source("mic", lambda: 0.0 if self.microphone.is_muted else 1.0)
+            self.mixer.add_source("mic", lambda: 1.0)       # muting the speakers never mutes the microphone on the stream
 
         RUN_LOG.write("START", "Step 6: audio sources connected.")
         self.warning_beep = HostBeep(get_or_create_warning_beep_path(), output_device)
@@ -9308,8 +9321,15 @@ class BroadcastingApp(QWidget):
         else:
             self.start_recording()
 
-    def start_recording(self, by_schedule=False):
-        """Returns True when recording is running. The first time, asks for bitrate and cue sheet."""
+    def start_recording(self, by_schedule=False, for_voice=False):
+        """Returns True when recording is running. The first time, asks for bitrate and cue sheet.
+        With "record only scheduled shows" on (the default), only a scheduled show or a voice track can start one."""
+        if (not by_schedule and not for_voice
+                and str(self.settings.value("record_only_scheduled", "true")).lower() != "false"
+                and active_show(load_show_times(self.settings), datetime.now()) is None):
+            self.announce("Recordings only start during a scheduled show. Add the show time in Settings, Recording, "
+                          "or turn off Record only scheduled shows.")
+            return False
         if not self.recorder.setup_done():
             if by_schedule:
                 self.announce("A scheduled recording was skipped. Press R once to finish the recording setup.")
@@ -9409,6 +9429,9 @@ class BroadcastingApp(QWidget):
         open_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         open_btn.clicked.connect(self.open_recordings_folder)
         layout.addRow(open_btn)
+        self.record_only_check = QCheckBox("Record only scheduled shows (and voice tracking if switched on below)")
+        self.record_only_check.toggled.connect(self.on_record_options_changed)
+        layout.addRow(self.record_only_check)
         self.record_vt_check = QCheckBox("Also record the program while I am voice tracking")
         self.record_vt_check.toggled.connect(self.on_record_options_changed)
         layout.addRow(self.record_vt_check)
@@ -9445,6 +9468,7 @@ class BroadcastingApp(QWidget):
             self.record_bitrate_combo.setCurrentIndex(max(0, index))
             self.record_cue_check.setChecked(self.recorder.cue_enabled())
             self.record_vt_check.setChecked(str(self.settings.value("record_voice_tracking", "false")).lower() == "true")
+            self.record_only_check.setChecked(str(self.settings.value("record_only_scheduled", "true")).lower() != "false")
             custom = bool(str(self.settings.value("recordings_folder", "") or "").strip())
             self.record_custom_folder_check.setChecked(custom)
             self.record_folder_btn.setEnabled(custom)
@@ -9461,6 +9485,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("record_bitrate", self.record_bitrate_combo.currentData())
         self.settings.setValue("record_cue", "true" if self.record_cue_check.isChecked() else "false")
         self.settings.setValue("record_voice_tracking", "true" if self.record_vt_check.isChecked() else "false")
+        self.settings.setValue("record_only_scheduled", "true" if self.record_only_check.isChecked() else "false")
         self.announce("Recording options saved.")
 
     def on_record_custom_folder_toggled(self, checked):
@@ -9920,7 +9945,7 @@ class BroadcastingApp(QWidget):
             m_status, m_color, level = "IDLE", COLOR_TEXT_DIM, 1.0
         master_vu = max(channels[k]["vu"] for k in ("deck_a", "deck_b", "mic", "seq"))
         channels["master"] = {"label": "MASTER", "on": m_status != "IDLE", "status": m_status, "color": m_color,
-                              "vu": 0.0 if self.is_muted else master_vu, "fader": level}
+                              "vu": master_vu, "fader": level}
         encoders = []
         for slot in self.encoder_bank.slots:
             state = "problem" if slot in self.encoder_problems else slot.state
@@ -10334,7 +10359,7 @@ class BroadcastingApp(QWidget):
         started_recording = False
         if (str(self.settings.value("record_voice_tracking", "false")).lower() == "true"
                 and not self.recorder.recording and self.recorder.setup_done()):
-            started_recording = self.start_recording()
+            started_recording = self.start_recording(for_voice=True)
             if started_recording:
                 self.recorder.note_other("Voice tracking session")
         try:
@@ -11066,7 +11091,7 @@ class BroadcastingApp(QWidget):
         self.mic_status_label.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
         layout_r.addWidget(self.mic_status_label)
 
-        self.mute_btn = QPushButton("Mute All Audio (Ctrl+Shift+U)")
+        self.mute_btn = QPushButton("Mute Speakers (Ctrl+Shift+U)")
         self.mute_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         self.mute_btn.clicked.connect(self.toggle_mute)
         layout_r.addWidget(self.mute_btn)
@@ -11523,22 +11548,22 @@ class BroadcastingApp(QWidget):
             self.mixer.push_raw("mic", data, fmt.sampleRate(), fmt.channelCount(), fmt.sampleFormat())
 
     def toggle_mute(self):
-        """Master mute: silences music, jingles and ads, and the microphone, on the
-        speakers and in the stream."""
+        """Mutes this computer's speakers only. The stream encoders, the recording and the microphone feed
+        keep the full program."""
         self.is_muted = not self.is_muted
         self.rotation.set_muted(self.is_muted)
         self.sequence_player.set_muted(self.is_muted)
         self.microphone.set_muted(self.is_muted)
         if self.is_muted:
-            self.mute_btn.setText("Unmute All Audio (Ctrl+Shift+U)")
-            self.console_mute_label.setText("Mute: ON.")
+            self.mute_btn.setText("Unmute Speakers (Ctrl+Shift+U)")
+            self.console_mute_label.setText("Speakers muted. The stream is live.")
             self.console_mute_label.setStyleSheet(f"color: {COLOR_LIVE_RED}; font-weight: bold;")
-            self.announce("All audio muted.")
+            self.announce("Speakers muted. The stream is still live.")
         else:
-            self.mute_btn.setText("Mute All Audio (Ctrl+Shift+U)")
+            self.mute_btn.setText("Mute Speakers (Ctrl+Shift+U)")
             self.console_mute_label.setText("Mute: off.")
             self.console_mute_label.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
-            self.announce("Audio unmuted.")
+            self.announce("Speakers unmuted.")
 
     # --- Scheduler / sequence callbacks ---
     def start_break(self, slot):
