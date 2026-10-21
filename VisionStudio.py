@@ -270,6 +270,24 @@ def _log_exception(exc_type, exc_value, exc_tb):
             pass
 
 
+def disable_power_throttling():
+    """Windows may slow a program that is hidden in the tray; ask it not to, so the stream keeps flowing."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+        state = PROCESS_POWER_THROTTLING_STATE(1, 1, 0)   # execution-speed throttling: controlled, and switched off
+        ctypes.windll.kernel32.SetProcessInformation(
+            ctypes.windll.kernel32.GetCurrentProcess(), 4, ctypes.byref(state), ctypes.sizeof(state))
+    except Exception:
+        pass
+
+
 def install_crash_guard():
     sys.excepthook = _log_exception
 
@@ -4056,6 +4074,10 @@ class ProgramMixer:
         self._outputs = []
         self.timer = QTimer()
         self.timer.setInterval(MIX_INTERVAL_MS)
+        try:
+            self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+        except Exception:
+            pass
         self.timer.timeout.connect(self._tick)
         self.last_time = None
         self.frame_remainder = 0.0
@@ -4807,6 +4829,24 @@ class EncoderSlot(QObject):
         self.connect_started = 0.0
         self.current_metadata = None
         self.user_stopped = False
+        self.keep_connected = "true"
+        self.reconnect_seconds = "10"
+        self.mixer_ref = None
+        self.fallback_getter = None
+        self.last_write = 0.0
+        self.bytes_sent = 0
+        self.minute_bytes = 0
+        self.minute_mark = 0.0
+        self.live_since = 0.0
+        self.fail_count = 0
+        self.retry_pending = False
+        self.quiet_retry = False
+        self.server_missing = 0
+        self.server_check_busy = False
+        self.last_server_check = 0.0
+        self.retry_timer = QTimer()
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self._retry_now)
 
         self.poll_timer = QTimer()
         self.poll_timer.setInterval(1000)
@@ -4814,7 +4854,8 @@ class EncoderSlot(QObject):
 
     # --- persistence ---
     FIELDS = ("stream_name", "protocol", "server_host", "server_port", "mount_point",
-              "username", "server_password", "source_password", "audio_format", "bitrate_kbps")
+              "username", "server_password", "source_password", "audio_format", "bitrate_kbps",
+              "keep_connected", "reconnect_seconds")
 
     def to_dict(self):
         return {name: getattr(self, name) for name in self.FIELDS}
@@ -4871,18 +4912,35 @@ class EncoderSlot(QObject):
         cmd += ["-ice_name", self.stream_name, "-content_type", content_type, "-f", container, url]
         return cmd
 
+    def keep_connected_on(self):
+        return str(self.keep_connected).lower() == "true"
+
+    def reconnect_delay(self):
+        try:
+            wanted = max(0, int(float(self.reconnect_seconds)))
+        except Exception:
+            wanted = 10
+        if self.fail_count >= 10:
+            wanted = max(wanted, 30)
+        elif self.fail_count >= 2:
+            wanted = max(wanted, 1)
+        return wanted
+
     def start(self, mixer, fallback_source):
+        """Returns True when ffmpeg was launched."""
+        self.retry_timer.stop()
         if self.state != "offline":
-            return
+            return False
         problem = self.validate()
         if problem:
+            self.retry_pending = False
             self.message.emit(f"{self.stream_name} cannot start: {problem}.")
-            return
+            return False
         use_pipe = mixer is not None and mixer.available
         if not use_pipe and not fallback_source:
             self.message.emit(f"{self.stream_name} cannot start: nothing is playing yet, and the live mix is "
                               f"unavailable ({mixer.unavailable_reason() if mixer else 'no mixer'}).")
-            return
+            return False
         try:
             self.process = subprocess.Popen(
                 self.build_ffmpeg_command(use_pipe, fallback_source),
@@ -4891,11 +4949,19 @@ class EncoderSlot(QObject):
                 creationflags=SUBPROCESS_FLAGS)
         except FileNotFoundError:
             self.message.emit(f"{self.stream_name} cannot start: ffmpeg was not found.")
-            return
+            return False
         except Exception as e:
             self.message.emit(f"{self.stream_name} cannot start: {e}")
-            return
+            return False
 
+        self.mixer_ref = mixer
+        now = time.monotonic()
+        self.last_write = now
+        self.minute_bytes = 0
+        self.minute_mark = now
+        self.live_since = 0.0
+        self.server_missing = 0
+        self.last_server_check = now
         self.user_stopped = False
         self.stderr_tail.clear()
         self.connect_started = time.monotonic()
@@ -4909,6 +4975,8 @@ class EncoderSlot(QObject):
             self.message.emit(f"{self.stream_name}: live mix unavailable, streaming only the current track file.")
         self.set_state("connecting")
         self.poll_timer.start()
+        RUN_LOG.write("ENCODER", f"{self.stream_name}: connecting to {self.server_host}:{self.server_port}{self.mount_point}.")
+        return True
 
     def _drain_stderr(self, proc):
         try:
@@ -4927,6 +4995,9 @@ class EncoderSlot(QObject):
                     break
                 proc.stdin.write(data)
                 proc.stdin.flush()
+                self.bytes_sent += len(data)
+                self.minute_bytes += len(data)
+                self.last_write = time.monotonic()
         except Exception:
             pass
         try:
@@ -4943,19 +5014,123 @@ class EncoderSlot(QObject):
         except queue.Full:
             pass
 
+    AUTH_WORDS = ("401", "403", "unauthorized", "authentication", "forbidden", "not authorized")
+
     def _poll(self):
         if self.process is None:
             self.poll_timer.stop()
             return
+        now = time.monotonic()
         code = self.process.poll()
         if code is not None:
             reason = " ".join(list(self.stderr_tail)[-2:]) or f"ffmpeg stopped (exit code {code})"
-            self._teardown()
-            self.set_state("offline", reason)
-        elif self.state == "connecting" and time.monotonic() - self.connect_started >= CONNECT_CONFIRM_SECONDS:
+            self.handle_drop(reason)
+            return
+        if self.state == "connecting" and now - self.connect_started >= CONNECT_CONFIRM_SECONDS:
+            self.live_since = now
+            self.last_write = now
+            self.fail_count = 0
+            was_retry = self.quiet_retry
+            self.quiet_retry = False
+            self.retry_pending = False
             self.set_state("live")
+            RUN_LOG.write("ENCODER", f"{self.stream_name}: LIVE" + (" (reconnected)." if was_retry else "."))
             if self.current_metadata:
                 self.push_metadata(self.current_metadata)
+            return
+        if self.state != "live":
+            return
+        # Stall: ffmpeg is running but no audio has gone out for 10 seconds.
+        if now - self.last_write > STALL_SECONDS:
+            self.handle_drop(f"no audio was sent for {int(now - self.last_write)} seconds, the connection stalled")
+            return
+        # One line in the log each minute so a quiet failure can be traced afterwards.
+        if now - self.minute_mark >= 60:
+            tail = list(self.stderr_tail)[-1:] or ["none"]
+            RUN_LOG.write("ENCODER", f"{self.stream_name}: live, {self.minute_bytes // 1024} KB sent in the last minute. "
+                                    f"Last ffmpeg message: {tail[0]}")
+            self.minute_bytes = 0
+            self.minute_mark = now
+        # Ask the server whether it still lists the mount (Icecast only).
+        if (self.protocol == "Icecast" and not self.server_check_busy
+                and now - self.last_server_check >= SERVER_CHECK_SECONDS and now - self.live_since >= 15):
+            self.last_server_check = now
+            self.server_check_busy = True
+            threading.Thread(target=self._server_check, daemon=True).start()
+        if self.server_missing >= 2:
+            self.server_missing = 0
+            self.handle_drop("the server no longer lists this mount point")
+
+    def _server_check(self):
+        """Reads the Icecast status page. A failed lookup is ignored; only a clear answer without our mount counts."""
+        try:
+            host = self.server_host.strip()
+            port = self.server_port.strip()
+            mount = self.mount_point.strip()
+            if not mount.startswith("/"):
+                mount = "/" + mount
+            request = urllib.request.Request(f"http://{host}:{port}/status-json.xsl")
+            request.add_header("User-Agent", "VisionStudio")
+            data = json.loads(urllib.request.urlopen(request, timeout=6).read().decode("utf-8", "replace"))
+            sources = data.get("icestats", {}).get("source", [])
+            if isinstance(sources, dict):
+                sources = [sources]
+            found = any(str(src.get("listenurl", "")).rstrip("/").endswith(mount.rstrip("/")) for src in sources)
+            self.server_missing = 0 if found else self.server_missing + 1
+        except Exception:
+            pass
+        finally:
+            self.server_check_busy = False
+
+    def handle_drop(self, reason):
+        """The stream ended without the user asking: tear down, announce it once, and reconnect if asked to."""
+        was = self.state
+        self._teardown()
+        self.fail_count += 1
+        RUN_LOG.write("ENCODER", f"{self.stream_name}: dropped ({reason}).")
+        auth = any(word in reason.lower() for word in self.AUTH_WORDS)
+        will_retry = self.keep_connected_on() and not self.user_stopped and not auth
+        self.retry_pending = will_retry
+        self.set_state("offline", reason)
+        if auth and self.keep_connected_on():
+            self.message.emit(f"{self.stream_name}: the server refused the login, so it will not retry. "
+                              f"Check the username and password.")
+            self.quiet_retry = False
+        elif will_retry:
+            self.quiet_retry = True
+            delay = self.reconnect_delay()
+            RUN_LOG.write("ENCODER", f"{self.stream_name}: reconnecting in {delay} seconds (attempt {self.fail_count}).")
+            self.retry_timer.start(delay * 1000)
+        else:
+            self.quiet_retry = False
+
+    def _retry_now(self):
+        if self.state != "offline" or self.user_stopped:
+            self.retry_pending = False
+            return
+        mixer = self.mixer_ref
+        fallback = self.fallback_getter() if self.fallback_getter else None
+        if not self.start(mixer, fallback):
+            self.fail_count += 1
+            if self.validate() or not self.keep_connected_on():
+                self.retry_pending = False
+                self.quiet_retry = False
+                return
+            self.retry_timer.start(self.reconnect_delay() * 1000)
+
+    def reconnect(self):
+        """Manual Reconnect button: drop whatever is there and connect again right now."""
+        self.retry_timer.stop()
+        self.retry_pending = False
+        self.quiet_retry = False
+        self.fail_count = 0
+        RUN_LOG.write("ENCODER", f"{self.stream_name}: manual reconnect.")
+        if self.process is not None:
+            self._teardown()
+        self.state = "offline"
+        fallback = self.fallback_getter() if self.fallback_getter else None
+        self.user_stopped = False
+        self.start(self.mixer_ref, fallback)
 
     def _teardown(self):
         self.poll_timer.stop()
@@ -4977,7 +5152,14 @@ class EncoderSlot(QObject):
                 pass
 
     def stop(self):
+        self.retry_timer.stop()
+        was_waiting = self.retry_pending
+        self.retry_pending = False
+        self.quiet_retry = False
+        self.fail_count = 0
         if self.state == "offline" and self.process is None:
+            if was_waiting:
+                self.set_state("offline", "stopped")
             return
         self.user_stopped = True
         self._teardown()
@@ -5018,6 +5200,9 @@ class EncoderSlot(QObject):
         except Exception as e:
             self.message.emit(f"{self.stream_name}: could not update the now-playing text ({e}).")
 
+
+STALL_SECONDS = 10
+SERVER_CHECK_SECONDS = 30
 
 STATE_TEXT = {"offline": "Offline", "connecting": "Connecting", "live": "LIVE"}
 STATE_COLOR = {"offline": COLOR_TEXT_DIM, "connecting": COLOR_WARNING_AMBER, "live": COLOR_ON_AIR_GREEN}
@@ -5075,6 +5260,20 @@ class EncoderSlotWidget(QWidget):
         self.bitrate_edit = QLineEdit(self.slot.bitrate_kbps)
         layout.addRow("Bitrate (kbps):", self.bitrate_edit)
 
+        self.keep_check = QCheckBox("Keep connected (reconnect automatically if the stream drops)")
+        self.keep_check.setChecked(self.slot.keep_connected_on())
+        self.keep_check.setAccessibleName(f"Encoder {self.slot.slot_number} keep connected")
+        layout.addRow(self.keep_check)
+
+        self.reconnect_spin = QSpinBox()
+        self.reconnect_spin.setRange(0, 3600)
+        try:
+            self.reconnect_spin.setValue(int(float(self.slot.reconnect_seconds)))
+        except Exception:
+            self.reconnect_spin.setValue(10)
+        self.reconnect_spin.setAccessibleName(f"Encoder {self.slot.slot_number} reconnect after seconds, 0 reconnects right away")
+        layout.addRow("Reconnect after (seconds, 0 = right away):", self.reconnect_spin)
+
         self.server_password_edit = QLineEdit(self.slot.server_password)
         self.server_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.server_password_edit.setAccessibleName(f"Encoder {self.slot.slot_number} Shoutcast admin password")
@@ -5117,6 +5316,11 @@ class EncoderSlotWidget(QWidget):
         self.stop_btn.clicked.connect(lambda: self.bank.stop_slot(self.slot))
         summary_row.addWidget(self.stop_btn)
 
+        self.reconnect_btn = QPushButton("Reconnect")
+        self.reconnect_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.reconnect_btn.clicked.connect(lambda: self.bank.reconnect_slot(self.slot))
+        summary_row.addWidget(self.reconnect_btn)
+
         self.remove_btn = QPushButton("Remove")
         self.remove_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         self.remove_btn.clicked.connect(lambda: self.bank.remove_slot(self))
@@ -5144,6 +5348,7 @@ class EncoderSlotWidget(QWidget):
         self.start_btn.setAccessibleName(f"Start streaming {name}")
         self.stop_btn.setAccessibleName(f"Stop streaming {name}")
         self.remove_btn.setAccessibleName(f"Remove {name}")
+        self.reconnect_btn.setAccessibleName(f"Reconnect {name}")
         self.state_label.setAccessibleName(f"{name} status")
 
     def set_collapsed(self, collapsed):
@@ -5168,6 +5373,8 @@ class EncoderSlotWidget(QWidget):
         self.slot.bitrate_kbps = self.bitrate_edit.text().strip() or "128"
         self.slot.server_password = self.server_password_edit.text()
         self.slot.source_password = self.source_password_edit.text()
+        self.slot.keep_connected = "true" if self.keep_check.isChecked() else "false"
+        self.slot.reconnect_seconds = str(self.reconnect_spin.value())
         self.summary_label.setText(self.slot.summary_text())
         self.refresh_accessible_names()
         self.bank.save_all()
@@ -5176,13 +5383,17 @@ class EncoderSlotWidget(QWidget):
         self.edit_btn.setFocus()
 
     def on_state_changed(self, slot, state, reason):
-        self.state_label.setText(STATE_TEXT.get(state, state))
+        shown = STATE_TEXT.get(state, state)
+        if state == "offline" and getattr(slot, "retry_pending", False):
+            shown = "Offline, reconnecting"
+        self.state_label.setText(shown)
         self.state_label.setStyleSheet(
             f"color: {STATE_COLOR.get(state, COLOR_TEXT_DIM)}; font-weight: bold;")
         busy = state != "offline"
         self.start_btn.setEnabled(not busy)
-        self.stop_btn.setEnabled(busy)
+        self.stop_btn.setEnabled(busy or bool(getattr(slot, "retry_pending", False)))
         self.remove_btn.setEnabled(not busy)
+        self.reconnect_btn.setEnabled(True)
 
 
 class EncoderBankWidget(QWidget):
@@ -5236,6 +5447,8 @@ class EncoderBankWidget(QWidget):
         slot = EncoderSlot(len(self.slots) + 1)
         if data:
             slot.load_dict(data)
+        slot.mixer_ref = self.mixer
+        slot.fallback_getter = self.get_fallback_source
         slot.message.connect(self.on_status)
         slot.state_changed.connect(self.on_slot_state_changed)
         widget = EncoderSlotWidget(slot, self)
@@ -5261,7 +5474,15 @@ class EncoderBankWidget(QWidget):
         self.on_slot_state_changed(slot, "offline", "removed")
 
     def start_slot(self, slot):
+        slot.mixer_ref = self.mixer
+        slot.fallback_getter = self.get_fallback_source
+        slot.fail_count = 0
         slot.start(self.mixer, self.get_fallback_source())
+
+    def reconnect_slot(self, slot):
+        slot.mixer_ref = self.mixer
+        slot.fallback_getter = self.get_fallback_source
+        slot.reconnect()
 
     def stop_slot(self, slot):
         slot.stop()
@@ -11964,6 +12185,9 @@ class BroadcastingApp(QWidget):
         elif state == "connecting":
             self.encoder_problems.pop(slot, None)
             self.update_status(f"{name} is connecting.")
+        elif getattr(slot, "quiet_retry", False) and previous in ("offline", "connecting"):
+            # A retry attempt that failed again: already announced the drop once, stay quiet.
+            self.encoder_problems[slot] = reason
         else:
             if reason in ("stopped", "removed", ""):
                 self.encoder_problems.pop(slot, None)
@@ -12257,6 +12481,7 @@ if __name__ == "__main__":
         write_icon_file(_target)
         sys.exit(0)
     install_crash_guard()
+    disable_power_throttling()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)      # hiding to the system tray must not end the program
     try:
