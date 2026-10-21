@@ -2109,8 +2109,26 @@ def set_crossfade_overlap(enabled):
     _OVERLAP[0] = CROSSFADE_OVERLAP_SECONDS if enabled else 0.0
 FIT_WINDOW_SECONDS = 720          # start fitting this long before the mark
 FIT_MIN_SECONDS = 75              # too close to the mark to fit anything
-FIT_GOOD_ENOUGH_EARLY = 12        # ending up to this many seconds early counts as on time
+FIT_GOOD_ENOUGH_EARLY = 5         # ending up to this many seconds early counts as on time (setting: fit_early_seconds)
 FIT_GOOD_ENOUGH_LATE = 2
+FIT_MIN_SONG_SECONDS = 180        # songs shorter than this are only used to fit when nothing longer will do
+_FIT_EARLY = [FIT_GOOD_ENOUGH_EARLY]
+_FIT_MIN_SONG = [FIT_MIN_SONG_SECONDS]
+
+
+def fit_early_limit():
+    return _FIT_EARLY[0]
+
+
+def fit_min_song():
+    return _FIT_MIN_SONG[0]
+
+
+def set_fit_options(early_seconds=None, min_song_seconds=None):
+    if early_seconds is not None:
+        _FIT_EARLY[0] = max(0.0, float(early_seconds))
+    if min_song_seconds is not None:
+        _FIT_MIN_SONG[0] = max(0.0, float(min_song_seconds))
 
 
 def is_voice_marker(entry):
@@ -2387,7 +2405,7 @@ class BreakMarks:
 # --- fitting the end of the hour ---
 
 def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=None,
-                sample=70):
+                sample=70, use_min_song=True):
     """Picks 1 to max_songs songs whose combined length (less the crossfade overlaps) comes closest to
     `gap` seconds, preferring to end a little early rather than late. Returns (songs, score) where the
     score is how far off it lands (lower is better), or (None, None)."""
@@ -2399,6 +2417,13 @@ def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=Non
     if len(pool) > 400:
         pool = random.sample(pool, 400)
     lengths = {p: duration(p) for p in pool}
+    minimum = fit_min_song() if use_min_song else 0
+    narrowed = False
+    if minimum > 0:
+        long_enough = [p for p in pool if lengths[p] >= minimum]
+        if len(long_enough) >= 30:          # keep the pool wide enough to find an exact fit
+            pool = long_enough
+            narrowed = True
 
     def score(total):
         diff = gap - total
@@ -2433,7 +2458,7 @@ def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=Non
             else:
                 hi -= 1
     # three songs: first song from a random sample, best pair for the rest
-    if max_songs >= 3 and (best[1] is None or best[1] > FIT_GOOD_ENOUGH_EARLY):
+    if max_songs >= 3 and (best[1] is None or best[1] > min(2.0, fit_early_limit())):
         firsts = random.sample(ordered, min(sample, len(ordered)))
         for first in firsts:
             rest_target = gap - lengths[first] + 2 * overlap
@@ -2455,6 +2480,11 @@ def choose_fill(gap, candidates, duration, artist=None, max_songs=3, overlap=Non
                     lo += 1
                 else:
                     hi -= 1
+    if narrowed and (best[1] is None or best[1] > fit_early_limit()):
+        # The longer songs alone could not land it; let the shorter ones help.
+        wide = choose_fill(gap, candidates, duration, artist, max_songs, overlap, sample, use_min_song=False)
+        if wide[1] is not None and (best[1] is None or wide[1] < best[1]):
+            best = wide
     return best
 
 
@@ -2486,7 +2516,7 @@ def plan_hour_end(queue_songs, gap, candidates, duration, artist=None):
         return None
     used, natural = natural_fit(queue_songs, gap, duration)
     overshoot = timeline_length(used, duration) - gap
-    if natural <= FIT_GOOD_ENOUGH_EARLY and overshoot <= FIT_GOOD_ENOUGH_LATE:
+    if natural <= fit_early_limit() and overshoot <= FIT_GOOD_ENOUGH_LATE:
         return None
     songs, score = choose_fill(gap, candidates, duration, artist)
     if songs is None or score >= natural:
@@ -3037,6 +3067,7 @@ class RotationEngine:
         self.next_track_cued = False
 
         self.apply_crossfade_setting()
+        self.apply_fit_options()
         self.separation_seconds = self.separation_from_settings()
         self.play_history = PersistentPlayHistory(settings, max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS))
         self.passed = []                  # songs of this hour already aired or skipped: [(path, "played" or "skipped")]
@@ -3364,6 +3395,13 @@ class RotationEngine:
         found = [p for p in self._fit_pool[1]
                  if p not in busy and p not in queued
                  and not self.play_history.violates_separation(p, self.separation_seconds)]
+        if len(found) < 25:
+            # A small rotation: the separation rule leaves too few songs to fit with. Add the ones that
+            # played longest ago, the same way the normal pick relaxes the rule.
+            have = set(found)
+            extra = [p for p in self._fit_pool[1] if p not in busy and p not in queued and p not in have]
+            extra.sort(key=lambda p: self.play_history.last_played_track.get(p, 0))
+            found = found + extra[:60]
         rotor = getattr(self, "folder_rotor", None)
         rotation = self.rotation_library.find(rotation_id) if self.rotation_library else None
         if rotor is not None and rotation is not None and len(found) > 60:
@@ -3386,7 +3424,15 @@ class RotationEngine:
                 best = candidate
         return best
 
-    def fit_before_mark(self, now=None, force_mark=False):
+    def apply_fit_options(self):
+        try:
+            early = float(self.settings.value("fit_early_seconds", FIT_GOOD_ENOUGH_EARLY))
+            shortest = float(self.settings.value("fit_min_song_seconds", FIT_MIN_SONG_SECONDS))
+        except Exception:
+            early, shortest = FIT_GOOD_ENOUGH_EARLY, FIT_MIN_SONG_SECONDS
+        set_fit_options(early, shortest)
+
+    def fit_before_mark(self, now=None, force_mark=False, remaining_override=None):
         """Called just before the next song is chosen. When the mark is near, the queued songs are swapped
         for ones that finish exactly on it, so the last song is never faded out. Voice tracked hours and
         hand-placed songs are never touched. Returns the replacement songs, or None."""
@@ -3396,7 +3442,9 @@ class RotationEngine:
         now = now or datetime.now()
         live = self.get_live_deck()
         remaining = 0.0
-        if live.current_track_path:
+        if remaining_override is not None:
+            remaining = float(remaining_override)
+        elif live.current_track_path:
             try:
                 remaining = max(0.0, (live.player.duration() - live.player.position()) / 1000.0)
             except Exception:
@@ -3608,7 +3656,8 @@ class RotationEngine:
         if self.break_target is None or self.break_started:
             return False
         seconds_to_mark = (self.break_target - datetime.now()).total_seconds()
-        if self.break_style() == "fade_at_mark" and seconds_to_mark > self.QUICK_BREAK_FADE_SECONDS + 1:
+        early_limit = max(self.QUICK_BREAK_FADE_SECONDS + 1, fit_early_limit())
+        if self.break_style() == "fade_at_mark" and seconds_to_mark > early_limit:
             return False        # not time yet: the song ends, the next one starts, and the break comes in at the mark
         if seconds_to_mark >= 0:
             self.on_status(f"Song finishing {int(seconds_to_mark)} seconds before the mark: starting the break now.")
@@ -3917,6 +3966,11 @@ class RotationEngine:
         if self.is_running:
             self.on_status("Rotation resuming, fading music back in.")
             live_deck = self.get_live_deck()
+            try:
+                # The break is over and its real length is known: fit the songs up to the next mark now.
+                self.fit_before_mark(remaining_override=0.0)
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
             next_track = self.pick_next_valid_track()
             if next_track is None:
                 self.on_status("Music library is empty. Rotation halted.")
@@ -4831,6 +4885,9 @@ class EncoderSlot(QObject):
         self.user_stopped = False
         self.keep_connected = "true"
         self.reconnect_seconds = "10"
+        self.reconnect_on_start = "false"     # connect again when the program starts, if it was live when it closed
+        self.was_live = "false"               # set by Start Streaming, cleared by Stop Streaming; a restart leaves it
+        self.boot_retry_until = 0.0
         self.mixer_ref = None
         self.fallback_getter = None
         self.last_write = 0.0
@@ -4855,7 +4912,7 @@ class EncoderSlot(QObject):
     # --- persistence ---
     FIELDS = ("stream_name", "protocol", "server_host", "server_port", "mount_point",
               "username", "server_password", "source_password", "audio_format", "bitrate_kbps",
-              "keep_connected", "reconnect_seconds")
+              "keep_connected", "reconnect_seconds", "reconnect_on_start", "was_live")
 
     def to_dict(self):
         return {name: getattr(self, name) for name in self.FIELDS}
@@ -5089,10 +5146,11 @@ class EncoderSlot(QObject):
         self.fail_count += 1
         RUN_LOG.write("ENCODER", f"{self.stream_name}: dropped ({reason}).")
         auth = any(word in reason.lower() for word in self.AUTH_WORDS)
-        will_retry = self.keep_connected_on() and not self.user_stopped and not auth
+        starting_up = time.monotonic() < self.boot_retry_until      # the network may still be coming up after a restart
+        will_retry = (self.keep_connected_on() or starting_up) and not self.user_stopped and not auth
         self.retry_pending = will_retry
         self.set_state("offline", reason)
-        if auth and self.keep_connected_on():
+        if auth and (self.keep_connected_on() or starting_up):
             self.message.emit(f"{self.stream_name}: the server refused the login, so it will not retry. "
                               f"Check the username and password.")
             self.quiet_retry = False
@@ -5112,7 +5170,7 @@ class EncoderSlot(QObject):
         fallback = self.fallback_getter() if self.fallback_getter else None
         if not self.start(mixer, fallback):
             self.fail_count += 1
-            if self.validate() or not self.keep_connected_on():
+            if self.validate() or not (self.keep_connected_on() or time.monotonic() < self.boot_retry_until):
                 self.retry_pending = False
                 self.quiet_retry = False
                 return
@@ -5274,6 +5332,11 @@ class EncoderSlotWidget(QWidget):
         self.reconnect_spin.setAccessibleName(f"Encoder {self.slot.slot_number} reconnect after seconds, 0 reconnects right away")
         layout.addRow("Reconnect after (seconds, 0 = right away):", self.reconnect_spin)
 
+        self.restart_check = QCheckBox("Reconnect when the program starts, if this stream was live when it closed")
+        self.restart_check.setChecked(str(self.slot.reconnect_on_start).lower() == "true")
+        self.restart_check.setAccessibleName(f"Encoder {self.slot.slot_number} reconnect when the program starts")
+        layout.addRow(self.restart_check)
+
         self.server_password_edit = QLineEdit(self.slot.server_password)
         self.server_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.server_password_edit.setAccessibleName(f"Encoder {self.slot.slot_number} Shoutcast admin password")
@@ -5316,11 +5379,6 @@ class EncoderSlotWidget(QWidget):
         self.stop_btn.clicked.connect(lambda: self.bank.stop_slot(self.slot))
         summary_row.addWidget(self.stop_btn)
 
-        self.reconnect_btn = QPushButton("Reconnect")
-        self.reconnect_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        self.reconnect_btn.clicked.connect(lambda: self.bank.reconnect_slot(self.slot))
-        summary_row.addWidget(self.reconnect_btn)
-
         self.remove_btn = QPushButton("Remove")
         self.remove_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         self.remove_btn.clicked.connect(lambda: self.bank.remove_slot(self))
@@ -5348,7 +5406,6 @@ class EncoderSlotWidget(QWidget):
         self.start_btn.setAccessibleName(f"Start streaming {name}")
         self.stop_btn.setAccessibleName(f"Stop streaming {name}")
         self.remove_btn.setAccessibleName(f"Remove {name}")
-        self.reconnect_btn.setAccessibleName(f"Reconnect {name}")
         self.state_label.setAccessibleName(f"{name} status")
 
     def set_collapsed(self, collapsed):
@@ -5375,6 +5432,7 @@ class EncoderSlotWidget(QWidget):
         self.slot.source_password = self.source_password_edit.text()
         self.slot.keep_connected = "true" if self.keep_check.isChecked() else "false"
         self.slot.reconnect_seconds = str(self.reconnect_spin.value())
+        self.slot.reconnect_on_start = "true" if self.restart_check.isChecked() else "false"
         self.summary_label.setText(self.slot.summary_text())
         self.refresh_accessible_names()
         self.bank.save_all()
@@ -5393,7 +5451,6 @@ class EncoderSlotWidget(QWidget):
         self.start_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy or bool(getattr(slot, "retry_pending", False)))
         self.remove_btn.setEnabled(not busy)
-        self.reconnect_btn.setEnabled(True)
 
 
 class EncoderBankWidget(QWidget):
@@ -5477,14 +5534,22 @@ class EncoderBankWidget(QWidget):
         slot.mixer_ref = self.mixer
         slot.fallback_getter = self.get_fallback_source
         slot.fail_count = 0
+        slot.was_live = "true"
+        self.save_all()
         slot.start(self.mixer, self.get_fallback_source())
 
-    def reconnect_slot(self, slot):
-        slot.mixer_ref = self.mixer
-        slot.fallback_getter = self.get_fallback_source
-        slot.reconnect()
+    def resume_saved(self):
+        """After a restart: connect again every stream that is set to, and was live when the program closed."""
+        for slot in self.slots:
+            if str(slot.reconnect_on_start).lower() == "true" and str(slot.was_live).lower() == "true" and slot.state == "offline":
+                RUN_LOG.write("ENCODER", f"{slot.stream_name}: was live when the program closed, connecting again.")
+                slot.boot_retry_until = time.monotonic() + 300
+                self.start_slot(slot)
 
     def stop_slot(self, slot):
+        slot.was_live = "false"
+        slot.boot_retry_until = 0.0
+        self.save_all()
         slot.stop()
 
     def push_metadata(self, meta):
@@ -9608,6 +9673,8 @@ class BroadcastingApp(QWidget):
         # is built and shown in the queue right away (nothing starts playing by itself).
         if self.setup_complete() and self.rotation_library.rotations:
             QTimer.singleShot(1500, lambda: self.ensure_hour_playlists(force=True))
+        QTimer.singleShot(6000, self.encoder_bank.resume_saved)
+        QTimer.singleShot(8000, self.resume_after_start)
 
         RUN_LOG.write("START", "Ready to show.")
         self.console_timer = QTimer()
@@ -9701,7 +9768,7 @@ class BroadcastingApp(QWidget):
             "automation_toggle": self.automation_toggle,
             "stop_fade": self.stop_with_fade,
             "start_rotation": self.start_rotation,
-            "stop_rotation": self.rotation.stop,
+            "stop_rotation": self.stop_everything,
             "mute_all": self.toggle_mute,
             "open_options": self.open_options,
             "toggle_recording": self.toggle_recording,
@@ -10867,7 +10934,7 @@ class BroadcastingApp(QWidget):
         add(file_menu, "insert_tracks", "Insert tracks into the queue", self.insert_tracks)
         add(file_menu, "automation_toggle", "Automation on or off", self.automation_toggle)
         add(file_menu, "stop_fade", "Stop with fade (the record stays on the deck)", self.stop_with_fade)
-        add(file_menu, "stop_rotation", "Stop everything at once", self.rotation.stop)
+        add(file_menu, "stop_rotation", "Stop everything at once", self.stop_everything)
         add(file_menu, "mute_all", "Mute or unmute all audio", self.toggle_mute)
         add(file_menu, "toggle_recording", "Start or stop recording", self.toggle_recording)
         add(file_menu, "open_options", "Open or close Settings", self.open_options)
@@ -10987,6 +11054,31 @@ class BroadcastingApp(QWidget):
             self.show_remembered()
         if str(self.settings.value("autoplay_on_boot", "false")).lower() == "true":
             QTimer.singleShot(8000, self.autoplay_after_boot)
+
+    def remember_automation(self, on):
+        """Only the person's own choice is saved, so a restart or a shutdown never changes it."""
+        try:
+            self.settings.setValue("automation_last_on", "true" if on else "false")
+        except Exception:
+            pass
+
+    def resume_after_start(self):
+        """Puts the speakers and automation back the way they were when the program closed."""
+        try:
+            if str(self.settings.value("speakers_muted", "false")).lower() == "true" and not self.is_muted:
+                self.toggle_mute()
+            wanted = (str(self.settings.value("resume_automation", "true")).lower() != "false"
+                      and str(self.settings.value("automation_last_on", "false")).lower() == "true")
+            if wanted and not self.rotation.is_running:
+                RUN_LOG.write("START", "Automation was on when the program closed; turning it back on.")
+                self.announce("Automation was on when the program closed. Turning it back on.")
+                self.start_rotation()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def stop_everything(self):
+        self.remember_automation(False)
+        self.rotation.stop()
 
     def autoplay_after_boot(self):
         if self.rotation.is_running:
@@ -11498,6 +11590,18 @@ class BroadcastingApp(QWidget):
         self.fit_quarter_check = QCheckBox("Do the same before the :15, :30 and :45 breaks")
         self.fit_quarter_check.setChecked(str(self.settings.value("fit_quarter_marks", "true")).lower() != "false")
         layout.addWidget(self.fit_quarter_check)
+        fit_form = QFormLayout()
+        self.fit_early_spin = QSpinBox()
+        self.fit_early_spin.setRange(0, 15)
+        self.fit_early_spin.setValue(int(float(self.settings.value("fit_early_seconds", FIT_GOOD_ENOUGH_EARLY))))
+        self.fit_early_spin.setAccessibleName("Start a break up to this many seconds early instead of fading")
+        fit_form.addRow("Start a break up to this many seconds early (instead of fading the song):", self.fit_early_spin)
+        self.fit_min_song_spin = QSpinBox()
+        self.fit_min_song_spin.setRange(0, 600)
+        self.fit_min_song_spin.setValue(int(float(self.settings.value("fit_min_song_seconds", FIT_MIN_SONG_SECONDS))))
+        self.fit_min_song_spin.setAccessibleName("Shortest song used when fitting a break, in seconds")
+        fit_form.addRow("Shortest song used when fitting a break (seconds):", self.fit_min_song_spin)
+        layout.addLayout(fit_form)
         save_btn = QPushButton("Save Settings")
         save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save_btn.clicked.connect(self.save_audio_settings)
@@ -11929,6 +12033,9 @@ class BroadcastingApp(QWidget):
         self.autoplay_check = QCheckBox("When it starts with Windows, begin playing automatically")
         self.autoplay_check.setChecked(str(self.settings.value("autoplay_on_boot", "false")).lower() == "true")
         layout_a.addRow(self.autoplay_check)
+        self.resume_automation_check = QCheckBox("When the program starts, turn automation back on if it was on when the program closed")
+        self.resume_automation_check.setChecked(str(self.settings.value("resume_automation", "true")).lower() != "false")
+        layout_a.addRow(self.resume_automation_check)
 
         layout_a.addRow(self.live_mix_check)
 
@@ -11985,7 +12092,7 @@ class BroadcastingApp(QWidget):
         layout_a.addRow(stop_fade_btn)
         stop_all_btn = QPushButton("Stop Everything At Once (Ctrl+Shift+S)")
         stop_all_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        stop_all_btn.clicked.connect(self.rotation.stop)
+        stop_all_btn.clicked.connect(self.stop_everything)
         layout_a.addRow(stop_all_btn)
 
         generate_btn = QPushButton("Generate Playlists Now (Ctrl+Shift+G)")
@@ -12280,6 +12387,10 @@ class BroadcastingApp(QWidget):
         """Mutes this computer's speakers only. The stream encoders, the recording and the microphone feed
         keep the full program."""
         self.is_muted = not self.is_muted
+        try:
+            self.settings.setValue("speakers_muted", "true" if self.is_muted else "false")
+        except Exception:
+            pass
         self.rotation.set_muted(self.is_muted)
         self.sequence_player.set_muted(self.is_muted)
         self.microphone.set_muted(self.is_muted)
@@ -12412,14 +12523,17 @@ class BroadcastingApp(QWidget):
             return
         self.ensure_hour_playlists()
         self.rotation.start()
+        self.remember_automation(self.rotation.automation_on)
 
     def automation_toggle(self):
         """A: automation on (the first song goes onto the deck) or off (the song on air finishes)."""
         if self.rotation.automation_on:
             self.rotation.automation_off()
+            self.remember_automation(False)
             self.announce("Automation off. The song on air will finish.")
         else:
             self.start_rotation()
+            self.remember_automation(self.rotation.automation_on)
         self.refresh_queue_list()
 
     def stop_with_fade(self):
@@ -12434,6 +12548,7 @@ class BroadcastingApp(QWidget):
                 pass
             self.on_sequence_changed()
         self.rotation.stop_with_fade()
+        self.remember_automation(False)
         self.announce("Stopping. Fading out.")
         self.refresh_queue_list()
 
@@ -12442,6 +12557,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("output_device", self.output_combo.currentText())
         self.settings.setValue("start_in_tray", "true" if self.start_in_tray_check.isChecked() else "false")
         self.settings.setValue("autoplay_on_boot", "true" if self.autoplay_check.isChecked() else "false")
+        self.settings.setValue("resume_automation", "true" if self.resume_automation_check.isChecked() else "false")
         self.settings.setValue("top_hour_ads", "true" if self.top_hour_ads_check.isChecked() else "false")
         self.settings.setValue("use_live_mix", "true" if self.live_mix_check.isChecked() else "false")
         self.settings.setValue("playlist_mode", self.playlist_mode_combo.currentData())
@@ -12456,6 +12572,9 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("separation_hours", self.separation_spin.value())
         self.settings.setValue("fit_end_of_hour", "true" if self.fit_hour_check.isChecked() else "false")
         self.settings.setValue("fit_quarter_marks", "true" if self.fit_quarter_check.isChecked() else "false")
+        self.settings.setValue("fit_early_seconds", self.fit_early_spin.value())
+        self.settings.setValue("fit_min_song_seconds", self.fit_min_song_spin.value())
+        self.rotation.apply_fit_options()
         self.settings.setValue("break_estimate_seconds", self.break_estimate_spin.value())
         self.settings.setValue("voice_slot_seconds", self.voice_slot_spin.value())
         self.settings.setValue("break_item_gap_ms", self.break_gap_spin.value())
