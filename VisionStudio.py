@@ -1137,8 +1137,9 @@ def pretty_folder_name(folder_name):
 
 
 class MusicRotation:
-    def __init__(self, name, folder, recursive=True, auto=False, rotation_id=None, regular=True):
+    def __init__(self, name, folder, recursive=True, auto=False, rotation_id=None, regular=True, mix=False):
         self.id = rotation_id or uuid.uuid4().hex[:8]
+        self.mix = mix              # the one rotation over the whole music folder: every folder feeds every hour
         self.regular = regular      # part of the everyday schedule; holiday music is not until you schedule it
         self.name = name
         self.folder = folder
@@ -1147,13 +1148,13 @@ class MusicRotation:
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "folder": self.folder,
-                "recursive": self.recursive, "auto": self.auto, "regular": self.regular}
+                "recursive": self.recursive, "auto": self.auto, "regular": self.regular, "mix": self.mix}
 
     @staticmethod
     def from_dict(data):
         return MusicRotation(data.get("name", "Rotation"), data.get("folder", ""),
                              bool(data.get("recursive", True)), bool(data.get("auto", False)),
-                             data.get("id"), bool(data.get("regular", True)))
+                             data.get("id"), bool(data.get("regular", True)), bool(data.get("mix", False)))
 
     def track_paths(self):
         return scan_audio_files(self.folder, self.recursive)
@@ -1302,10 +1303,27 @@ class RotationLibrary:
             self._changed("added" if added else "removed")
         return added, removed
 
+    def ensure_mix(self, root):
+        """The "All Volumes (mixed)" rotation: the whole music folder in one rotation, so the folder rotor can
+        give each of the (74) folders its turn in every hour. Made once, and kept pointing at the music folder."""
+        mix = next((r for r in self.rotations if getattr(r, "mix", False)), None)
+        if not root or not os.path.isdir(root):
+            return mix
+        if mix is None:
+            mix = MusicRotation(self.unique_name("All Volumes (mixed)"), root, True, auto=False, regular=False, mix=True)
+            self.rotations.append(mix)
+            self.save()
+        elif os.path.normcase(os.path.normpath(mix.folder)) != os.path.normcase(os.path.normpath(root)):
+            mix.folder = root
+            self.save()
+        return mix
+
     def detect_new_files(self):
         """Compares every rotation's folder with the last look. Returns {rotation_id: [new files]}."""
         result = {}
         for rotation in self.rotations:
+            if getattr(rotation, "mix", False):
+                continue                      # its songs already show up under their own volumes
             current = set(rotation.track_paths())
             previous = self.known_files.get(rotation.id)
             self.known_files[rotation.id] = current
@@ -1356,11 +1374,25 @@ class RotationSchedule:
         self.tracking = True
 
     # --- every volume gets a turn ---
-    def rotate_enabled(self):
+    def hour_mode(self):
+        """'mix' (default): every hour mixes all folders. 'volume': one volume per hour, every volume in turn.
+        'fixed': the schedule exactly as set."""
         try:
-            return str(self.settings.value("rotate_all_volumes", "true")).lower() != "false"
+            mode = str(self.settings.value("hour_mode", ""))
+            if mode in ("mix", "volume", "fixed"):
+                return mode
+            if str(self.settings.value("rotate_all_volumes", "true")).lower() == "false":
+                return "fixed"
         except Exception:
-            return True
+            pass
+        return "mix"
+
+    def rotate_enabled(self):
+        return self.hour_mode() != "fixed"
+
+    def mix_id(self):
+        mix = next((r for r in self.library.rotations if getattr(r, "mix", False)), None)
+        return mix.id if mix is not None else None
 
     def save_pins(self):
         try:
@@ -1436,6 +1468,8 @@ class RotationSchedule:
         return pick
 
     def usage_lines(self):
+        if self.hour_mode() == "mix" and self.mix_id():
+            return ["Every hour mixes all the folders, the ones that have waited longest first."]
         ids = self.regular_ids()
         st = self.state()
         names = {r.id: r.name for r in self.library.rotations}
@@ -1489,6 +1523,8 @@ class RotationSchedule:
             if event is not None and event.get("rotation_id") and self.library.find(event["rotation_id"]):
                 return event["rotation_id"]
         if self.rotate_enabled() and (hour % 24) not in self.pinned:
+            if self.hour_mode() == "mix" and self.mix_id():
+                return self.mix_id()
             return self.planned_id(day, hour)
         return self.hours[hour % 24]
 
@@ -1863,7 +1899,12 @@ class PlaylistGenerator:
                            marker=HOUR_MARKER_TOKEN, voice=False, signoff=False, break_seconds=0):
         """About an hour of tracks, starting with an hour marker. virtual_clock is advanced in place.
         The songs are chosen so the last one finishes at the end of the hour (less the breaks)."""
-        separation = DEFAULT_SEPARATION_SECONDS if separation is None else separation
+        rules = ProgramRules(self.settings)
+        if separation is None:
+            song_sep = rules.values["song_minutes"] * 60 if rules.enabled else 0
+            artist_sep = rules.values["artist_minutes"] * 60 if rules.enabled else 0
+        else:
+            song_sep = artist_sep = separation
         if rotation is None:
             pool = []
         elif rotation.id in self._pool_cache:
@@ -1887,8 +1928,8 @@ class PlaylistGenerator:
             last = last_track.get(candidate)
             artist = self._artist(candidate)
             a_last = last_artist.get(artist) if artist else None
-            return ((last is None or virtual_clock[0] - last >= separation) and
-                    (a_last is None or virtual_clock[0] - a_last >= separation))
+            return ((last is None or virtual_clock[0] - last >= song_sep) and
+                    (a_last is None or virtual_clock[0] - a_last >= artist_sep))
 
         while filled < target and guard < 5000:
             guard += 1
@@ -1927,8 +1968,8 @@ class PlaylistGenerator:
                     last = last_track.get(candidate)
                     artist = self._artist(candidate)
                     a_last = last_artist.get(artist) if artist else None
-                    if (last is None or virtual_clock[0] - last >= separation) and \
-                       (a_last is None or virtual_clock[0] - a_last >= separation):
+                    if (last is None or virtual_clock[0] - last >= song_sep) and \
+                       (a_last is None or virtual_clock[0] - a_last >= artist_sep):
                         chosen_index = i
                         break
                 if chosen_index is None:
@@ -2924,9 +2965,12 @@ def primary_artist(artist):
 
 
 RULE_PRESETS = {
-    "live365": {"window_hours": 3, "artist_max": 4, "artist_run": 3, "album_max": 3, "album_run": 2},
+    # The US webcasting limits Live365 publishes. A played song waits 45 minutes (the shortest hold Live365's
+    # AutoDJ offers); the artist and album limits do the rest, so there is no fixed two hour hold.
+    "live365": {"window_hours": 3, "artist_max": 4, "artist_run": 3, "album_max": 3, "album_run": 2,
+                "song_minutes": 45, "artist_minutes": 0},
 }
-RULE_KEYS = ("window_hours", "artist_max", "artist_run", "album_max", "album_run")
+RULE_KEYS = ("window_hours", "artist_max", "artist_run", "album_max", "album_run", "song_minutes", "artist_minutes")
 
 
 class ProgramRules:
@@ -2953,7 +2997,8 @@ class ProgramRules:
         if self.preset == "custom":
             for key in RULE_KEYS:
                 try:
-                    self.values[key] = max(1, int(float(s.value("rules_" + key, base[key]))))
+                    low = 0 if key in ("song_minutes", "artist_minutes") else 1
+                    self.values[key] = max(low, int(float(s.value("rules_" + key, base[key]))))
                 except Exception:
                     self.values[key] = base[key]
 
@@ -2961,10 +3006,11 @@ class ProgramRules:
     def enabled(self):
         return self.preset != "off"
 
-    def keep_seconds(self, separation_seconds):
-        return max(separation_seconds, self.values["window_hours"] * 3600, 4 * 3600) + 600
+    def keep_seconds(self, separation_seconds=0):
+        longest = max(self.values["song_minutes"], self.values["artist_minutes"]) * 60
+        return max(separation_seconds, longest, self.values["window_hours"] * 3600, 4 * 3600) + 600
 
-    def check(self, path, history, separation_seconds, planned=(), now=None):
+    def check(self, path, history, planned=(), now=None):
         """Returns '' when the song may play, or the reason it may not."""
         if not self.enabled or not is_song_entry(path):
             return ""
@@ -2972,7 +3018,9 @@ class ProgramRules:
         artist, album, title = track_tags(path)
         artist = primary_artist(artist)
         window = self.values["window_hours"] * 3600
-        horizon = max(window, separation_seconds)
+        song_hold = self.values["song_minutes"] * 60
+        artist_hold = self.values["artist_minutes"] * 60
+        horizon = max(window, song_hold, artist_hold)
         seq = [(t, p) for p, t in history.last_played_track.items()
                if now - t < horizon and is_song_entry(p) and p != path]
         seq.sort(key=lambda item: item[0])
@@ -2980,8 +3028,8 @@ class ProgramRules:
             if is_song_entry(p) and p != path:
                 seq.append((now, p))
         own_key = (artist, title)
-        if path in history.last_played_track and now - history.last_played_track[path] < separation_seconds:
-            return "the same song played less than the separation time ago"
+        if song_hold and path in history.last_played_track and now - history.last_played_track[path] < song_hold:
+            return "the same song played too recently"
         if any(p == path for p in planned):
             return "the same song is already queued ahead"
         same_artist_songs = set()
@@ -2989,11 +3037,11 @@ class ProgramRules:
         for t, p in seq:
             pa, pal, pt = track_tags(p)
             pa = primary_artist(pa)
-            if title and pt == title and pa == artist and now - t < separation_seconds:
-                return "the same song played less than the separation time ago"
+            if song_hold and title and pt == title and pa == artist and now - t < song_hold:
+                return "the same song played too recently"
             if artist and pa == artist:
-                if now - t < separation_seconds:
-                    return "the same artist played less than the separation time ago"
+                if artist_hold and now - t < artist_hold:
+                    return "the same artist played too recently"
                 if now - t < window:
                     same_artist_songs.add(pt or p)
             if album and pal == album and now - t < window:
@@ -3726,7 +3774,7 @@ class RotationEngine:
 
     def rule_problem(self, path, planned=()):
         try:
-            return self.rules.check(path, self.play_history, self.separation_seconds, planned)
+            return self.rules.check(path, self.play_history, planned)
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
             return ""
@@ -3740,7 +3788,7 @@ class RotationEngine:
         seen = set()
         owner = {}
         if self.rotation_library is not None:
-            for rotation in self.rotation_library.rotations:
+            for rotation in sorted(self.rotation_library.rotations, key=lambda r: bool(getattr(r, "mix", False))):
                 try:
                     for p in rotation.track_paths():
                         if p not in seen:
@@ -9965,6 +10013,10 @@ class BroadcastingApp(QWidget):
             self.settings.setValue("autoplay_on_boot", "false")
             self.settings.setValue("startup_defaults_v2", "done")
         self.rotation_library = RotationLibrary(self.settings, on_changed=self.on_rotations_changed)
+        _mode = str(self.settings.value("hour_mode", ""))
+        if _mode == "mix" or (_mode not in ("volume", "fixed")
+                              and str(self.settings.value("rotate_all_volumes", "true")).lower() != "false"):
+            self.rotation_library.ensure_mix(str(self.settings.value("music_library_folder", "")))
         self.rotation_schedule = RotationSchedule(self.settings, self.rotation_library)
         self.category_library = CategoryLibrary(self.settings, on_changed=self.on_categories_changed)
         self.playlist_generator = PlaylistGenerator(self.settings, self.rotation_library, self.rotation_schedule)
@@ -12007,7 +12059,9 @@ class BroadcastingApp(QWidget):
                   ("artist_max", "Most different songs by one artist in the window:", 1, 20),
                   ("artist_run", "Most songs by one artist in a row:", 1, 10),
                   ("album_max", "Most different songs from one album in the window:", 1, 20),
-                  ("album_run", "Most songs from one album in a row:", 1, 10))
+                  ("album_run", "Most songs from one album in a row:", 1, 10),
+                  ("song_minutes", "Hold a played song back for (minutes, 0 = no hold):", 0, 600),
+                  ("artist_minutes", "Hold a played artist back for (minutes, 0 = only the limits above):", 0, 600))
         saved = ProgramRules(self.settings)
         for key, text, low, high in labels:
             spin = QSpinBox()
@@ -12021,10 +12075,15 @@ class BroadcastingApp(QWidget):
         self.rules_preset_combo.setCurrentIndex(max(0, index))
         self.rules_preset_combo.currentIndexChanged.connect(self.on_rules_preset_changed)
         layout.addLayout(form)
-        self.rotate_volumes_check = QCheckBox("Give every volume a turn: the hours follow one round through all volumes, "
-                                              "and the ones that have waited longest, or never played, come first")
-        self.rotate_volumes_check.setChecked(str(self.settings.value("rotate_all_volumes", "true")).lower() != "false")
-        layout.addWidget(self.rotate_volumes_check)
+        mode_form = QFormLayout()
+        self.hour_mode_combo = QComboBox()
+        self.hour_mode_combo.addItem("Mix all the folders in every hour (recommended)", "mix")
+        self.hour_mode_combo.addItem("One volume per hour, every volume takes a turn", "volume")
+        self.hour_mode_combo.addItem("Use the schedule exactly as set", "fixed")
+        self.hour_mode_combo.setAccessibleName("How the hours use the folders")
+        self.hour_mode_combo.setCurrentIndex(max(0, self.hour_mode_combo.findData(self.rotation_schedule.hour_mode())))
+        mode_form.addRow("How the hours use the folders:", self.hour_mode_combo)
+        layout.addLayout(mode_form)
         save_btn = QPushButton("Save Rules")
         save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save_btn.clicked.connect(self.save_rules)
@@ -12055,8 +12114,11 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("rules_preset", preset)
         for key, spin in self.rules_spins.items():
             self.settings.setValue("rules_" + key, spin.value())
-        self.settings.setValue("rotate_all_volumes", "true" if self.rotate_volumes_check.isChecked() else "false")
+        self.settings.setValue("hour_mode", self.hour_mode_combo.currentData())
+        if self.hour_mode_combo.currentData() == "mix":
+            self.rotation_library.ensure_mix(str(self.settings.value("music_library_folder", "")))
         self.rotation.apply_separation_setting()
+        self.rotation.check_rotation_for_hour()
         try:
             self.schedule_tab.refresh()
         except Exception:
@@ -12667,7 +12729,7 @@ class BroadcastingApp(QWidget):
             self.separation_spin.setValue(int(float(self.settings.value("separation_hours", 2))))
         except Exception:
             self.separation_spin.setValue(2)
-        layout_a.addRow("Hours before a played song or artist can play again:", self.separation_spin)
+        # The hold-back times now live in Programming Rules (this old spin box is no longer shown).
         self.break_estimate_spin = QSpinBox()
         self.break_estimate_spin.setRange(0, 600)
         self.break_estimate_spin.setAccessibleName("Estimated seconds one break takes, used when building an hour")
@@ -13019,6 +13081,7 @@ class BroadcastingApp(QWidget):
             self.settings.setValue("setup_complete", "true")
             self._rescan_in_progress = False
             self.rotation_library.sync_from_root(folder)
+            self.rotation_library.ensure_mix(folder)
             self.rotation_schedule.regenerate_even()
             self.rotation_library.detect_new_files()
             self.rotations_tab.refresh()
