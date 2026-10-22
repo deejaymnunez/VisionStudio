@@ -2765,6 +2765,179 @@ def day_folder_report(rotation_library, rotor, day, playlist_files):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Programming rules: the US webcasting limits Live365 publishes, kept strict.
+# ---------------------------------------------------------------------------
+
+_TAG_CACHE = {}
+
+
+def track_tags(path):
+    """(artist, album, title), lowercased, read once per file. Blank when a tag is missing."""
+    if path in _TAG_CACHE:
+        return _TAG_CACHE[path]
+    artist = album = title = ""
+    if MUTAGEN_AVAILABLE and path and os.path.isfile(path):
+        try:
+            audio = mutagen.File(path, easy=True)
+            if audio and audio.tags:
+                def first(key):
+                    values = audio.tags.get(key)
+                    return values[0].strip().lower() if values else ""
+                artist, album, title = first("artist"), first("album"), first("title")
+        except Exception:
+            pass
+    _TAG_CACHE[path] = (artist, album, title)
+    return _TAG_CACHE[path]
+
+
+def primary_artist(artist):
+    """'ariana grande feat. mac miller' counts as Ariana Grande for the same-artist limits."""
+    return re.split(r"\s+(?:feat\.?|ft\.?|featuring|with)\s+|\s*[,;/]\s*|\s+&\s+|\s+and\s+", artist or "", maxsplit=1)[0].strip()
+
+
+RULE_PRESETS = {
+    "live365": {"window_hours": 3, "artist_max": 4, "artist_run": 3, "album_max": 3, "album_run": 2},
+}
+RULE_KEYS = ("window_hours", "artist_max", "artist_run", "album_max", "album_run")
+
+
+class ProgramRules:
+    """
+    Checks a song against what already played (and what is queued ahead of it):
+      - the same song, or the same artist, is held back for `separation_seconds` (the Hours setting);
+      - within the window (3 hours), no more than `artist_max` different songs by one artist and `album_max`
+        from one album, and no more than `artist_run` / `album_run` of them in a row (the US webcasting
+        performance complement that Live365 publishes).
+    A song that fails is never played and never relaxed; the engine borrows another that passes.
+    """
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.load()
+
+    def load(self):
+        s = self.settings
+        self.preset = str(s.value("rules_preset", "live365"))
+        if self.preset not in ("live365", "custom", "off"):
+            self.preset = "live365"
+        base = RULE_PRESETS["live365"]
+        self.values = dict(base)
+        if self.preset == "custom":
+            for key in RULE_KEYS:
+                try:
+                    self.values[key] = max(1, int(float(s.value("rules_" + key, base[key]))))
+                except Exception:
+                    self.values[key] = base[key]
+
+    @property
+    def enabled(self):
+        return self.preset != "off"
+
+    def keep_seconds(self, separation_seconds):
+        return max(separation_seconds, self.values["window_hours"] * 3600, 4 * 3600) + 600
+
+    def check(self, path, history, separation_seconds, planned=(), now=None):
+        """Returns '' when the song may play, or the reason it may not."""
+        if not self.enabled or not is_song_entry(path):
+            return ""
+        now = time.time() if now is None else now
+        artist, album, title = track_tags(path)
+        artist = primary_artist(artist)
+        window = self.values["window_hours"] * 3600
+        horizon = max(window, separation_seconds)
+        seq = [(t, p) for p, t in history.last_played_track.items()
+               if now - t < horizon and is_song_entry(p) and p != path]
+        seq.sort(key=lambda item: item[0])
+        for offset, p in enumerate(planned):
+            if is_song_entry(p) and p != path:
+                seq.append((now, p))
+        own_key = (artist, title)
+        if path in history.last_played_track and now - history.last_played_track[path] < separation_seconds:
+            return "the same song played less than the separation time ago"
+        if any(p == path for p in planned):
+            return "the same song is already queued ahead"
+        same_artist_songs = set()
+        same_album_songs = set()
+        for t, p in seq:
+            pa, pal, pt = track_tags(p)
+            pa = primary_artist(pa)
+            if title and pt == title and pa == artist and now - t < separation_seconds:
+                return "the same song played less than the separation time ago"
+            if artist and pa == artist:
+                if now - t < separation_seconds:
+                    return "the same artist played less than the separation time ago"
+                if now - t < window:
+                    same_artist_songs.add(pt or p)
+            if album and pal == album and now - t < window:
+                same_album_songs.add(pt or p)
+        if artist and len(same_artist_songs | {title or path}) > self.values["artist_max"]:
+            return f"more than {self.values['artist_max']} different songs by the same artist in {self.values['window_hours']} hours"
+        if album and len(same_album_songs | {title or path}) > self.values["album_max"]:
+            return f"more than {self.values['album_max']} different songs from the same album in {self.values['window_hours']} hours"
+        run_artist = run_album = 0
+        # runs: count back from the newest song while the artist (or album) keeps matching
+        for t, p in reversed(seq):
+            pa, _pal, _pt = track_tags(p)
+            if artist and primary_artist(pa) == artist:
+                run_artist += 1
+            else:
+                break
+        for t, p in reversed(seq):
+            _pa, pal, _pt = track_tags(p)
+            if album and pal == album:
+                run_album += 1
+            else:
+                break
+        if run_artist + 1 > self.values["artist_run"]:
+            return f"more than {self.values['artist_run']} songs by the same artist in a row"
+        if run_album + 1 > self.values["album_run"]:
+            return f"more than {self.values['album_run']} songs from the same album in a row"
+        return ""
+
+
+def build_library_report(rotations, rules):
+    """A plain text report: files with missing artist, title or album tags, and any album that has more songs in
+    one volume than the album limit allows in the window. `rotations` is a list of (name, [paths])."""
+    lines = [f"Library report, {time.strftime('%A %B %d %Y %H:%M')}", "",
+             f"Rules in force: {'off' if not rules.enabled else rules.preset}. "
+             f"At most {rules.values['artist_max']} different songs by one artist and {rules.values['album_max']} from one album "
+             f"in {rules.values['window_hours']} hours; no more than {rules.values['artist_run']} by one artist and "
+             f"{rules.values['album_run']} from one album in a row.", ""]
+    totals = {"files": 0, "no_artist": 0, "no_album": 0, "no_title": 0, "crowded": 0}
+    for name, paths in rotations:
+        albums = Counter()
+        missing = []
+        for p in paths:
+            artist, album, title = track_tags(p)
+            totals["files"] += 1
+            gaps = []
+            if not artist:
+                totals["no_artist"] += 1
+                gaps.append("artist")
+            if not album:
+                totals["no_album"] += 1
+                gaps.append("album")
+            if not title:
+                totals["no_title"] += 1
+                gaps.append("title")
+            if gaps:
+                missing.append(f"    {os.path.basename(p)}: no {', '.join(gaps)}")
+            if album:
+                albums[album] += 1
+        crowded = [(a, n) for a, n in albums.items() if n > rules.values["album_max"]]
+        lines.append(f"{name}: {len(paths)} songs")
+        for a, n in sorted(crowded, key=lambda x: -x[1]):
+            totals["crowded"] += 1
+            lines.append(f"    Album \"{a}\" has {n} songs in this volume; only {rules.values['album_max']} may play in "
+                         f"{rules.values['window_hours']} hours, so the rest are borrowed or skipped.")
+        lines.extend(missing)
+    lines += ["", f"{totals['files']} songs checked: {totals['no_artist']} without an artist tag, "
+                  f"{totals['no_title']} without a title, {totals['no_album']} without an album tag, "
+                  f"{totals['crowded']} albums over the album limit inside one volume."]
+    return lines, totals
+
+
 
 # ---------------------------------------------------------------------------
 # OctiMax-style stream processor: two-band AGC -> five-band compressor ->
@@ -3069,7 +3242,10 @@ class RotationEngine:
         self.apply_crossfade_setting()
         self.apply_fit_options()
         self.separation_seconds = self.separation_from_settings()
-        self.play_history = PersistentPlayHistory(settings, max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS))
+        self.rules = ProgramRules(settings)
+        self.play_history = PersistentPlayHistory(settings, self.rules.keep_seconds(self.separation_seconds))
+        self.pick_problem = ""
+        self._borrow_cache = (0.0, [])
         self.passed = []                  # songs of this hour already aired or skipped: [(path, "played" or "skipped")]
         self.passed_hour = None
         self.replaceable = set()          # queued songs the end-of-hour fit may swap (playlist songs, not hand-placed ones)
@@ -3123,7 +3299,8 @@ class RotationEngine:
 
     def apply_separation_setting(self):
         self.separation_seconds = self.separation_from_settings()
-        self.play_history.keep_seconds = max(self.separation_seconds, DEFAULT_SEPARATION_SECONDS)
+        self.rules.load()
+        self.play_history.keep_seconds = self.rules.keep_seconds(self.separation_seconds)
 
     # --- deck helpers ---
     def get_live_deck(self):
@@ -3392,16 +3569,11 @@ class RotationEngine:
             self._fit_pool = (rotation_id, rotation.track_paths() if rotation else [])
         busy = {self.deck_a.current_track_path, self.deck_b.current_track_path}
         queued = set(self.shuffled_queue) - set(prefix)
-        found = [p for p in self._fit_pool[1]
-                 if p not in busy and p not in queued
-                 and not self.play_history.violates_separation(p, self.separation_seconds)]
-        if len(found) < 25:
-            # A small rotation: the separation rule leaves too few songs to fit with. Add the ones that
-            # played longest ago, the same way the normal pick relaxes the rule.
-            have = set(found)
-            extra = [p for p in self._fit_pool[1] if p not in busy and p not in queued and p not in have]
-            extra.sort(key=lambda p: self.play_history.last_played_track.get(p, 0))
-            found = found + extra[:60]
+        pool = list(self._fit_pool[1])
+        if len(pool) < 60:
+            have = set(pool)
+            pool += [p for p in self.borrow_pool() if p not in have][:250]      # a small volume: borrow from the others
+        found = [p for p in pool if p not in busy and p not in queued and not self.rule_problem(p)]
         rotor = getattr(self, "folder_rotor", None)
         rotation = self.rotation_library.find(rotation_id) if self.rotation_library else None
         if rotor is not None and rotation is not None and len(found) > 60:
@@ -3409,6 +3581,65 @@ class RotationEngine:
             waited = sorted(found, key=lambda p: rotor.last_scheduled(rotation.id, folder_group(p, rotation.folder)))
             found = waited[:max(40, int(len(found) * 0.7))]
         return found
+
+    def warm_up(self):
+        """Reads every song's tags once, in the background, so the rules can check any song at once."""
+        try:
+            for path in self.borrow_pool():
+                track_tags(path)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def rule_problem(self, path, planned=()):
+        try:
+            return self.rules.check(path, self.play_history, self.separation_seconds, planned)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            return ""
+
+    def borrow_pool(self):
+        """Every song of every rotation (refreshed every ten minutes), for when the hour's own volume runs short."""
+        now = time.time()
+        if now - self._borrow_cache[0] < 600 and self._borrow_cache[1]:
+            return self._borrow_cache[1]
+        found = []
+        seen = set()
+        if self.rotation_library is not None:
+            for rotation in self.rotation_library.rotations:
+                try:
+                    for p in rotation.track_paths():
+                        if p not in seen:
+                            seen.add(p)
+                            found.append(p)
+                except Exception:
+                    pass
+        if not found:
+            try:
+                found = list(scan_audio_files(self.get_library_folder()))
+            except Exception:
+                found = []
+        self._borrow_cache = (now, found)
+        return found
+
+    def borrow_track(self):
+        """A song that passes every rule, preferring the active volume, then whatever has waited longest."""
+        busy = {self.deck_a.current_track_path, self.deck_b.current_track_path}
+        queued = set(self.shuffled_queue)
+        pool = [p for p in self.borrow_pool() if p not in busy and p not in queued]
+        random.shuffle(pool)
+        own = set()
+        if self.rotation_library is not None and self.active_rotation_id:
+            rotation = self.rotation_library.find(self.active_rotation_id)
+            if rotation is not None:
+                own = set(self._fit_pool[1]) if self._fit_pool[0] == self.active_rotation_id else set(rotation.track_paths())
+        last = self.play_history.last_played_track
+        pool.sort(key=lambda p: (0 if p in own else 1, last.get(p, 0)))
+        for candidate in pool[:900]:
+            if not self.rule_problem(candidate):
+                where = "this volume" if candidate in own else "another volume"
+                RUN_LOG.write("RULES", f"Borrowed from {where} so no rule is broken: {os.path.basename(candidate)}")
+                return candidate
+        return None
 
     def is_replaceable(self, item):
         return is_song_entry(item) and (item in self.replaceable or item not in self.pinned_tracks)
@@ -3459,7 +3690,23 @@ class RotationEngine:
             prefix.append(item)
         if not prefix:
             return None
-        replacement = plan_hour_end(prefix, gap, self.fit_candidates(prefix), get_track_duration, get_track_artist)
+        candidates = self.fit_candidates(prefix)
+        replacement = None
+        for _attempt in range(5):
+            replacement = plan_hour_end(prefix, gap, candidates, get_track_duration, get_track_artist)
+            if not replacement:
+                return None
+            planned = []
+            bad = None
+            for song in replacement:
+                if self.rule_problem(song, planned):
+                    bad = song
+                    break
+                planned.append(song)
+            if bad is None:
+                break
+            candidates = [c for c in candidates if c != bad]      # that combination breaks a rule: try again without it
+            replacement = None
         if not replacement:
             return None
         del self.shuffled_queue[:len(prefix)]
@@ -3715,7 +3962,7 @@ class RotationEngine:
         self.on_status(f"Automation is on, {count} track(s) in the queue. The first song goes onto Deck {target_name}.")
         first_track = self.pick_next_valid_track()
         if first_track is None:
-            self.on_status("Music library is empty. Automation stopped.")
+            self.on_status(f"{self.pick_problem or 'Music library is empty'}. Automation stopped.")
             self.is_running = False
             self.automation_on = False
             return
@@ -3792,20 +4039,31 @@ class RotationEngine:
             if self.build_shuffled_queue() == 0:
                 return None
         chosen = None
+        self.pick_problem = ""
         for i, candidate in enumerate(self.shuffled_queue):
             if is_hour_marker(candidate):
                 continue
-            if candidate in self.pinned_tracks or not self.play_history.violates_separation(
-                    candidate, self.separation_seconds):
+            if candidate in self.pinned_tracks:
+                chosen = self.shuffled_queue.pop(i)
+                reason = self.rule_problem(chosen)
+                if reason:
+                    RUN_LOG.write("RULES", f"Played as placed by hand, although {reason}: {os.path.basename(chosen)}")
+                break
+            reason = self.rule_problem(candidate)
+            if not reason:
                 chosen = self.shuffled_queue.pop(i)
                 break
+            logged = self.__dict__.setdefault("_rule_logged", set())
+            if candidate not in logged:
+                logged.add(candidate)
+                RUN_LOG.write("RULES", f"Skipped {os.path.basename(candidate)}: {reason}.")
         if chosen is None:
-            self.on_status("Separation rule relaxed: no track available that fully satisfies it.")
-            real = [c for c in self.shuffled_queue if not is_hour_marker(c)]
-            if not real:
+            # Nothing queued may play. The rules are never relaxed: borrow a song from another volume that passes.
+            chosen = self.borrow_track()
+            if chosen is None:
+                self.pick_problem = "No song in the library can play without breaking the programming rules"
+                RUN_LOG.write("RULES", self.pick_problem + ".")
                 return None
-            chosen = real[0]
-            self.shuffled_queue.remove(chosen)
         self.pinned_tracks.discard(chosen)
         self.replaceable.discard(chosen)
         self._queue_changed()
@@ -3821,7 +4079,7 @@ class RotationEngine:
             _log_exception(type(e), e, e.__traceback__)
         next_track = self.pick_next_valid_track()
         if next_track is None:
-            self.on_status("Music library is empty. Rotation halted.")
+            self.on_status(f"{self.pick_problem or 'Music library is empty'}. Rotation halted.")
             self.is_running = False
             return
         cued_deck = self.get_cued_deck()
@@ -3885,10 +4143,9 @@ class RotationEngine:
             return cued_deck.current_track_path
         real = [c for c in self.shuffled_queue if not is_hour_marker(c)]
         for candidate in real:
-            if candidate in self.pinned_tracks or not self.play_history.violates_separation(
-                    candidate, self.separation_seconds):
+            if candidate in self.pinned_tracks or not self.rule_problem(candidate):
                 return candidate
-        return real[0] if real else None
+        return None
 
     def on_position_changed(self, position_ms, deck):
         if deck.name != self.live_deck_name:
@@ -3973,7 +4230,7 @@ class RotationEngine:
                 _log_exception(type(e), e, e.__traceback__)
             next_track = self.pick_next_valid_track()
             if next_track is None:
-                self.on_status("Music library is empty. Rotation halted.")
+                self.on_status(f"{self.pick_problem or 'Music library is empty'}. Rotation halted.")
                 self.is_running = False
                 return
             self.play_history.record_play(next_track)
@@ -9674,6 +9931,8 @@ class BroadcastingApp(QWidget):
         if self.setup_complete() and self.rotation_library.rotations:
             QTimer.singleShot(1500, lambda: self.ensure_hour_playlists(force=True))
         QTimer.singleShot(6000, self.encoder_bank.resume_saved)
+        self.report_ready.connect(self.on_library_report_ready)
+        QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
 
         RUN_LOG.write("START", "Ready to show.")
@@ -11572,6 +11831,103 @@ class BroadcastingApp(QWidget):
                 return True
         return False
 
+    report_ready = pyqtSignal(str)
+
+    def build_rules_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("These rules keep the programming inside the US webcasting limits that Live365 publishes, and they are "
+                       "never relaxed: a song that would break a rule is skipped, and another song that passes is borrowed "
+                       "from the rest of the library. The hours a song and its artist are held back are set in General. "
+                       "Change the numbers here if your station is licensed another way.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.rules_preset_combo = QComboBox()
+        self.rules_preset_combo.addItem("Live365 (US webcasting limits)", "live365")
+        self.rules_preset_combo.addItem("Custom (use the numbers below)", "custom")
+        self.rules_preset_combo.addItem("Off (no checks at all)", "off")
+        self.rules_preset_combo.setAccessibleName("Programming rules preset")
+        form.addRow("Preset:", self.rules_preset_combo)
+        self.rules_spins = {}
+        labels = (("window_hours", "Window, in hours:", 1, 12),
+                  ("artist_max", "Most different songs by one artist in the window:", 1, 20),
+                  ("artist_run", "Most songs by one artist in a row:", 1, 10),
+                  ("album_max", "Most different songs from one album in the window:", 1, 20),
+                  ("album_run", "Most songs from one album in a row:", 1, 10))
+        saved = ProgramRules(self.settings)
+        for key, text, low, high in labels:
+            spin = QSpinBox()
+            spin.setRange(low, high)
+            spin.setValue(saved.values[key])
+            spin.setAccessibleName(text.rstrip(":"))
+            spin.valueChanged.connect(self.on_rules_value_edited)
+            self.rules_spins[key] = spin
+            form.addRow(text, spin)
+        index = self.rules_preset_combo.findData(saved.preset)
+        self.rules_preset_combo.setCurrentIndex(max(0, index))
+        self.rules_preset_combo.currentIndexChanged.connect(self.on_rules_preset_changed)
+        layout.addLayout(form)
+        save_btn = QPushButton("Save Rules")
+        save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save_btn.clicked.connect(self.save_rules)
+        layout.addWidget(save_btn)
+        report_btn = QPushButton("Check the Library Tags and Albums")
+        report_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        report_btn.clicked.connect(self.start_library_report)
+        layout.addWidget(report_btn)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return page
+
+    def on_rules_preset_changed(self, *_args):
+        if self.rules_preset_combo.currentData() == "live365":
+            for key, spin in self.rules_spins.items():
+                spin.blockSignals(True)
+                spin.setValue(RULE_PRESETS["live365"][key])
+                spin.blockSignals(False)
+
+    def on_rules_value_edited(self, *_args):
+        if self.rules_preset_combo.currentData() == "live365":
+            self.rules_preset_combo.blockSignals(True)
+            self.rules_preset_combo.setCurrentIndex(self.rules_preset_combo.findData("custom"))
+            self.rules_preset_combo.blockSignals(False)
+
+    def save_rules(self):
+        preset = self.rules_preset_combo.currentData()
+        self.settings.setValue("rules_preset", preset)
+        for key, spin in self.rules_spins.items():
+            self.settings.setValue("rules_" + key, spin.value())
+        self.rotation.apply_separation_setting()
+        RUN_LOG.write("RULES", f"Programming rules saved: {preset}.")
+        self.announce("Programming rules saved." if preset != "off" else "Programming rules saved. They are off.")
+
+    def start_library_report(self):
+        self.announce("Checking the library tags. This takes a moment.")
+        threading.Thread(target=self._library_report_worker, daemon=True).start()
+
+    def _library_report_worker(self):
+        path = ""
+        try:
+            rotations = [(r.name, r.track_paths()) for r in self.rotation_library.rotations]
+            if not rotations:
+                rotations = [("Music library", scan_audio_files(self.settings.value("music_library_folder", "")))]
+            lines, totals = build_library_report(rotations, self.rotation.rules)
+            folder = get_reports_folder()
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime("library-report-%Y-%m-%d.txt"))
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            self._library_report_summary = lines[-1]
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            self._library_report_summary = "The library report could not be written."
+        self.report_ready.emit(path)
+
+    def on_library_report_ready(self, path):
+        text = getattr(self, "_library_report_summary", "")
+        self.announce(f"{text} Saved to {path}" if path else text)
+
     def build_crossfade_tab(self):
         page = QWidget()
         layout = QVBoxLayout()
@@ -12199,12 +12555,13 @@ class BroadcastingApp(QWidget):
         self.crossfade_tab = self.build_crossfade_tab()
         self.version_tab = self.build_version_tab()
         self.folder_tab = self.build_folder_tab()
+        self.rules_tab = self.build_rules_tab()
         sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
