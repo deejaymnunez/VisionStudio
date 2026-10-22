@@ -5343,7 +5343,7 @@ class EncoderSlot(QObject):
         self.user_stopped = False
         self.keep_connected = "true"
         self.reconnect_seconds = "10"
-        self.reconnect_on_start = "false"     # connect again when the program starts, if it was live when it closed
+        self.reconnect_on_start = "true"     # connect again when the program starts, if it was live when it closed
         self.was_live = "false"               # set by Start Streaming, cleared by Stop Streaming; a restart leaves it
         self.boot_retry_until = 0.0
         self.mixer_ref = None
@@ -5923,6 +5923,16 @@ class EncoderBankWidget(QWidget):
         self.slot_widgets = []
         self.setup_ui()
         self.restore_slots()
+        if str(self.settings.value("encoder_reconnect_default_v1", "")) != "done":
+            # One time: reconnect after a restart becomes the starting point for every encoder
+            for slot, widget in zip(self.slots, self.slot_widgets):
+                slot.reconnect_on_start = "true"
+                try:
+                    widget.restart_check.setChecked(True)
+                except Exception:
+                    pass
+            self.save_all()
+            self.settings.setValue("encoder_reconnect_default_v1", "done")
 
     def setup_ui(self):
         outer_layout = QVBoxLayout()
@@ -10012,6 +10022,19 @@ class BroadcastingApp(QWidget):
             self.settings.setValue("start_in_tray", "false")
             self.settings.setValue("autoplay_on_boot", "false")
             self.settings.setValue("startup_defaults_v2", "done")
+        if str(self.settings.value("live365_defaults_v1", "")) != "done":
+            # One time: the Live365 build becomes the starting point. Folders, encoders, passwords and schedules are left alone.
+            for key, value in (("rules_preset", "live365"), ("hour_mode", "mix"), ("fit_end_of_hour", "true"),
+                               ("fit_quarter_marks", "true"), ("fit_early_seconds", FIT_GOOD_ENOUGH_EARLY),
+                               ("fit_late_seconds", FIT_GOOD_ENOUGH_LATE), ("fit_min_song_seconds", FIT_MIN_SONG_SECONDS),
+                               ("resume_automation", "true")):
+                self.settings.setValue(key, value)
+            for key in RULE_KEYS:
+                try:
+                    self.settings.remove("rules_" + key)
+                except Exception:
+                    pass
+            self.settings.setValue("live365_defaults_v1", "done")
         self.rotation_library = RotationLibrary(self.settings, on_changed=self.on_rotations_changed)
         _mode = str(self.settings.value("hour_mode", ""))
         if _mode == "mix" or (_mode not in ("volume", "fixed")
@@ -11909,9 +11932,10 @@ class BroadcastingApp(QWidget):
     def build_break_deck_column(self, deck_name):
         """Decks C and D: the jingle, the ad break and the closing jingle alternate between them."""
         column = QVBoxLayout()
-        title = QLabel(f"Deck {deck_name} (jingles and ads)")
+        title = QLabel(f"Deck {deck_name}")
+        title.setAccessibleName(f"Deck {deck_name}, for jingles and ads")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold;")
+        title.setStyleSheet(f"color: {COLOR_TEXT_BRIGHT}; font-weight: bold; font-size: 14px;")
         column.addWidget(title)
         vinyl = VinylWidget(deck_name)
         column.addWidget(vinyl, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -11920,6 +11944,13 @@ class BroadcastingApp(QWidget):
         live_indicator.setAccessibleName(f"Deck {deck_name} on-air indicator")
         live_indicator.setStyleSheet(f"color: {COLOR_LIVE_RED}; font-weight: bold;")
         column.addWidget(live_indicator)
+        artwork_label = QLabel("No\nArtwork")
+        artwork_label.setFixedSize(ARTWORK_PLACEHOLDER_SIZE, ARTWORK_PLACEHOLDER_SIZE)
+        artwork_label.setAccessibleName(f"Deck {deck_name}: artwork")
+        artwork_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        artwork_label.setStyleSheet(
+            f"background-color: {COLOR_PANEL_DARK}; border-radius: 6px; border: 1px solid {COLOR_BORDER};")
+        column.addWidget(artwork_label, alignment=Qt.AlignmentFlag.AlignCenter)
         item_label = QLabel("(idle)")
         item_label.setAccessibleName(f"Deck {deck_name}: break item")
         item_label.setWordWrap(True)
@@ -11938,7 +11969,8 @@ class BroadcastingApp(QWidget):
         stop_btn.clicked.connect(lambda: self.sequence_player.stop_break())
         row.addWidget(stop_btn)
         column.addLayout(row)
-        self.break_deck_widgets[deck_name] = {"vinyl": vinyl, "live_indicator": live_indicator, "item_label": item_label}
+        self.break_deck_widgets[deck_name] = {"vinyl": vinyl, "live_indicator": live_indicator, "item_label": item_label,
+                                              "artwork_label": artwork_label}
         return column
 
     def refresh_break_decks(self):
@@ -11951,7 +11983,10 @@ class BroadcastingApp(QWidget):
             if sp.active and sp.item_index in mine:
                 widgets["live_indicator"].setText("● ON AIR")
                 widgets["item_label"].setText(os.path.basename(sp.items[sp.item_index]))
+                self.update_artwork_display(widgets["artwork_label"], sp.items[sp.item_index], f"Deck {name} artwork")
             else:
+                widgets["artwork_label"].setPixmap(QPixmap())
+                widgets["artwork_label"].setText("No\nArtwork")
                 widgets["live_indicator"].setText("")
                 waiting = [i for i in mine if i > sp.item_index]
                 widgets["item_label"].setText(f"Next: {os.path.basename(sp.items[waiting[0]])}" if waiting else "(idle)")
@@ -12332,14 +12367,6 @@ class BroadcastingApp(QWidget):
         self.tab_rotation = QWidget()
         layout_r = QVBoxLayout()
 
-        break_row = QHBoxLayout()
-        break_row.addStretch(1)
-        break_row.addLayout(self.build_break_deck_column("C"))
-        break_row.addSpacing(40)
-        break_row.addLayout(self.build_break_deck_column("D"))
-        break_row.addStretch(1)
-        layout_r.addLayout(break_row)
-
         player_display = QHBoxLayout()
         player_display.addLayout(self.build_deck_column("A"))
 
@@ -12435,6 +12462,13 @@ class BroadcastingApp(QWidget):
         player_display.addLayout(mixer_column, 1)
         player_display.addLayout(self.build_deck_column("B"))
         layout_r.addLayout(player_display)
+
+        # Decks C and D sit under A and B, built the same way and the same size
+        break_row = QHBoxLayout()
+        break_row.addLayout(self.build_break_deck_column("C"))
+        break_row.addStretch(1)
+        break_row.addLayout(self.build_break_deck_column("D"))
+        layout_r.addLayout(break_row)
 
         automation_hint = QLabel("Press A to turn automation on or off. Press S to fade out and stop. "
                                  "The buttons for these are in Settings (Ctrl+O). Press R to start or stop recording.")
