@@ -1317,28 +1317,146 @@ class RotationLibrary:
         return result
 
 
+class _Hours(list):
+    """The 24 hourly rotations. Setting one by hand pins that hour, so the automatic spread leaves it alone."""
+
+    def __init__(self, items, owner):
+        super().__init__(items)
+        self.owner = owner
+
+    def __setitem__(self, index, value):
+        super().__setitem__(index, value)
+        if getattr(self.owner, "tracking", False) and isinstance(index, int):
+            self.owner.pinned.add(index % 24)
+            self.owner.save_pins()
+            self.owner.save()
+
+
+VOLUME_ROTOR_KEY = "volume_rotor_json"
+PINNED_HOURS_KEY = "schedule_pinned_json"
+
+
 class RotationSchedule:
     """
-    A 24-hour schedule saying which rotation is live in each hour. It builds
-    itself: rotations are spread evenly round-robin across the day, and it
-    regenerates whenever rotations are added or removed.
+    A 24-hour schedule saying which rotation is live in each hour. Unless an hour has been set by hand, every
+    rotation (volume) takes a turn before any volume plays twice: the ones that have waited longest, or have
+    never played, come first, so no folder is left out for good. It regenerates whenever rotations change.
     """
 
     def __init__(self, settings, library):
         self.settings = settings
         self.library = library
-        self.hours = [None] * 24
+        self.tracking = False
+        self.pinned = set()
+        self.hours = _Hours([None] * 24, self)
         self.events = None          # the dated schedules (EventLibrary), set by the app
+        self._rotor = None
         self.load()
         self.ensure_valid()
+        self.tracking = True
+
+    # --- every volume gets a turn ---
+    def rotate_enabled(self):
+        try:
+            return str(self.settings.value("rotate_all_volumes", "true")).lower() != "false"
+        except Exception:
+            return True
+
+    def save_pins(self):
+        try:
+            self.settings.setValue(PINNED_HOURS_KEY, json.dumps(sorted(self.pinned)))
+        except Exception:
+            pass
+
+    def state(self):
+        if self._rotor is None:
+            try:
+                data = json.loads(str(self.settings.value(VOLUME_ROTOR_KEY, "{}")))
+                self._rotor = data if isinstance(data, dict) else {}
+            except Exception:
+                self._rotor = {}
+            for key, default in (("remaining", []), ("plan", {}), ("last", {}), ("count", {}), ("known", [])):
+                self._rotor.setdefault(key, default)
+            self._rotor.setdefault("rounds", 0)
+        return self._rotor
+
+    def save_state(self):
+        try:
+            self.settings.setValue(VOLUME_ROTOR_KEY, json.dumps(self.state()))
+        except Exception:
+            pass
+
+    def regular_ids(self):
+        ids = [r.id for r in self.library.rotations if getattr(r, "regular", True)]
+        return ids or [r.id for r in self.library.rotations]
+
+    def note_used(self, rotation_id, borrowed=False):
+        """A volume went on air for an hour (or had a song borrowed from it): it goes to the back of the line."""
+        st = self.state()
+        st["last"][rotation_id] = time.time()
+        if not borrowed:
+            st["count"][rotation_id] = int(st["count"].get(rotation_id, 0)) + 1
+        self.save_state()
+
+    def volume_last_used(self, rotation_id):
+        return float(self.state()["last"].get(rotation_id, 0))
+
+    def planned_id(self, day, hour):
+        """The volume for that hour: planned once, in order, and remembered."""
+        fallback = self.hours[hour % 24]
+        ids = self.regular_ids()
+        if not ids:
+            return fallback
+        now = datetime.now()
+        if day < now.date() or (day == now.date() and hour < now.hour):
+            return fallback            # an hour that has already gone by is not planned
+        st = self.state()
+        valid = set(r.id for r in self.library.rotations)
+        key = day.strftime("%Y%m%d") + f"{hour:02d}"
+        if st["plan"].get(key) in valid:
+            return st["plan"][key]
+        known = [i for i in st["known"] if i in valid]
+        remaining = [i for i in st["remaining"] if i in valid and i in ids]
+        for i in ids:
+            if i not in known:
+                known.append(i)
+                remaining.insert(0, i)          # a volume the program has not seen before goes first
+        if not remaining:
+            st["rounds"] = int(st["rounds"]) + 1
+            remaining = sorted(ids, key=lambda i: (int(st["count"].get(i, 0)), float(st["last"].get(i, 0)), random.random()))
+        previous = st["plan"].get((datetime.combine(day, datetime.min.time()) + timedelta(hours=hour - 1)).strftime("%Y%m%d%H"))
+        pick = next((i for i in remaining if i != previous), remaining[0])
+        remaining.remove(pick)
+        st["plan"][key] = pick
+        st["remaining"] = remaining
+        st["known"] = known
+        cutoff = (now - timedelta(days=3)).strftime("%Y%m%d00")
+        st["plan"] = {k: v for k, v in st["plan"].items() if k >= cutoff}
+        self.save_state()
+        return pick
+
+    def usage_lines(self):
+        ids = self.regular_ids()
+        st = self.state()
+        names = {r.id: r.name for r in self.library.rotations}
+        waiting = [names[i] for i in st["remaining"] if i in names]
+        never = [names[i] for i in ids if int(st["count"].get(i, 0)) == 0]
+        lines = [f"Volumes (rotations): {len(ids)}. Round {int(st['rounds'])}: {len(ids) - len(waiting)} have had their turn, "
+                 f"{len(waiting)} are still waiting.",
+                 f"Never on air yet: {len(never)}" + (f" ({', '.join(never[:12])}{', ...' if len(never) > 12 else ''})" if never else "") + "."]
+        return lines
 
     def load(self):
         try:
             data = json.loads(self.settings.value("schedule_json", "[]"))
             if isinstance(data, list) and len(data) == 24:
-                self.hours = data
+                self.hours = _Hours(data, self)
         except Exception:
             pass
+        try:
+            self.pinned = set(int(h) % 24 for h in json.loads(str(self.settings.value(PINNED_HOURS_KEY, "[]"))))
+        except Exception:
+            self.pinned = set()
 
     def save(self):
         try:
@@ -1349,7 +1467,9 @@ class RotationSchedule:
     def regenerate_even(self):
         ids = [r.id for r in self.library.rotations if getattr(r, "regular", True)]
         ids = ids or [r.id for r in self.library.rotations]
-        self.hours = [ids[h % len(ids)] if ids else None for h in range(24)]
+        self.hours = _Hours([ids[h % len(ids)] if ids else None for h in range(24)], self)
+        self.pinned = set()
+        self.save_pins()
         self.save()
 
     def ensure_valid(self):
@@ -1357,7 +1477,7 @@ class RotationSchedule:
         if any(h not in valid for h in self.hours) and valid:
             self.regenerate_even()
         elif not valid:
-            self.hours = [None] * 24
+            self.hours = _Hours([None] * 24, self)
 
     def rotation_id_for(self, day, hour):
         """The rotation for that hour on that day: a running dated schedule wins over the everyday one."""
@@ -1368,6 +1488,8 @@ class RotationSchedule:
                 event = None
             if event is not None and event.get("rotation_id") and self.library.find(event["rotation_id"]):
                 return event["rotation_id"]
+        if self.rotate_enabled() and (hour % 24) not in self.pinned:
+            return self.planned_id(day, hour)
         return self.hours[hour % 24]
 
     def rotation_id_for_hour(self, hour):
@@ -1380,7 +1502,7 @@ class RotationSchedule:
     def describe_day(self, current_hour):
         rows = []
         for hour in range(24):
-            rotation = self.library.find(self.hours[hour])
+            rotation = self.library.find(self.rotation_id_for(datetime.now().date(), hour))
             rows.append((hour_label(hour), rotation.name if rotation else "(none)", hour == current_hour))
         return rows
 
@@ -2727,7 +2849,7 @@ def folder_report(rotation, rotor=None, now=None):
     return "\n".join(lines)
 
 
-def day_folder_report(rotation_library, rotor, day, playlist_files):
+def day_folder_report(rotation_library, rotor, day, playlist_files, schedule=None):
     """The report saved with each day's playlists: every rotation's folders, plus how many songs of each
     folder went into that day's playlists."""
     used = {}
@@ -2749,6 +2871,11 @@ def day_folder_report(rotation_library, rotor, day, playlist_files):
                     break
     lines = [f"Folder report for the playlists of {day.strftime('%A %B %d, %Y')}",
              f"Made {time.strftime('%Y-%m-%d %I:%M %p')}", ""]
+    if schedule is not None:
+        try:
+            lines += schedule.usage_lines() + [""]
+        except Exception:
+            pass
     for rotation in rotation_library.rotations:
         lines.append(folder_report(rotation, rotor))
         counts = used.get(rotation.id)
@@ -3526,6 +3653,13 @@ class RotationEngine:
         if not files:
             return False
         old = self.rotation_library.find(self.active_rotation_id)
+        if old is None or old.id != new_id:
+            try:
+                self.rotation_schedule.note_used(new_id)
+                for line in self.rotation_schedule.usage_lines():
+                    RUN_LOG.write("ROTATE", f"{new.name} goes on air. {line}")
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
         self.active_rotation_id = new_id
         if not self.playlist_driven:
             random.shuffle(files)
@@ -3572,7 +3706,7 @@ class RotationEngine:
         pool = list(self._fit_pool[1])
         if len(pool) < 60:
             have = set(pool)
-            pool += [p for p in self.borrow_pool() if p not in have][:250]      # a small volume: borrow from the others
+            pool += [p for p in self.ranked_borrow_pool() if p not in have][:250]      # a small volume: borrow from the others, longest-waiting volumes first
         found = [p for p in pool if p not in busy and p not in queued and not self.rule_problem(p)]
         rotor = getattr(self, "folder_rotor", None)
         rotation = self.rotation_library.find(rotation_id) if self.rotation_library else None
@@ -3604,6 +3738,7 @@ class RotationEngine:
             return self._borrow_cache[1]
         found = []
         seen = set()
+        owner = {}
         if self.rotation_library is not None:
             for rotation in self.rotation_library.rotations:
                 try:
@@ -3611,6 +3746,7 @@ class RotationEngine:
                         if p not in seen:
                             seen.add(p)
                             found.append(p)
+                            owner[p] = rotation.id
                 except Exception:
                     pass
         if not found:
@@ -3618,25 +3754,42 @@ class RotationEngine:
                 found = list(scan_audio_files(self.get_library_folder()))
             except Exception:
                 found = []
+        self._borrow_owner = owner
         self._borrow_cache = (now, found)
         return found
+
+    def ranked_borrow_pool(self):
+        """The borrow pool with the volumes that have waited longest (or never played) first."""
+        pool = list(self.borrow_pool())
+        random.shuffle(pool)
+        owner = getattr(self, "_borrow_owner", {})
+        schedule = self.rotation_schedule
+        last = self.play_history.last_played_track
+
+        def wait_key(p):
+            volume = owner.get(p)
+            used = schedule.volume_last_used(volume) if (schedule is not None and volume) else 0.0
+            return (used, last.get(p, 0))
+        pool.sort(key=wait_key)
+        return pool
 
     def borrow_track(self):
         """A song that passes every rule, preferring the active volume, then whatever has waited longest."""
         busy = {self.deck_a.current_track_path, self.deck_b.current_track_path}
         queued = set(self.shuffled_queue)
-        pool = [p for p in self.borrow_pool() if p not in busy and p not in queued]
-        random.shuffle(pool)
+        pool = [p for p in self.ranked_borrow_pool() if p not in busy and p not in queued]
         own = set()
         if self.rotation_library is not None and self.active_rotation_id:
             rotation = self.rotation_library.find(self.active_rotation_id)
             if rotation is not None:
                 own = set(self._fit_pool[1]) if self._fit_pool[0] == self.active_rotation_id else set(rotation.track_paths())
-        last = self.play_history.last_played_track
-        pool.sort(key=lambda p: (0 if p in own else 1, last.get(p, 0)))
+        pool.sort(key=lambda p: 0 if p in own else 1)       # this volume first; the order inside each part is longest-waiting first
         for candidate in pool[:900]:
             if not self.rule_problem(candidate):
                 where = "this volume" if candidate in own else "another volume"
+                volume = getattr(self, "_borrow_owner", {}).get(candidate)
+                if volume and candidate not in own and self.rotation_schedule is not None:
+                    self.rotation_schedule.note_used(volume, borrowed=True)
                 RUN_LOG.write("RULES", f"Borrowed from {where} so no rule is broken: {os.path.basename(candidate)}")
                 return candidate
         return None
@@ -11008,7 +11161,7 @@ class BroadcastingApp(QWidget):
         try:
             folder = get_reports_folder()
             os.makedirs(folder, exist_ok=True)
-            text = day_folder_report(self.rotation_library, self.playlist_generator.rotor, day, files)
+            text = day_folder_report(self.rotation_library, self.playlist_generator.rotor, day, files, self.rotation_schedule)
             with open(os.path.join(folder, f"{day.strftime('%Y-%m-%d')}_folder_report.txt"), "w", encoding="utf-8") as handle:
                 handle.write(text)
         except Exception as e:
@@ -11868,6 +12021,10 @@ class BroadcastingApp(QWidget):
         self.rules_preset_combo.setCurrentIndex(max(0, index))
         self.rules_preset_combo.currentIndexChanged.connect(self.on_rules_preset_changed)
         layout.addLayout(form)
+        self.rotate_volumes_check = QCheckBox("Give every volume a turn: the hours follow one round through all volumes, "
+                                              "and the ones that have waited longest, or never played, come first")
+        self.rotate_volumes_check.setChecked(str(self.settings.value("rotate_all_volumes", "true")).lower() != "false")
+        layout.addWidget(self.rotate_volumes_check)
         save_btn = QPushButton("Save Rules")
         save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save_btn.clicked.connect(self.save_rules)
@@ -11898,7 +12055,12 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("rules_preset", preset)
         for key, spin in self.rules_spins.items():
             self.settings.setValue("rules_" + key, spin.value())
+        self.settings.setValue("rotate_all_volumes", "true" if self.rotate_volumes_check.isChecked() else "false")
         self.rotation.apply_separation_setting()
+        try:
+            self.schedule_tab.refresh()
+        except Exception:
+            pass
         RUN_LOG.write("RULES", f"Programming rules saved: {preset}.")
         self.announce("Programming rules saved." if preset != "off" else "Programming rules saved. They are off.")
 
