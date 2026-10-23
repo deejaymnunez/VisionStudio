@@ -1,4 +1,7 @@
-PyQt6
+# Windows 10 support: Qt 6.12 is the last Qt that runs on Windows 10 (version 1809 and later).
+# Keep Qt below 6.13 until Windows 10 support ends (business extended updates run to about October 2028).
+PyQt6>=6.7,<6.13
+PyQt6-Qt6>=6.7,<6.13
 mutagen
 numpy
 pyinstaller

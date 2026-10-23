@@ -22,6 +22,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Check the toolkit still supports Windows 10
+        shell: pwsh
+        run: |
+          pip freeze
+          $qt = python -c "from PyQt6.QtCore import QT_VERSION_STR; print(QT_VERSION_STR)"
+          Write-Host "Qt version: $qt"
+          $parts = $qt.Trim().Split('.')
+          if ([int]$parts[0] -gt 6 -or ([int]$parts[0] -eq 6 -and [int]$parts[1] -ge 13)) {
+            Write-Error "Qt $qt does not run on Windows 10. Vision Studio keeps Windows 10 support until about October 2028."
+            exit 1
+          }
+
       - name: Download FFmpeg (bundled into the app)
         shell: pwsh
         run: |
