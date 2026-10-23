@@ -9991,6 +9991,568 @@ class KeyboardNavigationFilter(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Remote voice tracking: a station lets approved people record voice tracks from their own PC.
+# The station runs a small receiver (off until switched on). Each person has a username and a
+# password. The password never crosses the network: the person's PC proves it knows it.
+# Traffic is expected to travel over Tailscale, which encrypts it; the receiver only listens on
+# the Tailscale address unless the manager types a different one on purpose.
+# ---------------------------------------------------------------------------
+import socket
+import hmac
+import secrets
+
+VT_DEFAULT_PORT = 2323
+VT_PBKDF2_ROUNDS = 200000
+VT_MAX_HEADER = 65536
+VT_MAX_CLIP_BYTES = 60 * 1024 * 1024
+VT_MAX_CONNECTIONS = 8
+VT_MAX_UPLOADS = 2
+VT_FAIL_LIMIT = 5
+VT_FAIL_WINDOW = 600.0
+VT_LOCK_SECONDS = 900.0
+VT_PROTOCOL = 1
+
+
+def vt_derive_key(password, salt_hex, rounds=VT_PBKDF2_ROUNDS):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), rounds).hex()
+
+
+def vt_proof(key_hex, nonce_hex, username):
+    return hmac.new(bytes.fromhex(key_hex), (nonce_hex + "|" + username).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def vt_clip_prefix(user):
+    """Clips are named voicetrack_<who>_..., the same 'voicetrack_' start the rest of the program recognizes.
+    The name is hex so one person's prefix can never match another person's."""
+    return "voicetrack_u" + user.strip().lower().encode("utf-8").hex() + "_"
+
+
+def find_tailscale_address():
+    """The machine's Tailscale IPv4 address (100.64.0.0/10), or ''."""
+    candidates = []
+    for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
+        try:
+            result = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=4,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            candidates += result.stdout.split()
+        except Exception:
+            continue
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            candidates.append(info[4][0])
+    except Exception:
+        pass
+    for text in candidates:
+        parts = text.strip().split(".")
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except Exception:
+            continue
+        if a == 100 and 64 <= b <= 127:
+            return text.strip()
+    return ""
+
+
+class VTAccounts:
+    """The people allowed to voice track this station. Saved in the program settings; only a scrambled
+    form of each password is kept."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.items = []
+        try:
+            data = json.loads(str(settings.value("vt_accounts_json", "[]")) or "[]")
+            self.items = [d for d in data if isinstance(d, dict) and d.get("user")]
+        except Exception:
+            self.items = []
+
+    def save(self):
+        self.settings.setValue("vt_accounts_json", json.dumps(self.items))
+
+    def find(self, user):
+        user = (user or "").strip().lower()
+        for item in self.items:
+            if item["user"].lower() == user:
+                return item
+        return None
+
+    def add(self, user, password, allowed_ip="", enabled=True, keep_password=False):
+        user = (user or "").strip()
+        if not user or any(c in user for c in "|\n\r\t"):
+            return "Type a user name without spaces at the ends or the | character."
+        existing = self.find(user)
+        if existing is not None and keep_password and not password:
+            existing["ip"] = (allowed_ip or "").strip()
+            existing["enabled"] = bool(enabled)
+            self.save()
+            return ""
+        if len(password or "") < 8:
+            return "The password needs at least 8 characters."
+        salt = secrets.token_hex(16)
+        entry = {"user": user, "salt": salt, "rounds": VT_PBKDF2_ROUNDS, "key": vt_derive_key(password, salt),
+                 "ip": (allowed_ip or "").strip(), "enabled": bool(enabled)}
+        if existing is not None:
+            self.items[self.items.index(existing)] = entry
+        else:
+            self.items.append(entry)
+        self.save()
+        return ""
+
+    def remove(self, user):
+        item = self.find(user)
+        if item is None:
+            return False
+        self.items.remove(item)
+        self.save()
+        return True
+
+
+class VTGuard:
+    """Counts wrong logins per address; too many and the address is locked out for a while."""
+
+    def __init__(self):
+        self.fails = {}
+        self.locked_until = {}
+        self.lock = threading.Lock()
+
+    def blocked(self, ip, now=None):
+        now = now or time.monotonic()
+        with self.lock:
+            return self.locked_until.get(ip, 0) > now
+
+    def failed(self, ip, now=None):
+        now = now or time.monotonic()
+        with self.lock:
+            stamps = [t for t in self.fails.get(ip, []) if now - t < VT_FAIL_WINDOW] + [now]
+            self.fails[ip] = stamps
+            if len(stamps) >= VT_FAIL_LIMIT:
+                self.locked_until[ip] = now + VT_LOCK_SECONDS
+                self.fails[ip] = []
+                return True
+        return False
+
+    def ok(self, ip):
+        with self.lock:
+            self.fails.pop(ip, None)
+
+
+def vt_send(sock, header, body=b""):
+    header = dict(header)
+    if body:
+        header["size"] = len(body)
+    raw = json.dumps(header).encode("utf-8")
+    sock.sendall(struct.pack(">I", len(raw)) + raw + body)
+
+
+def vt_recv_exact(sock, count):
+    chunks = []
+    while count > 0:
+        chunk = sock.recv(min(count, 65536))
+        if not chunk:
+            raise ConnectionError("The connection closed.")
+        chunks.append(chunk)
+        count -= len(chunk)
+    return b"".join(chunks)
+
+
+def vt_recv(sock, max_body=0):
+    (length,) = struct.unpack(">I", vt_recv_exact(sock, 4))
+    if length > VT_MAX_HEADER:
+        raise ValueError("The message header is too big.")
+    header = json.loads(vt_recv_exact(sock, length).decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError("Bad message.")
+    size = int(header.get("size", 0) or 0)
+    if size < 0 or size > max_body:
+        raise ValueError("The attachment is too big.")
+    body = vt_recv_exact(sock, size) if size else b""
+    return header, body
+
+
+class GuiCaller:
+    """Runs a function on the screen's thread from another thread and waits for the answer, so the
+    receiver never touches playlists or the engine from its own thread."""
+
+    def __init__(self, interval_ms=150):
+        self.jobs = queue.Queue()
+        self.timer = QTimer()
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self.run_pending)
+        self.timer.start()
+
+    def run_pending(self):
+        for _ in range(20):
+            try:
+                fn, done, box = self.jobs.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                box["result"] = fn()
+            except Exception as e:
+                box["error"] = str(e) or type(e).__name__
+                _log_exception(type(e), e, e.__traceback__)
+            done.set()
+
+    def call(self, fn, timeout=40.0):
+        done = threading.Event()
+        box = {}
+        self.jobs.put((fn, done, box))
+        if not done.wait(timeout):
+            raise TimeoutError("The station was busy.")
+        if "error" in box:
+            raise RuntimeError(box["error"])
+        return box.get("result")
+
+
+class VTService:
+    """What a voice tracker is allowed to do, reusing the Voice Track Hour screen's own fitting and saving."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def setting(self, key, default):
+        try:
+            return type(default)(float(self.app.settings.value(key, default)))
+        except Exception:
+            return default
+
+    def hour_start(self, day, hour):
+        return datetime(day.year, day.month, day.day, hour)
+
+    def check_hour(self, day, hour):
+        now = datetime.now()
+        lead = self.setting("vt_min_lead_minutes", 10)
+        if self.hour_start(day, hour) - now < timedelta(minutes=lead):
+            raise ValueError(f"That hour is too close to air. Hours must be voice tracked at least {lead} minutes ahead.")
+        if day > now.date() + timedelta(days=14):
+            raise ValueError("That day is too far ahead.")
+
+    def load_entries(self, day, hour, create=True):
+        generator = self.app.playlist_generator
+        path = generator.current_hour_playlist(day, hour)
+        if path is None and create:
+            path = generator.generate_hour(day, hour)
+        if not path:
+            raise ValueError("No rotation is scheduled for that hour.")
+        entries, _missing = read_m3u(path)
+        return path, entries
+
+    def describe(self, entries, user):
+        out = []
+        for number, entry in enumerate(entries):
+            if is_hour_marker(entry) and not is_voice_marker(entry):
+                kind, title, seconds, mine = "marker", "Hour marker", 0, False
+            elif is_voice_marker(entry):
+                kind, title, seconds, mine = "slot", "Voice track slot", 0, False
+            elif is_song_entry(entry):
+                kind, title, seconds, mine = "song", format_track_display(entry), int(get_track_duration(entry)), False
+            else:
+                base = os.path.basename(entry)
+                kind, title, seconds = "clip", base, int(get_track_duration(entry))
+                mine = base.startswith(vt_clip_prefix(user))
+            out.append({"index": number, "kind": kind, "title": title, "seconds": seconds, "mine": mine})
+        return out
+
+    def list_hours(self, user, days=2):
+        today = datetime.now().date()
+        result = []
+        for offset in range(max(1, min(int(days), 14))):
+            day = today + timedelta(days=offset)
+            for hour in range(24):
+                try:
+                    self.check_hour(day, hour)
+                except ValueError:
+                    continue
+                path = self.app.playlist_generator.current_hour_playlist(day, hour)
+                slots = clips = 0
+                if path:
+                    entries, _m = read_m3u(path)
+                    slots = sum(1 for e in entries if is_voice_marker(e))
+                    clips = sum(1 for e in entries if not is_hour_marker(e) and not is_song_entry(e))
+                result.append({"day": day.isoformat(), "hour": hour, "ready": bool(path), "slots": slots, "clips": clips})
+        return result
+
+    def get_hour(self, user, day, hour):
+        self.check_hour(day, hour)
+        path, entries = self.load_entries(day, hour)
+        if not any(is_voice_marker(e) for e in entries) and not any(
+                not is_hour_marker(e) and not is_song_entry(e) for e in entries):
+            entries = insert_voice_markers([e for e in entries if not is_voice_marker(e)], VOICE_MARKER_EVERY, False)
+            write_m3u(path, entries)
+        return self.describe(entries, user)
+
+    def work_object(self, day, hour, entries):
+        class Work:
+            pass
+        work = Work()
+        work.app, work.day, work.hour, work.entries = self.app, day, hour, list(entries)
+        return work
+
+    def put_clip(self, user, day, hour, index, data, underlay):
+        self.check_hour(day, hour)
+        max_seconds = self.setting("vt_max_clip_seconds", 180)
+        temp = os.path.join(get_voice_folder(), "vt_incoming_%s.wav" % secrets.token_hex(4))
+        with open(temp, "wb") as handle:
+            handle.write(data)
+        try:
+            with wave.open(temp, "rb") as probe:
+                seconds = probe.getnframes() / float(probe.getframerate() or 1)
+        except Exception:
+            os.remove(temp)
+            raise ValueError("The clip must be a WAV file.")
+        if seconds < 0.5 or seconds > max_seconds:
+            os.remove(temp)
+            raise ValueError(f"The clip must be between half a second and {int(max_seconds)} seconds.")
+        path, entries = self.load_entries(day, hour)
+        if not (0 <= index < len(entries)):
+            os.remove(temp)
+            raise ValueError("That position is not in the hour.")
+        target = entries[index]
+        mine = (not is_hour_marker(target) and not is_song_entry(target)
+                and os.path.basename(target).startswith(vt_clip_prefix(user)))
+        if not (is_voice_marker(target) or mine):
+            os.remove(temp)
+            raise ValueError("That position is not a voice track slot, or a clip of yours.")
+        underlay = max(0, min(int(underlay), 20))
+        final = os.path.join(get_voice_folder(),
+                             f"{vt_clip_prefix(user)}{day.isoformat()}_{hour:02d}_{secrets.token_hex(3)}_u{underlay}.wav")
+        os.replace(temp, final)
+        entries[index] = final
+        work = self.work_object(day, hour, entries)
+        VoiceTrackHourTab.refit_end(work)
+        write_m3u(path, work.entries)
+        set_hour_locked(self.app.settings, day, hour, True)
+        self.app.reload_hour_if_current(day, hour)
+        return {"seconds": round(seconds, 1), "entries": self.describe(work.entries, user)}
+
+    def clear_clip(self, user, day, hour, index):
+        self.check_hour(day, hour)
+        path, entries = self.load_entries(day, hour, create=False)
+        if not (0 <= index < len(entries)):
+            raise ValueError("That position is not in the hour.")
+        target = entries[index]
+        if is_hour_marker(target) or is_song_entry(target) or not os.path.basename(target).startswith(vt_clip_prefix(user)):
+            raise ValueError("You can only remove your own clips.")
+        entries[index] = VOICE_MARKER_TOKEN
+        work = self.work_object(day, hour, entries)
+        VoiceTrackHourTab.refit_end(work)
+        write_m3u(path, work.entries)
+        return {"entries": self.describe(work.entries, user)}
+
+
+class VTServer:
+    """The receiver. Starts and stops from the Settings screen."""
+
+    def __init__(self, accounts, service_getter, run_on_gui, log, activity=None):
+        self.accounts = accounts
+        self.service_getter = service_getter
+        self.run_on_gui = run_on_gui
+        self.log = log
+        self.activity = activity or (lambda text: None)
+        self.guard = VTGuard()
+        self.fake_secret = secrets.token_bytes(16)
+        self.sock = None
+        self.thread = None
+        self.running = False
+        self.connections = threading.BoundedSemaphore(VT_MAX_CONNECTIONS)
+        self.uploads = threading.BoundedSemaphore(VT_MAX_UPLOADS)
+        self.host = ""
+        self.port = 0
+
+    def start(self, host, port):
+        if self.running:
+            return ""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, int(port)))
+            sock.listen(8)
+            sock.settimeout(1.0)
+        except OSError as e:
+            return f"The receiver could not start on {host}:{port}. {e}"
+        self.sock, self.host, self.port = sock, host, sock.getsockname()[1]
+        self.running = True
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+        self.log(f"Remote voice tracking is listening on {host}:{self.port}.")
+        return ""
+
+    def stop(self):
+        was = self.running
+        self.running = False
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        if was:
+            self.log("Remote voice tracking stopped.")
+
+    def serve(self):
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if self.guard.blocked(addr[0]):
+                conn.close()
+                continue
+            if not self.connections.acquire(blocking=False):
+                conn.close()
+                continue
+            threading.Thread(target=self.handle, args=(conn, addr[0]), daemon=True).start()
+
+    def handle(self, conn, ip):
+        user = ""
+        try:
+            conn.settimeout(30.0)
+            nonce = secrets.token_hex(16)
+            vt_send(conn, {"hello": "VisionStudio", "protocol": VT_PROTOCOL, "nonce": nonce})
+            header, _ = vt_recv(conn)
+            if header.get("cmd") != "salt":
+                return
+            asked = str(header.get("user", ""))
+            known = self.accounts.find(asked)
+            if known is not None:
+                vt_send(conn, {"ok": True, "user": known["user"], "salt": known["salt"], "rounds": known.get("rounds", VT_PBKDF2_ROUNDS)})
+            else:      # an unknown name gets a believable answer, so names cannot be guessed
+                fake_salt = hmac.new(self.fake_secret, asked.lower().encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+                vt_send(conn, {"ok": True, "user": asked, "salt": fake_salt, "rounds": VT_PBKDF2_ROUNDS})
+            header, _ = vt_recv(conn)
+            user = str(header.get("user", ""))
+            account = self.accounts.find(user)
+            fake = secrets.token_hex(16)
+            good = False
+            if account is not None and account.get("enabled", True):
+                expected = vt_proof(account["key"], nonce, account["user"])
+                good = hmac.compare_digest(expected, str(header.get("proof", "")))
+                if good and account.get("ip") and account["ip"] != ip:
+                    self.log(f"Voice tracker {account['user']} refused: connecting from {ip}, not the locked address.")
+                    self.activity(f"{account['user']} refused from {ip} (locked to another address)")
+                    good = False
+            else:
+                hmac.compare_digest(fake, str(header.get("proof", "")))
+            if not good:
+                locked = self.guard.failed(ip)
+                self.log(f"Voice tracker login failed for '{user}' from {ip}." + (" That address is now locked out." if locked else ""))
+                self.activity(f"Login failed for {user or '(no name)'} from {ip}" + (" - locked out" if locked else ""))
+                vt_send(conn, {"ok": False, "error": "Login refused."})
+                return
+            self.guard.ok(ip)
+            user = account["user"]
+            vt_send(conn, {"ok": True, "user": user})
+            self.log(f"Voice tracker {user} connected from {ip}.")
+            self.activity(f"{user} connected from {ip}")
+            conn.settimeout(120.0)
+            while self.running:
+                try:
+                    header, body = vt_recv(conn, VT_MAX_CLIP_BYTES)
+                except ConnectionError:
+                    break
+                reply, out_body = self.command(user, ip, header, body)
+                vt_send(conn, reply, out_body)
+        except (OSError, ValueError, json.JSONDecodeError, struct.error):
+            pass
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.connections.release()
+            if user:
+                self.log(f"Voice tracker {user} disconnected.")
+
+    def command(self, user, ip, header, body):
+        cmd = str(header.get("cmd", ""))
+        service = self.service_getter()
+        try:
+            if cmd == "ping":
+                return {"ok": True}, b""
+            if cmd == "hours":
+                result = self.run_on_gui(lambda: service.list_hours(user, int(header.get("days", 2))))
+                return {"ok": True, "hours": result}, b""
+            day = datetime.strptime(str(header.get("day", "")), "%Y-%m-%d").date() if header.get("day") else None
+            hour = int(header["hour"]) if "hour" in header else None
+            if cmd == "hour":
+                result = self.run_on_gui(lambda: service.get_hour(user, day, hour))
+                return {"ok": True, "entries": result}, b""
+            if cmd == "put":
+                if not self.uploads.acquire(blocking=False):
+                    return {"ok": False, "error": "The station is receiving other clips. Try again in a moment."}, b""
+                try:
+                    index = int(header["index"])
+                    underlay = int(header.get("underlay", 0))
+                    result = self.run_on_gui(lambda: service.put_clip(user, day, hour, index, body, underlay))
+                finally:
+                    self.uploads.release()
+                self.log(f"Voice tracker {user} saved a clip into {day} hour {hour}, position {index}.")
+                self.activity(f"{user} saved a clip into {day} {hour:02d}:00")
+                return {"ok": True, **result}, b""
+            if cmd == "clear":
+                index = int(header["index"])
+                result = self.run_on_gui(lambda: service.clear_clip(user, day, hour, index))
+                self.log(f"Voice tracker {user} removed a clip from {day} hour {hour}, position {index}.")
+                self.activity(f"{user} removed a clip from {day} {hour:02d}:00")
+                return {"ok": True, **result}, b""
+            return {"ok": False, "error": "Unknown command."}, b""
+        except (ValueError, KeyError) as e:
+            return {"ok": False, "error": str(e) or "Bad request."}, b""
+        except Exception as e:
+            return {"ok": False, "error": "The station could not do that: " + (str(e) or type(e).__name__)}, b""
+
+
+class VTClient:
+    """The voice tracker's side of the connection (used by the voice tracking screen)."""
+
+    def __init__(self, host, port, user, password, timeout=30.0):
+        self.sock = socket.create_connection((host, int(port)), timeout=timeout)
+        hello, _ = vt_recv(self.sock)
+        if hello.get("hello") != "VisionStudio" or hello.get("protocol") != VT_PROTOCOL:
+            raise ConnectionError("That is not a Vision Studio station, or it is a different version.")
+        # the station sends the salt on request so the password is never sent
+        vt_send(self.sock, {"cmd": "salt", "user": user})
+        reply, _ = vt_recv(self.sock)
+        key = vt_derive_key(password, reply.get("salt", secrets.token_hex(16)), int(reply.get("rounds", VT_PBKDF2_ROUNDS)))
+        vt_send(self.sock, {"user": user, "proof": vt_proof(key, hello["nonce"], reply.get("user", user))})
+        answer, _ = vt_recv(self.sock)
+        if not answer.get("ok"):
+            self.sock.close()
+            raise PermissionError(answer.get("error", "Login refused."))
+        self.user = answer.get("user", user)
+
+    def ask(self, header, body=b""):
+        vt_send(self.sock, header, body)
+        reply, out = vt_recv(self.sock, VT_MAX_CLIP_BYTES)
+        if not reply.get("ok"):
+            raise RuntimeError(reply.get("error", "The station refused that."))
+        return reply
+
+    def hours(self, days=2):
+        return self.ask({"cmd": "hours", "days": days})["hours"]
+
+    def hour(self, day, hour):
+        return self.ask({"cmd": "hour", "day": day, "hour": hour})["entries"]
+
+    def put(self, day, hour, index, wav_bytes, underlay=0):
+        return self.ask({"cmd": "put", "day": day, "hour": hour, "index": index, "underlay": underlay}, wav_bytes)
+
+    def clear(self, day, hour, index):
+        return self.ask({"cmd": "clear", "day": day, "hour": hour, "index": index})
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+
+# ---------------------------------------------------------------------------
 # Main application window
 # ---------------------------------------------------------------------------
 
@@ -10141,6 +10703,13 @@ class BroadcastingApp(QWidget):
             self.category_library.sync_music(self.rotation_library)
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
+        self.vt_activity = deque(maxlen=200)
+        self.vt_accounts = VTAccounts(self.settings)
+        self.gui_caller = GuiCaller()
+        self.vt_service = VTService(self)
+        self.vt_server = VTServer(self.vt_accounts, lambda: self.vt_service, self.gui_caller.call,
+                                  lambda text: RUN_LOG.write("VTREMOTE", text),
+                                  lambda text: self.vt_activity.append(time.strftime("%I:%M:%S %p ").lstrip("0") + text))
         RUN_LOG.write("START", "Building the window.")
         self.setup_ui()
         RUN_LOG.write("START", "Window built.")
@@ -10168,6 +10737,11 @@ class BroadcastingApp(QWidget):
         self.report_ready.connect(self.on_library_report_ready)
         QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
+        QTimer.singleShot(3000, self.apply_remote_vt)
+        try:
+            QApplication.instance().aboutToQuit.connect(self.vt_server.stop)
+        except Exception:
+            pass
 
         RUN_LOG.write("START", "Ready to show.")
         self.console_timer = QTimer()
@@ -12099,6 +12673,182 @@ class BroadcastingApp(QWidget):
 
     report_ready = pyqtSignal(str)
 
+    # --- remote voice tracking (the receiver on the station) ---
+    def build_remote_vt_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("Let approved people record voice tracks from their own PC and send them to this station. It is off "
+                       "until you switch it on. Each person gets a user name and a password; the password is never sent "
+                       "over the network. The receiver listens only on this PC's Tailscale address unless you type another "
+                       "address on purpose. People can only fill voice track slots, and can only remove their own clips.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.vt_enable_check = QCheckBox("Accept remote voice tracking")
+        self.vt_enable_check.setChecked(str(self.settings.value("vt_enabled", "false")).lower() == "true")
+        form.addRow(self.vt_enable_check)
+        self.vt_port_spin = QSpinBox()
+        self.vt_port_spin.setRange(1024, 65535)
+        self.vt_port_spin.setValue(int(float(self.settings.value("vt_port", VT_DEFAULT_PORT))))
+        self.vt_port_spin.setAccessibleName("Port for remote voice tracking")
+        form.addRow("Port:", self.vt_port_spin)
+        self.vt_host_edit = QLineEdit(str(self.settings.value("vt_host", "")))
+        self.vt_host_edit.setAccessibleName("Address to listen on. Leave empty for the Tailscale address")
+        self.vt_host_edit.setPlaceholderText("Empty = this PC's Tailscale address")
+        form.addRow("Listen on:", self.vt_host_edit)
+        find_btn = QPushButton("Find This PC's Tailscale Address")
+        find_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        find_btn.clicked.connect(self.find_vt_address)
+        form.addRow(find_btn)
+        self.vt_lead_spin = QSpinBox()
+        self.vt_lead_spin.setRange(1, 600)
+        self.vt_lead_spin.setValue(int(float(self.settings.value("vt_min_lead_minutes", 10))))
+        self.vt_lead_spin.setAccessibleName("Minutes before an hour when voice tracking for it closes")
+        form.addRow("Voice tracking for an hour closes (minutes before it starts):", self.vt_lead_spin)
+        self.vt_clip_spin = QSpinBox()
+        self.vt_clip_spin.setRange(5, 900)
+        self.vt_clip_spin.setValue(int(float(self.settings.value("vt_max_clip_seconds", 180))))
+        self.vt_clip_spin.setAccessibleName("Longest voice track clip in seconds")
+        form.addRow("Longest clip (seconds):", self.vt_clip_spin)
+        layout.addLayout(form)
+        save_btn = QPushButton("Save And Apply")
+        save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save_btn.clicked.connect(self.save_remote_vt)
+        layout.addWidget(save_btn)
+        self.vt_status_label = QLabel("")
+        self.vt_status_label.setWordWrap(True)
+        self.vt_status_label.setAccessibleName("Remote voice tracking status")
+        layout.addWidget(self.vt_status_label)
+
+        layout.addWidget(QLabel("People who can voice track:"))
+        self.vt_account_list = QListWidget()
+        self.vt_account_list.setAccessibleName("People who can voice track")
+        self.vt_account_list.setMaximumHeight(130)
+        self.vt_account_list.currentRowChanged.connect(self.on_vt_account_selected)
+        layout.addWidget(self.vt_account_list)
+        account_form = QFormLayout()
+        self.vt_user_edit = QLineEdit()
+        self.vt_user_edit.setAccessibleName("User name")
+        account_form.addRow("User name:", self.vt_user_edit)
+        self.vt_password_edit = QLineEdit()
+        self.vt_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vt_password_edit.setAccessibleName("Password, at least 8 characters. Leave empty to keep the current one")
+        account_form.addRow("Password:", self.vt_password_edit)
+        self.vt_ip_edit = QLineEdit()
+        self.vt_ip_edit.setAccessibleName("Lock to this address. Leave empty to allow any address")
+        self.vt_ip_edit.setPlaceholderText("Empty = any address")
+        account_form.addRow("Lock to address:", self.vt_ip_edit)
+        self.vt_user_enabled = QCheckBox("This person may connect")
+        self.vt_user_enabled.setChecked(True)
+        account_form.addRow(self.vt_user_enabled)
+        layout.addLayout(account_form)
+        for text, handler in (("Add Or Update Person", self.add_vt_account), ("Remove Selected Person", self.remove_vt_account)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            layout.addWidget(btn)
+        layout.addWidget(QLabel("Recent activity:"))
+        self.vt_activity_list = QListWidget()
+        self.vt_activity_list.setAccessibleName("Recent remote voice tracking activity")
+        layout.addWidget(self.vt_activity_list, 1)
+        self.vt_refresh_timer = QTimer(self)
+        self.vt_refresh_timer.setInterval(2000)
+        self.vt_refresh_timer.timeout.connect(self.refresh_remote_vt)
+        self.vt_refresh_timer.start()
+        page.setLayout(layout)
+        self.refresh_vt_accounts()
+        self.refresh_remote_vt()
+        return page
+
+    def refresh_vt_accounts(self):
+        self.vt_account_list.clear()
+        for item in self.vt_accounts.items:
+            where = f", locked to {item['ip']}" if item.get("ip") else ", any address"
+            self.vt_account_list.addItem(f"{item['user']}{where}" + ("" if item.get("enabled", True) else ", switched off"))
+
+    def refresh_remote_vt(self):
+        server = self.vt_server
+        if server.running:
+            self.vt_status_label.setText(f"Listening on {server.host}:{server.port}.")
+        else:
+            self.vt_status_label.setText("Not listening.")
+        lines = list(self.vt_activity)[::-1]
+        if [self.vt_activity_list.item(i).text() for i in range(self.vt_activity_list.count())] != lines:
+            self.vt_activity_list.clear()
+            for line in lines:
+                self.vt_activity_list.addItem(line)
+
+    def on_vt_account_selected(self, row):
+        if 0 <= row < len(self.vt_accounts.items):
+            item = self.vt_accounts.items[row]
+            self.vt_user_edit.setText(item["user"])
+            self.vt_password_edit.clear()
+            self.vt_ip_edit.setText(item.get("ip", ""))
+            self.vt_user_enabled.setChecked(bool(item.get("enabled", True)))
+
+    def add_vt_account(self):
+        user = self.vt_user_edit.text().strip()
+        problem = self.vt_accounts.add(user, self.vt_password_edit.text(), self.vt_ip_edit.text(),
+                                       self.vt_user_enabled.isChecked(), keep_password=True)
+        if problem:
+            self.announce(problem)
+            return
+        RUN_LOG.write("VTREMOTE", f"Voice tracker account saved: {user}.")
+        self.vt_password_edit.clear()
+        self.refresh_vt_accounts()
+        self.announce(f"{user} can voice track" + (" from that address only." if self.vt_ip_edit.text().strip() else "."))
+
+    def remove_vt_account(self):
+        row = self.vt_account_list.currentRow()
+        if not (0 <= row < len(self.vt_accounts.items)):
+            self.announce("Select a person first.")
+            return
+        user = self.vt_accounts.items[row]["user"]
+        self.vt_accounts.remove(user)
+        RUN_LOG.write("VTREMOTE", f"Voice tracker account removed: {user}.")
+        self.refresh_vt_accounts()
+        self.announce(f"{user} was removed.")
+
+    def find_vt_address(self):
+        address = find_tailscale_address()
+        if address:
+            self.vt_host_edit.setText(address)
+            self.announce(f"This PC's Tailscale address is {address}.")
+        else:
+            self.announce("No Tailscale address was found. Is Tailscale installed and signed in on this PC?")
+
+    def save_remote_vt(self):
+        self.settings.setValue("vt_enabled", "true" if self.vt_enable_check.isChecked() else "false")
+        self.settings.setValue("vt_port", self.vt_port_spin.value())
+        self.settings.setValue("vt_host", self.vt_host_edit.text().strip())
+        self.settings.setValue("vt_min_lead_minutes", self.vt_lead_spin.value())
+        self.settings.setValue("vt_max_clip_seconds", self.vt_clip_spin.value())
+        self.vt_server.stop()
+        self.apply_remote_vt(announce=True)
+
+    def apply_remote_vt(self, announce=False):
+        if str(self.settings.value("vt_enabled", "false")).lower() != "true":
+            self.vt_server.stop()
+            if announce:
+                self.announce("Remote voice tracking is off.")
+            return
+        host = str(self.settings.value("vt_host", "")).strip() or find_tailscale_address()
+        if not host:
+            message = "Remote voice tracking did not start: no Tailscale address was found. Install and sign in to Tailscale, or type an address."
+            RUN_LOG.write("VTREMOTE", message)
+            self.vt_activity.append(message)
+            self.announce(message)
+            return
+        problem = self.vt_server.start(host, int(float(self.settings.value("vt_port", VT_DEFAULT_PORT))))
+        if problem:
+            RUN_LOG.write("VTREMOTE", problem)
+            self.vt_activity.append(problem)
+            self.announce(problem)
+        elif announce:
+            self.announce(f"Remote voice tracking is on, listening on {host}.")
+
+    # --- end remote voice tracking ---
+
     def build_rules_tab(self):
         page = QWidget()
         layout = QVBoxLayout()
@@ -12840,12 +13590,13 @@ class BroadcastingApp(QWidget):
         self.version_tab = self.build_version_tab()
         self.folder_tab = self.build_folder_tab()
         self.rules_tab = self.build_rules_tab()
+        self.remote_vt_tab = self.build_remote_vt_tab()
         sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
