@@ -2142,6 +2142,7 @@ DEFAULT_SHORTCUTS = [
     ("stop_rotation", "Stop everything at once", "Ctrl+Shift+S", True),
     ("mute_all", "Mute or unmute all audio", "Ctrl+Shift+U", True),
     ("open_options", "Open or close Settings", "Ctrl+O", True),
+    ("send_to_tray", "Send to the system tray (keeps playing)", "Ctrl+Shift+Y", True),
     ("toggle_recording", "Start or stop recording", "R", True),
     ("new_item", "New rotation, category or hour marker (depends on the tab)", "Ctrl+N", True),
     ("generate_now", "Generate playlists now", "Ctrl+Shift+G", True),
@@ -9946,6 +9947,11 @@ class KeyboardNavigationFilter(QObject):
     def eventFilter(self, obj, event):
         try:
             win = self.app_window
+            if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_F, Qt.Key.Key_V):
+                mods = event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+                                            | Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.MetaModifier)
+                if mods == Qt.KeyboardModifier.AltModifier and win.open_menu_by_key("F" if event.key() == Qt.Key.Key_F else "V"):
+                    return True
             section_list = getattr(win, "section_list", None)
             if (event.type() == QEvent.Type.KeyPress and section_list is not None
                     and getattr(win, "pages", None) is not None and win.pages.currentIndex() == 1):
@@ -10258,6 +10264,7 @@ class BroadcastingApp(QWidget):
             "stop_rotation": self.stop_everything,
             "mute_all": self.toggle_mute,
             "open_options": self.open_options,
+            "send_to_tray": self.hide_to_tray,
             "toggle_recording": self.toggle_recording,
             "new_item": self.new_item,
             "generate_now": self.generate_now,
@@ -11402,10 +11409,14 @@ class BroadcastingApp(QWidget):
     # --- menu bar (Alt+F) ---
     def build_menus(self, layout):
         self.menu_bar = QMenuBar()
+        self.menu_bar.setNativeMenuBar(False)
+        self.menu_bar.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         file_menu = self.menu_bar.addMenu("&File")
         file_menu.setAccessibleName("File menu")
         voice_menu = self.menu_bar.addMenu("&Voice Track")
         voice_menu.setAccessibleName("Voice Track menu")
+        self.menu_by_letter = {"F": file_menu, "V": voice_menu}
+        self.menu_open_check_logged = False
 
         def add(menu, key, text, handler, checkable=False):
             action = QAction(text, self)
@@ -11418,6 +11429,8 @@ class BroadcastingApp(QWidget):
             self.menu_actions[key] = (action, text)
             return action
 
+        add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
+        file_menu.addSeparator()
         add(file_menu, "insert_tracks", "Insert tracks into the queue", self.insert_tracks)
         add(file_menu, "automation_toggle", "Automation on or off", self.automation_toggle)
         add(file_menu, "stop_fade", "Stop with fade (the record stays on the deck)", self.stop_with_fade)
@@ -11425,8 +11438,6 @@ class BroadcastingApp(QWidget):
         add(file_menu, "mute_all", "Mute or unmute all audio", self.toggle_mute)
         add(file_menu, "toggle_recording", "Start or stop recording", self.toggle_recording)
         add(file_menu, "open_options", "Open or close Settings", self.open_options)
-        file_menu.addSeparator()
-        add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
         file_menu.addSeparator()
         add(file_menu, "exit", "Exit Vision Studio", self.exit_program)
 
@@ -11504,6 +11515,21 @@ class BroadcastingApp(QWidget):
                 self.hide_to_tray()
             else:
                 self.show_from_tray()
+
+    def open_menu_by_key(self, letter):
+        """Alt+F and Alt+V. Qt normally opens the menus itself; this opens them when it did not."""
+        menu = getattr(self, "menu_by_letter", {}).get(letter)
+        if menu is None or not self.isActiveWindow():
+            return False
+        try:
+            action = menu.menuAction()
+            spot = self.menu_bar.mapToGlobal(self.menu_bar.actionGeometry(action).bottomLeft())
+            RUN_LOG.write("MENU", f"Alt+{letter} reached the program without opening the menu; opening it directly.")
+            menu.popup(spot)
+            return True
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            return False
 
     def hide_to_tray(self):
         if self.tray is None:
