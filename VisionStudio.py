@@ -18,6 +18,9 @@ import uuid
 import urllib.request
 import urllib.parse
 import base64
+import socket
+import hmac
+import secrets
 from array import array
 from collections import deque, Counter
 from datetime import datetime, timedelta
@@ -80,6 +83,30 @@ SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform ==
 # Crash guard: in PyQt6 an unhandled Python exception inside a Qt callback can
 # abort the whole program. This logs the error to a file and keeps running.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Stations. One copy of the program can be started for another station with `--station ID`: it keeps its
+# own settings, logs, playlists, recordings and voice tracks. The original install is the "main" station
+# and keeps everything exactly where it was.
+# ---------------------------------------------------------------------------
+def _arg_value(name):
+    if name in sys.argv:
+        position = sys.argv.index(name)
+        if position + 1 < len(sys.argv):
+            return sys.argv[position + 1]
+    return None
+
+
+STATION_CHILD = "--station" in sys.argv
+STATION_ID = (_arg_value("--station") or "main") if STATION_CHILD else "main"
+STATION_PROFILE = "" if STATION_ID == "main" else re.sub(r"[^a-z0-9_]", "", STATION_ID.lower())
+STATION_NAME = (_arg_value("--station-name") or ("Main station" if not STATION_PROFILE else STATION_PROFILE)) if STATION_CHILD else ""
+
+
+def profile_sub():
+    """'' for the main station, 'Stations/<id>' for the others, to put inside the program's data folders."""
+    return os.path.join("Stations", STATION_PROFILE) if STATION_PROFILE else ""
+
+
 def _writable_dir(folder):
     try:
         os.makedirs(folder, exist_ok=True)
@@ -95,10 +122,10 @@ def _writable_dir(folder):
 def get_reports_folder():
     """Reports (the daily folder report) sit next to Logs, Playlists and VoiceTracks."""
     if getattr(sys, "frozen", False):
-        candidate = os.path.join(os.path.dirname(sys.executable), "Reports")
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), "Reports")
         if _writable_dir(candidate):
             return candidate
-    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Reports")
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", profile_sub(), "Reports")
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
@@ -108,10 +135,10 @@ def get_logs_folder():
     """Installed copy: a Logs folder inside the program folder, for example
     C:\\Program Files (x86)\\Vision Studio\\Logs. Otherwise a folder under the user profile."""
     if getattr(sys, "frozen", False):
-        candidate = os.path.join(os.path.dirname(sys.executable), "Logs")
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), "Logs")
         if _writable_dir(candidate):
             return candidate
-    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Logs")
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", profile_sub(), "Logs")
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
@@ -120,10 +147,10 @@ def get_logs_folder():
 def get_voice_folder():
     """Voice tracks are saved here, next to Logs and Playlists."""
     if getattr(sys, "frozen", False):
-        candidate = os.path.join(os.path.dirname(sys.executable), "VoiceTracks")
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), "VoiceTracks")
         if _writable_dir(candidate):
             return candidate
-    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "VoiceTracks")
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", profile_sub(), "VoiceTracks")
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
@@ -132,10 +159,10 @@ def get_voice_folder():
 def get_recordings_folder():
     """Live-show recordings are saved here by default, next to Logs and Playlists."""
     if getattr(sys, "frozen", False):
-        candidate = os.path.join(os.path.dirname(sys.executable), "Recordings")
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), "Recordings")
         if _writable_dir(candidate):
             return candidate
-    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Recordings")
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", profile_sub(), "Recordings")
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
@@ -1779,7 +1806,7 @@ def default_playlist_folder():
     Otherwise Documents\\VisionStudio\\Playlists.
     """
     if getattr(sys, "frozen", False):
-        candidate = os.path.join(os.path.dirname(sys.executable), "Playlists")
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), "Playlists")
         if _folder_is_writable(candidate):
             return candidate
     documents = ""
@@ -1789,7 +1816,7 @@ def default_playlist_folder():
         documents = ""
     if not documents or not isinstance(documents, str):
         documents = os.path.join(os.path.expanduser("~"), "Documents")
-    return os.path.join(documents, "VisionStudio", "Playlists")
+    return os.path.join(documents, "VisionStudio", profile_sub(), "Playlists")
 
 
 class PlaylistGenerator:
@@ -9890,10 +9917,10 @@ def default_app_icon():
 def get_logo_folder():
     """A copy of the station's own logo is kept here, next to Logs and Playlists."""
     if getattr(sys, "frozen", False):
-        candidate = os.path.join(os.path.dirname(sys.executable), "Logos")
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), "Logos")
         if _writable_dir(candidate):
             return candidate
-    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", "Logos")
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", profile_sub(), "Logos")
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
@@ -11497,16 +11524,723 @@ class VoiceTrackerPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Several stations on one PC. Each station is its own copy of the program (its own settings, logs,
+# playlists, encoders and automation). A small launcher lists them, starts them, and collapses or
+# expands them. A collapsed station keeps running and streaming but its window is hidden and its
+# speakers are muted; only the expanded station is heard on this PC's speakers.
+# ---------------------------------------------------------------------------
+
+STATION_SOFT_LIMIT = 5
+
+
+def control_folder():
+    base = os.path.join(os.path.expanduser("~"), "VisionStudio", "StationControl")
+    try:
+        os.makedirs(base, exist_ok=True)
+        return base
+    except OSError:
+        fallback = os.path.join(tempfile.gettempdir(), "VisionStudioControl")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+def control_path(station_id):
+    return os.path.join(control_folder(), f"{station_id or 'main'}.json")
+
+
+def control_call(station_id, cmd, timeout=3.0, **extra):
+    """Sends one command to a running station and returns its answer (raises if it is not running)."""
+    with open(control_path(station_id), "r", encoding="utf-8") as handle:
+        info = json.load(handle)
+    with socket.create_connection(("127.0.0.1", int(info["port"])), timeout=timeout) as conn:
+        conn.settimeout(timeout)
+        conn.sendall((json.dumps({"token": info["token"], "cmd": cmd, **extra}) + "\n").encode("utf-8"))
+        data = b""
+        while not data.endswith(b"\n") and len(data) < 1000000:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    return json.loads(data.decode("utf-8"))
+
+
+def station_running(station_id):
+    try:
+        return bool(control_call(station_id, "ping", timeout=1.5).get("ok"))
+    except Exception:
+        return False
+
+
+def process_memory_mb():
+    """Memory this program is using, in megabytes (0 if it cannot be read)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class COUNTERS(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+            counters = COUNTERS()
+            counters.cb = ctypes.sizeof(COUNTERS)
+            kernel = ctypes.windll.kernel32
+            kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi = ctypes.windll.psapi
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(COUNTERS), wintypes.DWORD]
+            if psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+                return round(counters.WorkingSetSize / 1048576.0, 1)
+            return 0.0
+        with open("/proc/self/statm") as handle:
+            pages = int(handle.read().split()[1])
+        return round(pages * os.sysconf("SC_PAGE_SIZE") / 1048576.0, 1)
+    except Exception:
+        return 0.0
+
+
+class CpuMeter:
+    """This program's processor use, as a percent of one core, since the last time it was asked."""
+
+    def __init__(self):
+        self.last_cpu = time.process_time()
+        self.last_wall = time.monotonic()
+
+    def percent(self):
+        cpu, wall = time.process_time(), time.monotonic()
+        spent, elapsed = cpu - self.last_cpu, wall - self.last_wall
+        self.last_cpu, self.last_wall = cpu, wall
+        return round(100.0 * spent / elapsed, 1) if elapsed > 0.2 else 0.0
+
+
+class StationControl:
+    """Runs inside every station: a tiny local-only listener the launcher uses to ask it to show, hide,
+    report, or quit. It only listens on this PC (127.0.0.1) and every request needs the token that was
+    written, for this user only, next to the program's other data."""
+
+    def __init__(self, station_id, name, handlers, run_on_gui):
+        self.station_id = station_id or "main"
+        self.name = name
+        self.handlers = handlers
+        self.run_on_gui = run_on_gui
+        self.token = secrets.token_hex(16)
+        self.sock = None
+        self.running = False
+        self.port = 0
+
+    def start(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(4)
+            sock.settimeout(1.0)
+        except OSError:
+            return False
+        self.sock, self.port, self.running = sock, sock.getsockname()[1], True
+        with open(control_path(self.station_id), "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "port": self.port, "token": self.token, "name": self.name}, handle)
+        threading.Thread(target=self.serve, daemon=True).start()
+        return True
+
+    def stop(self):
+        was = self.running
+        self.running = False
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except Exception:
+            pass
+        if was:
+            try:
+                with open(control_path(self.station_id), "r", encoding="utf-8") as handle:
+                    mine = json.load(handle).get("token") == self.token
+                if mine:
+                    os.remove(control_path(self.station_id))
+            except Exception:
+                pass
+
+    def serve(self):
+        while self.running:
+            try:
+                conn, _addr = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+    def handle(self, conn):
+        try:
+            conn.settimeout(5.0)
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            request = json.loads(data.decode("utf-8"))
+            if not hmac.compare_digest(str(request.get("token", "")), self.token):
+                reply = {"ok": False, "error": "Refused."}
+            elif request.get("cmd") == "ping":
+                reply = {"ok": True, "id": self.station_id, "name": self.name, "pid": os.getpid()}
+            elif request.get("cmd") in self.handlers:
+                handler = self.handlers[request["cmd"]]
+                reply = self.run_on_gui(lambda: handler(request))
+                reply = {"ok": True, **(reply or {})}
+            else:
+                reply = {"ok": False, "error": "Unknown command."}
+        except Exception as e:
+            reply = {"ok": False, "error": str(e) or type(e).__name__}
+        try:
+            conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def self_command():
+    """The command that starts another copy of this program."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, os.path.abspath(sys.argv[0])]
+
+
+def station_slug(name, taken):
+    base = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_") or "station"
+    base = base[:24]
+    if base == "main":
+        base = "main_2"
+    slug, number = base, 2
+    while slug in taken:
+        slug = f"{base}_{number}"
+        number += 1
+    return slug
+
+
+class StationStore:
+    """The list of stations the launcher manages. The original install is always there as 'main'."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.items = []
+        try:
+            data = json.loads(str(settings.value("stations_json", "[]")) or "[]")
+            self.items = [d for d in data if isinstance(d, dict) and d.get("id") and d.get("name")]
+        except Exception:
+            self.items = []
+        if not any(i["id"] == "main" for i in self.items):
+            self.items.insert(0, {"id": "main", "name": "Main station", "auto": True})
+            self.save()
+
+    def save(self):
+        self.settings.setValue("stations_json", json.dumps(self.items))
+
+    def find(self, station_id):
+        for item in self.items:
+            if item["id"] == station_id:
+                return item
+        return None
+
+    def add(self, name):
+        name = (name or "").strip()
+        if not name:
+            return "", "Type a name for the station."
+        if any(i["name"].lower() == name.lower() for i in self.items):
+            return "", "A station with that name already exists."
+        station_id = station_slug(name, {i["id"] for i in self.items})
+        self.items.append({"id": station_id, "name": name, "auto": False})
+        self.save()
+        return station_id, ""
+
+    def remove(self, station_id):
+        if station_id == "main":
+            return "The main station cannot be removed."
+        self.items = [i for i in self.items if i["id"] != station_id]
+        self.save()
+        return ""
+
+    def rename(self, station_id, name):
+        name = (name or "").strip()
+        item = self.find(station_id)
+        if item is None or not name:
+            return "Type a name first."
+        if any(i["name"].lower() == name.lower() and i["id"] != station_id for i in self.items):
+            return "A station with that name already exists."
+        item["name"] = name
+        self.save()
+        return ""
+
+    def set_auto(self, station_id, on):
+        item = self.find(station_id)
+        if item is not None:
+            item["auto"] = bool(on)
+            self.save()
+
+
+def launcher_enabled():
+    try:
+        scope = QSettings("VisionRecords", "VisionRadio_Launcher")
+        return str(scope.value("multi_station_enabled", "false")).lower() == "true"
+    except Exception:
+        return False
+
+
+def format_station_line(item, status, running, collapsed_hint=None):
+    """One readable line for the launcher list."""
+    if not running:
+        return f"{item['name']}: not running" + (", starts automatically" if item.get("auto") else "")
+    if status is None:
+        return f"{item['name']}: running, not answering"
+    parts = [item["name"], "collapsed" if status.get("collapsed") else "EXPANDED (heard on this PC)"]
+    if status.get("muted") and not status.get("collapsed"):
+        parts[-1] += ", speakers muted"
+    playing = status.get("now_playing") or "nothing playing"
+    left = int(status.get("seconds_left", 0))
+    parts.append(f"{playing}" + (f", {left // 60}:{left % 60:02d} left" if left else ""))
+    encoders = status.get("encoders", [])
+    if encoders:
+        live = sum(1 for e in encoders if e.get("state") == "live")
+        parts.append(f"{live} of {len(encoders)} encoders live")
+    if status.get("takeover_state") and status.get("takeover_state") != "idle":
+        parts.append(f"live takeover: {status.get('takeover_user', '')} ({status['takeover_state']})")
+    parts.append(f"{status.get('memory_mb', 0):.0f} MB, {status.get('cpu_percent', 0):.0f}% processor")
+    return ": ".join([parts[0], ", ".join(parts[1:])])
+
+
+class StationLauncher(QWidget):
+    """Lists the stations, starts and stops them, and collapses or expands them."""
+
+    polled = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.settings = QSettings("VisionRecords", "VisionRadio_Launcher")
+        self.store = StationStore(self.settings)
+        self.procs = {}
+        self.statuses = {}
+        self.running_ids = set()
+        self.last_encoders = {}
+        self.polling = False
+        self.setWindowTitle("Vision Studio - Stations")
+        self.resize(780, 560)
+        self.setStyleSheet(MAIN_WINDOW_STYLE)
+        layout = QVBoxLayout()
+        intro = QLabel("Each station runs on its own with its own settings, encoders and automation. A collapsed station "
+                       "keeps streaming but is hidden and its speakers are muted. Press Enter on a station to expand or "
+                       "collapse it. Only the expanded station is heard on this PC's speakers.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.alert_label = QLabel("")
+        self.alert_label.setWordWrap(True)
+        self.alert_label.setAccessibleName("Launcher alerts")
+        layout.addWidget(self.alert_label)
+        self.list = QListWidget()
+        self.list.setAccessibleName("Stations")
+        self.list.itemActivated.connect(lambda _item: self.toggle_selected())
+        self.list.currentRowChanged.connect(self.on_row_changed)
+        layout.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        for text, handler in (("Start", self.start_selected), ("Expand Or Collapse (Enter)", self.toggle_selected),
+                              ("Collapse All", self.collapse_all), ("Stop", self.stop_selected)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            row.addWidget(btn)
+        layout.addLayout(row)
+        form = QFormLayout()
+        self.auto_check = QCheckBox("Start this station automatically when the launcher opens")
+        self.auto_check.toggled.connect(self.on_auto_toggled)
+        form.addRow(self.auto_check)
+        self.one_check = QCheckBox("Only one station expanded at a time (expanding one collapses the others)")
+        self.one_check.setChecked(str(self.settings.value("one_expanded", "true")).lower() != "false")
+        self.one_check.toggled.connect(lambda on: self.settings.setValue("one_expanded", "true" if on else "false"))
+        form.addRow(self.one_check)
+        self.name_edit = QLineEdit()
+        self.name_edit.setAccessibleName("Station name")
+        form.addRow("Station name:", self.name_edit)
+        layout.addLayout(form)
+        row2 = QHBoxLayout()
+        for text, handler in (("Add A Station", self.add_station), ("Rename Selected", self.rename_selected),
+                              ("Remove Selected", self.remove_selected)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            row2.addWidget(btn)
+        layout.addLayout(row2)
+        self.totals_label = QLabel("")
+        self.totals_label.setWordWrap(True)
+        self.totals_label.setAccessibleName("Total memory and processor use")
+        layout.addWidget(self.totals_label)
+        quit_btn = QPushButton("Quit Everything (stops every station)")
+        quit_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        quit_btn.clicked.connect(self.quit_everything)
+        layout.addWidget(quit_btn)
+        self.setLayout(layout)
+        for number in range(1, 10):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+Alt+{number}"), self)
+            shortcut.activated.connect(lambda n=number: self.toggle_index(n - 1))
+        self.tray = None
+        self.setup_tray()
+        self.polled.connect(self.on_polled)
+        self.poll_timer = QTimer()
+        self.poll_timer.setInterval(3000)
+        self.poll_timer.timeout.connect(self.poll)
+        self.poll_timer.start()
+        self.refresh_list()
+        QTimer.singleShot(500, self.adopt_running)
+        QTimer.singleShot(1500, self.start_auto_stations)
+
+    # --- helpers ---
+    def tell(self, text):
+        RUN_LOG.write("STATION", text)
+        self.alert_label.setText(text)
+        announce_accessible(self.alert_label, f"Alert: {text}")
+
+    def selected_item(self):
+        row = self.list.currentRow()
+        return self.store.items[row] if 0 <= row < len(self.store.items) else None
+
+    def on_row_changed(self, row):
+        item = self.selected_item()
+        if item is not None:
+            self.name_edit.setText(item["name"])
+            self.auto_check.blockSignals(True)
+            self.auto_check.setChecked(bool(item.get("auto")))
+            self.auto_check.blockSignals(False)
+
+    def on_auto_toggled(self, on):
+        item = self.selected_item()
+        if item is not None:
+            self.store.set_auto(item["id"], on)
+            self.refresh_list()
+
+    def is_running(self, station_id):
+        proc = self.procs.get(station_id)
+        if proc is not None and proc.poll() is None:
+            return True
+        return station_id in self.running_ids
+
+    # --- starting and stopping ---
+    def adopt_running(self):
+        for item in self.store.items:
+            if station_running(item["id"]):
+                self.running_ids.add(item["id"])
+        self.refresh_list()
+
+    def start_auto_stations(self):
+        delay = 0
+        for item in self.store.items:
+            if item.get("auto") and not self.is_running(item["id"]):
+                QTimer.singleShot(delay, lambda i=item["id"]: self.start_station(i))
+                delay += 15000          # one at a time, so they do not all load the PC at once
+
+    def start_station(self, station_id, then_expand=False):
+        item = self.store.find(station_id)
+        if item is None or self.is_running(station_id):
+            if item is not None and then_expand:
+                self.expand(station_id)
+            return
+        command = self_command() + ["--station", station_id, "--station-name", item["name"], "--collapsed"]
+        try:
+            self.procs[station_id] = subprocess.Popen(command, creationflags=SUBPROCESS_FLAGS)
+        except Exception as e:
+            self.tell(f"{item['name']} could not start: {e}")
+            return
+        self.tell(f"Starting {item['name']}. It starts collapsed.")
+        if len(self.store.items) > STATION_SOFT_LIMIT and self.running_count() + 1 > STATION_SOFT_LIMIT:
+            self.tell(f"{self.running_count() + 1} stations are running. More than {STATION_SOFT_LIMIT} may slow this PC down; "
+                      f"check the memory and processor figures below.")
+        if then_expand:
+            self.wait_then_expand(station_id, 0)
+        self.refresh_list()
+
+    def wait_then_expand(self, station_id, tries):
+        if station_running(station_id):
+            self.running_ids.add(station_id)
+            self.expand(station_id)
+        elif tries < 60:
+            QTimer.singleShot(1000, lambda: self.wait_then_expand(station_id, tries + 1))
+        else:
+            self.tell("The station did not finish starting in time.")
+
+    def running_count(self):
+        return sum(1 for i in self.store.items if self.is_running(i["id"]))
+
+    def start_selected(self):
+        item = self.selected_item()
+        if item is None:
+            self.tell("Select a station first.")
+            return
+        self.start_station(item["id"])
+
+    def stop_selected(self):
+        item = self.selected_item()
+        if item is None:
+            self.tell("Select a station first.")
+            return
+        self.stop_station(item["id"], ask=True)
+
+    def stop_station(self, station_id, ask=False):
+        item = self.store.find(station_id)
+        if item is None or not self.is_running(station_id):
+            return
+        status = self.statuses.get(station_id) or {}
+        on_air = status.get("automation") or any(e.get("state") == "live" for e in status.get("encoders", []))
+        if ask and on_air:
+            answer = QMessageBox.question(self, "Stop station",
+                                          f"{item['name']} is on the air. Stop it? Its music fades out and its encoders disconnect.")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            control_call(station_id, "quit", timeout=3.0)
+            self.tell(f"{item['name']} is stopping.")
+        except Exception:
+            proc = self.procs.get(station_id)
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                self.tell(f"{item['name']} did not answer and was stopped.")
+        self.running_ids.discard(station_id)
+        self.statuses.pop(station_id, None)
+        QTimer.singleShot(2500, self.refresh_list)
+
+    def quit_everything(self):
+        running = [i for i in self.store.items if self.is_running(i["id"])]
+        if running:
+            answer = QMessageBox.question(self, "Quit everything",
+                                          f"This stops {len(running)} running station(s) and takes them off the air. Continue?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        for item in running:
+            self.stop_station(item["id"])
+        QTimer.singleShot(4000, lambda: QApplication.quit())
+
+    # --- collapse and expand ---
+    def expand(self, station_id):
+        item = self.store.find(station_id)
+        if item is None:
+            return
+        if not self.is_running(station_id):
+            self.start_station(station_id, then_expand=True)
+            return
+        if self.one_check.isChecked():
+            for other in self.store.items:
+                if other["id"] != station_id and self.is_running(other["id"]) and not (self.statuses.get(other["id"]) or {}).get("collapsed", False):
+                    self.collapse(other["id"], quiet=True)
+        try:
+            control_call(station_id, "show", timeout=4.0)
+            self.tell(f"{item['name']} is expanded.")
+        except Exception as e:
+            self.tell(f"{item['name']} did not answer: {e}")
+        self.poll()
+
+    def collapse(self, station_id, quiet=False):
+        item = self.store.find(station_id)
+        if item is None or not self.is_running(station_id):
+            return
+        try:
+            control_call(station_id, "hide", timeout=4.0)
+            if not quiet:
+                self.tell(f"{item['name']} is collapsed and muted. It is still running.")
+        except Exception as e:
+            self.tell(f"{item['name']} did not answer: {e}")
+
+    def collapse_all(self):
+        for item in self.store.items:
+            self.collapse(item["id"], quiet=True)
+        self.tell("Every station is collapsed.")
+        self.poll()
+
+    def toggle_selected(self):
+        item = self.selected_item()
+        if item is not None:
+            self.toggle_station(item["id"])
+
+    def toggle_index(self, index):
+        if 0 <= index < len(self.store.items):
+            self.toggle_station(self.store.items[index]["id"])
+
+    def toggle_station(self, station_id):
+        status = self.statuses.get(station_id)
+        if self.is_running(station_id) and status is not None and not status.get("collapsed"):
+            self.collapse(station_id)
+        else:
+            self.expand(station_id)
+
+    # --- adding and removing ---
+    def add_station(self):
+        station_id, problem = self.store.add(self.name_edit.text())
+        if problem:
+            self.tell(problem)
+            return
+        self.refresh_list()
+        self.tell(f"{self.name_edit.text().strip()} was added. Press Start, then Expand, and set it up in its Settings.")
+        if len(self.store.items) > STATION_SOFT_LIMIT:
+            self.tell(f"That makes {len(self.store.items)} stations. More than {STATION_SOFT_LIMIT} running at once may slow this PC.")
+
+    def rename_selected(self):
+        item = self.selected_item()
+        if item is None:
+            return
+        problem = self.store.rename(item["id"], self.name_edit.text())
+        self.tell(problem or "Renamed. The new name shows the next time that station starts.")
+        self.refresh_list()
+
+    def remove_selected(self):
+        item = self.selected_item()
+        if item is None:
+            return
+        if self.is_running(item["id"]):
+            self.tell("Stop the station before removing it.")
+            return
+        answer = QMessageBox.question(self, "Remove station",
+                                      f"Remove {item['name']} from this list? Its settings and files stay on this PC.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        problem = self.store.remove(item["id"])
+        self.tell(problem or f"{item['name']} was removed from the list.")
+        self.refresh_list()
+
+    # --- status ---
+    def poll(self):
+        if self.polling:
+            return
+        self.polling = True
+        ids = [i["id"] for i in self.store.items]
+
+        def work():
+            result = {}
+            for station_id in ids:
+                try:
+                    reply = control_call(station_id, "status", timeout=2.0)
+                    result[station_id] = reply if reply.get("ok") else None
+                except FileNotFoundError:
+                    result[station_id] = "off"
+                except Exception:
+                    result[station_id] = None
+            self.polled.emit(result)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_polled(self, result):
+        self.polling = False
+        for station_id, reply in result.items():
+            item = self.store.find(station_id)
+            if reply == "off":
+                self.running_ids.discard(station_id)
+                self.statuses.pop(station_id, None)
+                continue
+            self.running_ids.add(station_id)
+            if reply is None:
+                continue
+            self.statuses[station_id] = reply
+            # a stream going down on a collapsed station is announced here, since nobody is looking at it
+            before = self.last_encoders.get(station_id, {})
+            for encoder in reply.get("encoders", []):
+                was = before.get(encoder["name"])
+                if was == "live" and encoder["state"] != "live":
+                    self.tell(f"{item['name']}: the {encoder['name']} encoder dropped.")
+                elif was is not None and was != "live" and encoder["state"] == "live":
+                    self.tell(f"{item['name']}: the {encoder['name']} encoder is live again.")
+            self.last_encoders[station_id] = {e["name"]: e["state"] for e in reply.get("encoders", [])}
+        self.refresh_list()
+
+    def refresh_list(self):
+        row = self.list.currentRow()
+        self.list.clear()
+        memory = cpu = 0.0
+        for item in self.store.items:
+            running = self.is_running(item["id"])
+            status = self.statuses.get(item["id"]) if running else None
+            self.list.addItem(format_station_line(item, status, running))
+            if status:
+                memory += float(status.get("memory_mb", 0))
+                cpu += float(status.get("cpu_percent", 0))
+        if self.list.count():
+            self.list.setCurrentRow(max(0, min(row, self.list.count() - 1)))
+        count = self.running_count()
+        self.totals_label.setText(f"{count} station(s) running. Together they use about {memory:.0f} MB of memory and "
+                                  f"{cpu:.0f}% of one processor core.")
+        self.refresh_tray()
+
+    # --- tray ---
+    def setup_tray(self):
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return
+            pixmap = QPixmap(64, 64)
+            pixmap.fill(QColor(20, 24, 33))
+            painter = QPainter(pixmap)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "VS")
+            painter.end()
+            icon = QIcon(pixmap)
+            self.setWindowIcon(icon)
+            self.tray = QSystemTrayIcon(icon, self)
+            self.tray.setToolTip("Vision Studio stations")
+            self.tray.activated.connect(self.on_tray_activated)
+            self.tray.show()
+        except Exception as e:
+            self.tray = None
+            RUN_LOG.write("ERROR", f"Station tray could not start: {e}")
+
+    def refresh_tray(self):
+        if self.tray is None:
+            return
+        try:
+            menu = QMenu()
+            for item in self.store.items:
+                status = self.statuses.get(item["id"]) if self.is_running(item["id"]) else None
+                if status is not None and not status.get("collapsed"):
+                    text = f"Collapse {item['name']}"
+                elif self.is_running(item["id"]):
+                    text = f"Expand {item['name']}"
+                else:
+                    text = f"Start and expand {item['name']}"
+                action = menu.addAction(text)
+                action.triggered.connect(lambda _c=False, i=item["id"]: self.toggle_station(i))
+            menu.addSeparator()
+            menu.addAction("Open the station list").triggered.connect(lambda _c=False: self.show_launcher())
+            menu.addAction("Collapse all").triggered.connect(lambda _c=False: self.collapse_all())
+            menu.addAction("Quit everything").triggered.connect(lambda _c=False: self.quit_everything())
+            self.tray_menu = menu
+            self.tray.setContextMenu(menu)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_launcher()
+
+    def show_launcher(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.list.setFocus()
+
+    def closeEvent(self, event):
+        if self.tray is not None and self.tray.isVisible():
+            event.ignore()
+            self.hide()            # the stations keep running; the tray icon brings this list back
+        else:
+            event.accept()
+
+
+
+# ---------------------------------------------------------------------------
 # Main application window
 # ---------------------------------------------------------------------------
 
 class BroadcastingApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Vision Studio")
+        self.setWindowTitle("Vision Studio" + (f" - {STATION_NAME}" if STATION_CHILD else ""))
         self.resize(760, 720)
         self.setStyleSheet(MAIN_WINDOW_STYLE)
-        self.settings = QSettings("VisionRecords", "VisionRadio")
+        self.settings = QSettings("VisionRecords", "VisionRadio" + (("_" + STATION_PROFILE) if STATION_PROFILE else ""))
         self.deck_widgets = {}
         self.encoder_last_state = {}
         self.encoder_problems = {}
@@ -11520,6 +12254,10 @@ class BroadcastingApp(QWidget):
         self._closing = False
         self._shutdown_done = False
         self._quitting = False
+        self.collapsed = bool(STATION_CHILD and "--collapsed" in sys.argv)
+        self._muted_by_collapse = False
+        self.station_control = None
+        self.cpu_meter = CpuMeter()
         self._voice_recording = False
         self.tray = None
         self.menu_actions = {}
@@ -11691,6 +12429,7 @@ class BroadcastingApp(QWidget):
         QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
         QTimer.singleShot(3000, self.apply_remote_vt)
+        self.start_station_control()
         if self.voice_only:
             QTimer.singleShot(500, self.show_voice_tracker)
         try:
@@ -13058,6 +13797,8 @@ class BroadcastingApp(QWidget):
         return QIcon(pixmap)
 
     def setup_tray(self):
+        if STATION_CHILD:
+            return False        # the launcher owns the one tray icon
         try:
             icon = self.make_app_icon()
             self.setWindowIcon(icon)
@@ -13104,6 +13845,9 @@ class BroadcastingApp(QWidget):
             return False
 
     def hide_to_tray(self):
+        if STATION_CHILD:
+            self.collapse_station()
+            return
         if self.tray is None:
             self.showMinimized()
             self.announce("No system tray is available, so the window was minimized instead.")
@@ -13186,6 +13930,11 @@ class BroadcastingApp(QWidget):
             self._quitting = False     # the user said no to the close question
 
     def quit_application(self):
+        try:
+            if self.station_control is not None:
+                self.station_control.stop()
+        except Exception:
+            pass
         try:
             if self.tray is not None:
                 self.tray.hide()
@@ -13376,6 +14125,10 @@ class BroadcastingApp(QWidget):
             return
         if self._closing:
             event.ignore()
+            return
+        if STATION_CHILD and not self._quitting:
+            event.ignore()
+            self.collapse_station()
             return
         if (not self._quitting and self.tray is not None and self.tray.isVisible()
                 and str(self.settings.value("close_to_tray", "false")).lower() == "true"):
@@ -13824,6 +14577,46 @@ class BroadcastingApp(QWidget):
         self.live_selected_id = None
         self.refresh_live_shows()
         self.announce("The live show was removed.")
+
+    def build_stations_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("Run more than one radio station on this PC. This is off until you switch it on. When it is on, "
+                       "Vision Studio opens a station list first. Each station is its own copy of the program with its own "
+                       "settings, encoders, playlists, logs, recordings and automation. The station you have now becomes "
+                       "\"Main station\" with everything exactly as it is. A collapsed station keeps running and streaming "
+                       "but its window is hidden and its speakers are muted, and it does not hold the microphone. Only the "
+                       "station you expand is heard on this PC's speakers and uses its microphone. Three to five stations is "
+                       "typical; each one uses its own memory, so the station list shows the memory and processor use of every "
+                       "station. You will be warned past five, but never blocked. A PC with no sound card can run stations "
+                       "that only do automation and streaming.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.stations_enable_check = QCheckBox("Run more than one station on this PC (takes effect the next time Vision Studio starts)")
+        self.stations_enable_check.setChecked(launcher_enabled())
+        if STATION_CHILD:
+            self.stations_enable_check.setEnabled(False)
+        layout.addWidget(self.stations_enable_check)
+        self.stations_note = QLabel("Manage stations in the station list. In it, Enter expands or collapses the selected station and "
+                                    "Ctrl+Alt+1 to 9 toggle stations one to nine." if STATION_CHILD else "")
+        self.stations_note.setWordWrap(True)
+        layout.addWidget(self.stations_note)
+        save = QPushButton("Save Station Settings")
+        save.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save.clicked.connect(self.save_stations_settings)
+        layout.addWidget(save)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return page
+
+    def save_stations_settings(self):
+        try:
+            scope = QSettings("VisionRecords", "VisionRadio_Launcher")
+            scope.setValue("multi_station_enabled", "true" if self.stations_enable_check.isChecked() else "false")
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.announce("Station settings saved. " + ("Next time Vision Studio starts it opens the station list." if self.stations_enable_check.isChecked()
+                                                   else "Vision Studio starts as a single station."))
 
     def save_live_settings(self):
         self.settings.setValue("live_enabled", "true" if self.live_enable_check.isChecked() else "false")
@@ -14797,6 +15590,7 @@ class BroadcastingApp(QWidget):
         self.rules_tab = self.build_rules_tab()
         self.remote_vt_tab = self.build_remote_vt_tab()
         self.live_tab = self.build_live_tab()
+        self.stations_tab = self.build_stations_tab()
         self.vt_page = VoiceTrackerPage(self)
         sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
                     ("Startup and Tray", self.settings_pages["startup"]), ("Playlists", self.settings_pages["playlists"]),
@@ -14806,7 +15600,7 @@ class BroadcastingApp(QWidget):
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
@@ -14846,6 +15640,8 @@ class BroadcastingApp(QWidget):
         RUN_LOG.write("STATUS", str(message))
 
     def announce(self, message):
+        if STATION_CHILD:
+            message = f"{STATION_NAME}: {message}"
         announce_accessible(self.alert_label, f"Alert: {message}")
         self.update_status(message)
 
@@ -14986,14 +15782,22 @@ class BroadcastingApp(QWidget):
         if self.mixer.available:
             self.mixer.push_raw("mic", data, fmt.sampleRate(), fmt.channelCount(), fmt.sampleFormat())
 
-    def toggle_mute(self):
+    def toggle_mute(self, *_ignored):
         """Mutes this computer's speakers only. The stream encoders, the recording and the microphone feed
         keep the full program."""
-        self.is_muted = not self.is_muted
-        try:
-            self.settings.setValue("speakers_muted", "true" if self.is_muted else "false")
-        except Exception:
-            pass
+        if self.collapsed:
+            self.announce("This station is collapsed, so its speakers stay muted. Expand it first.")
+            return
+        self._muted_by_collapse = False
+        self.apply_mute(not self.is_muted, persist=True, quiet=False)
+
+    def apply_mute(self, muted, persist=True, quiet=False):
+        self.is_muted = bool(muted)
+        if persist:
+            try:
+                self.settings.setValue("speakers_muted", "true" if self.is_muted else "false")
+            except Exception:
+                pass
         self.rotation.set_muted(self.is_muted)
         self.sequence_player.set_muted(self.is_muted)
         self.microphone.set_muted(self.is_muted)
@@ -15001,12 +15805,75 @@ class BroadcastingApp(QWidget):
             self.mute_btn.setText("Unmute Speakers (Ctrl+Shift+U)")
             self.console_mute_label.setText("Speakers muted. The stream is live.")
             self.console_mute_label.setStyleSheet(f"color: {COLOR_LIVE_RED}; font-weight: bold;")
-            self.announce("Speakers muted. The stream is still live.")
+            if not quiet:
+                self.announce("Speakers muted. The stream is still live.")
         else:
             self.mute_btn.setText("Mute Speakers (Ctrl+Shift+U)")
             self.console_mute_label.setText("Mute: off.")
             self.console_mute_label.setStyleSheet(f"color: {COLOR_TEXT_DIM};")
-            self.announce("Speakers unmuted.")
+            if not quiet:
+                self.announce("Speakers unmuted.")
+
+    # --- several stations on one PC ---
+    def start_station_control(self):
+        if not STATION_CHILD:
+            return
+        self.station_control = StationControl(
+            STATION_ID, STATION_NAME,
+            {"show": lambda r: self.expand_station(), "hide": lambda r: self.collapse_station(),
+             "status": lambda r: self.station_status(), "quit": lambda r: self.station_quit()},
+            self.gui_caller.call)
+        if not self.station_control.start():
+            RUN_LOG.write("STATION", "The control link could not start; the launcher cannot manage this station.")
+
+    def collapse_station(self):
+        """Hides the window and mutes this PC's speakers (the station keeps running and streaming), and lets go of the microphone."""
+        if not self.collapsed:
+            self._muted_by_collapse = not self.is_muted
+            self.collapsed = True
+        try:
+            if self.microphone.is_live:
+                self.microphone.stop()
+        except Exception:
+            pass
+        if not self.is_muted:
+            self.apply_mute(True, persist=False, quiet=True)
+        self.hide()
+        RUN_LOG.write("STATION", f"{STATION_NAME} collapsed.")
+        return {"collapsed": True}
+
+    def expand_station(self):
+        self.collapsed = False
+        if self._muted_by_collapse and self.is_muted:
+            self.apply_mute(False, persist=False, quiet=True)
+        self._muted_by_collapse = False
+        self.show_from_tray()
+        self.announce("Expanded. Its speakers are on.")
+        RUN_LOG.write("STATION", f"{STATION_NAME} expanded.")
+        return {"collapsed": False}
+
+    def station_quit(self):
+        QTimer.singleShot(200, self.exit_program)
+        return {}
+
+    def station_status(self):
+        playing = ""
+        left = 0
+        try:
+            for d in (self.rotation.deck_a, self.rotation.deck_b):
+                if d.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState and d.player.duration() > 0:
+                    playing = re.sub(r"^Now Playing: ", "", self.now_playing_label.text())
+                    left = max(0, (d.player.duration() - d.player.position()) // 1000)
+                    break
+        except Exception:
+            pass
+        return {"collapsed": self.collapsed, "muted": self.is_muted,
+                "now_playing": playing,
+                "seconds_left": int(left),
+                "automation": bool(self.rotation.is_running and self.rotation.automation_on),
+                "encoders": [{"name": s.stream_name, "state": s.state} for s in self.encoder_bank.slots],
+                "takeover_state": self.live_station.state, "takeover_user": self.live_station.user,
+                "memory_mb": process_memory_mb(), "cpu_percent": self.cpu_meter.percent()}
 
     # --- Scheduler / sequence callbacks ---
     def start_break(self, slot):
@@ -15214,8 +16081,24 @@ if __name__ == "__main__":
     disable_power_throttling()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)      # hiding to the system tray must not end the program
+    if STATION_CHILD and station_running(STATION_ID):
+        RUN_LOG.write("STATION", f"{STATION_NAME} is already running; this second copy is closing.")
+        sys.exit(0)
+    if not STATION_CHILD and launcher_enabled():
+        try:
+            launcher = StationLauncher()
+            launcher.show()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            QMessageBox.critical(None, "Vision Studio could not start",
+                                 f"The station list could not start.\n\n{type(e).__name__}: {e}\n\nDetails were saved to:\n{ERROR_LOG_PATH}")
+            sys.exit(1)
+        sys.exit(app.exec())
     try:
         window = BroadcastingApp()
+        if STATION_CHILD and window.collapsed:
+            window.collapse_station()
+            sys.exit(app.exec())
         # Only a start-up entry made by the "Start with Windows" setting counts as a Windows start-up launch.
         if ("--startup" in sys.argv or "--tray" in sys.argv) and autostart_enabled():
             window.on_startup_launch()
