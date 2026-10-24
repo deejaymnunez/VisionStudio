@@ -2143,6 +2143,7 @@ DEFAULT_SHORTCUTS = [
     ("mute_all", "Mute or unmute all audio", "Ctrl+Shift+U", True),
     ("open_options", "Open or close Settings", "Ctrl+O", True),
     ("send_to_tray", "Send to the system tray (keeps playing)", "Ctrl+Shift+Y", True),
+    ("show_voice_tracker", "Voice tracker: record on a station from this PC", "Ctrl+Shift+V", True),
     ("toggle_recording", "Start or stop recording", "R", True),
     ("new_item", "New rotation, category or hour marker (depends on the tab)", "Ctrl+N", True),
     ("generate_now", "Generate playlists now", "Ctrl+Shift+G", True),
@@ -10076,7 +10077,7 @@ class VTAccounts:
                 return item
         return None
 
-    def add(self, user, password, allowed_ip="", enabled=True, keep_password=False):
+    def add(self, user, password, allowed_ip="", enabled=True, keep_password=False, live=None):
         user = (user or "").strip()
         if not user or any(c in user for c in "|\n\r\t"):
             return "Type a user name without spaces at the ends or the | character."
@@ -10084,13 +10085,16 @@ class VTAccounts:
         if existing is not None and keep_password and not password:
             existing["ip"] = (allowed_ip or "").strip()
             existing["enabled"] = bool(enabled)
+            if live is not None:
+                existing["live"] = bool(live)
             self.save()
             return ""
         if len(password or "") < 8:
             return "The password needs at least 8 characters."
         salt = secrets.token_hex(16)
         entry = {"user": user, "salt": salt, "rounds": VT_PBKDF2_ROUNDS, "key": vt_derive_key(password, salt),
-                 "ip": (allowed_ip or "").strip(), "enabled": bool(enabled)}
+                 "ip": (allowed_ip or "").strip(), "enabled": bool(enabled),
+                 "live": bool(live) if live is not None else bool(existing.get("live")) if existing else False}
         if existing is not None:
             self.items[self.items.index(existing)] = entry
         else:
@@ -10280,6 +10284,36 @@ class VTService:
             entries = insert_voice_markers([e for e in entries if not is_voice_marker(e)], VOICE_MARKER_EVERY, False)
             write_m3u(path, entries)
         return self.describe(entries, user)
+
+    def preview(self, user, day, hour, index, part, seconds):
+        """A few seconds from the end of the song at `index` (part 'end') or from its start ('start'),
+        as a small WAV, so the voice tracker hears what leads into and out of a gap."""
+        self.check_hour(day, hour)
+        path = self.app.playlist_generator.current_hour_playlist(day, hour)
+        if not path:
+            raise ValueError("That hour has no playlist yet.")
+        entries, _m = read_m3u(path)
+        if not (0 <= index < len(entries)) or is_hour_marker(entries[index]) or not is_song_entry(entries[index]):
+            raise ValueError("That position is not a song.")
+        song = entries[index]
+        seconds = max(2, min(int(seconds), 30))
+        total = float(get_track_duration(song) or 0)
+        start = max(0.0, total - seconds) if part == "end" else 0.0
+        out = os.path.join(tempfile.gettempdir(), "vs_preview_%s.wav" % secrets.token_hex(4))
+        cmd = [get_ffmpeg_path(), "-y", "-loglevel", "error", "-ss", f"{start:.2f}", "-t", str(seconds), "-i", song,
+               "-ac", "1", "-ar", "22050", "-sample_fmt", "s16", out]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=30, check=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with open(out, "rb") as handle:
+                return handle.read()
+        except Exception:
+            raise ValueError("The station could not prepare that preview.")
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
 
     def work_object(self, day, hour, entries):
         class Work:
@@ -10473,6 +10507,18 @@ class VTServer:
         try:
             if cmd == "ping":
                 return {"ok": True}, b""
+            live = getattr(service, "live", None)
+            if cmd == "status":
+                return {"ok": True, "status": self.run_on_gui(lambda: live.status(user) if live else {})}, b""
+            if cmd == "live_request":
+                result = self.run_on_gui(lambda: live.request(user, ip))
+                return {"ok": True, **result}, b""
+            if cmd == "live_ready":
+                result = self.run_on_gui(lambda: live.ready_from(user))
+                return {"ok": True, **result}, b""
+            if cmd == "live_release":
+                result = self.run_on_gui(lambda: live.release_by(user, "released by " + user))
+                return {"ok": True, **result}, b""
             if cmd == "hours":
                 result = self.run_on_gui(lambda: service.list_hours(user, int(header.get("days", 2))))
                 return {"ok": True, "hours": result}, b""
@@ -10481,6 +10527,9 @@ class VTServer:
             if cmd == "hour":
                 result = self.run_on_gui(lambda: service.get_hour(user, day, hour))
                 return {"ok": True, "entries": result}, b""
+            if cmd == "preview":
+                data = service.preview(user, day, hour, int(header["index"]), str(header.get("part", "end")), int(header.get("seconds", 12)))
+                return {"ok": True}, data
             if cmd == "put":
                 if not self.uploads.acquire(blocking=False):
                     return {"ok": False, "error": "The station is receiving other clips. Try again in a moment."}, b""
@@ -10532,6 +10581,25 @@ class VTClient:
             raise RuntimeError(reply.get("error", "The station refused that."))
         return reply
 
+    def status(self):
+        return self.ask({"cmd": "status"})["status"]
+
+    def live_request(self):
+        return self.ask({"cmd": "live_request"})
+
+    def live_ready(self):
+        return self.ask({"cmd": "live_ready"})
+
+    def live_release(self):
+        return self.ask({"cmd": "live_release"})
+
+    def preview(self, day, hour, index, part="end", seconds=12):
+        vt_send(self.sock, {"cmd": "preview", "day": day, "hour": hour, "index": index, "part": part, "seconds": seconds})
+        reply, body = vt_recv(self.sock, VT_MAX_CLIP_BYTES)
+        if not reply.get("ok"):
+            raise RuntimeError(reply.get("error", "The station refused that."))
+        return body
+
     def hours(self, days=2):
         return self.ask({"cmd": "hours", "days": days})["hours"]
 
@@ -10549,6 +10617,882 @@ class VTClient:
             self.sock.close()
         except Exception:
             pass
+
+
+
+# ---------------------------------------------------------------------------
+# Live takeover (station side and the live PC's side) and the voice tracker screen.
+# Everything here is off until someone switches it on in Settings.
+# ---------------------------------------------------------------------------
+
+LIVE_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def protect_text(text):
+    """Windows only: scrambles text so only this Windows user on this PC can read it back. '' elsewhere."""
+    if os.name != "nt" or not text:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+        data = text.encode("utf-8")
+        buffer = ctypes.create_string_buffer(data, len(data))
+        source = BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+        result = BLOB()
+        if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)):
+            return ""
+        raw = ctypes.string_at(result.pbData, result.cbData)
+        ctypes.windll.kernel32.LocalFree(result.pbData)
+        return base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return ""
+
+
+def unprotect_text(text):
+    if os.name != "nt" or not text:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+        data = base64.b64decode(text)
+        buffer = ctypes.create_string_buffer(data, len(data))
+        source = BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+        result = BLOB()
+        if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)):
+            return ""
+        raw = ctypes.string_at(result.pbData, result.cbData)
+        ctypes.windll.kernel32.LocalFree(result.pbData)
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def parse_clock_text(text):
+    """'18:00', '6:30 pm' or '0' style times to minutes after midnight, or None."""
+    text = (text or "").strip().lower().replace(".", "")
+    pm = text.endswith("pm")
+    am = text.endswith("am")
+    text = text[:-2].strip() if (pm or am) else text
+    try:
+        if ":" in text:
+            hh, mm = text.split(":", 1)
+            hour, minute = int(hh), int(mm)
+        else:
+            hour, minute = int(text), 0
+    except ValueError:
+        return None
+    if pm and hour < 12:
+        hour += 12
+    if am and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def clock_text(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+class LiveShows:
+    """The live shows that may take the air: who, which days, from what time to what time, and optionally
+    from which address. A show that ends earlier than it starts runs past midnight."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.items = []
+        try:
+            data = json.loads(str(settings.value("live_shows_json", "[]")) or "[]")
+            self.items = [d for d in data if isinstance(d, dict) and d.get("user") and d.get("id")]
+        except Exception:
+            self.items = []
+
+    def save(self):
+        self.settings.setValue("live_shows_json", json.dumps(self.items))
+
+    def add(self, user, days, start, end, ip="", enabled=True, show_id=None):
+        start_min, end_min = parse_clock_text(start), parse_clock_text(end)
+        if not (user or "").strip():
+            return "Choose who the show belongs to."
+        if not days:
+            return "Choose at least one day."
+        if start_min is None or end_min is None:
+            return "Type the start and end as times, for example 18:00 and 00:00."
+        if start_min == end_min:
+            return "The show needs a start time that differs from its end time."
+        entry = {"id": show_id or secrets.token_hex(4), "user": user.strip(), "days": sorted(set(int(d) for d in days)),
+                 "start": clock_text(start_min), "end": clock_text(end_min), "ip": (ip or "").strip(),
+                 "enabled": bool(enabled)}
+        for index, existing in enumerate(self.items):
+            if existing["id"] == entry["id"]:
+                self.items[index] = entry
+                break
+        else:
+            self.items.append(entry)
+        self.save()
+        return ""
+
+    def remove(self, show_id):
+        before = len(self.items)
+        self.items = [i for i in self.items if i["id"] != show_id]
+        if len(self.items) != before:
+            self.save()
+            return True
+        return False
+
+    def windows(self, now, user=None, days_ahead=8):
+        """The coming (and running) occurrences, soonest first: dicts with id, user, start, end, ip, enabled."""
+        out = []
+        for entry in self.items:
+            if user is not None and entry["user"].lower() != user.lower():
+                continue
+            start_min = parse_clock_text(entry["start"])
+            end_min = parse_clock_text(entry["end"])
+            if start_min is None or end_min is None:
+                continue
+            length = (end_min - start_min) % 1440
+            for offset in range(-1, days_ahead + 1):
+                day = now.date() + timedelta(days=offset)
+                if day.weekday() not in entry.get("days", []):
+                    continue
+                start = datetime(day.year, day.month, day.day) + timedelta(minutes=start_min)
+                end = start + timedelta(minutes=length)
+                if end > now:
+                    out.append({"id": entry["id"], "user": entry["user"], "start": start, "end": end,
+                                "ip": entry.get("ip", ""), "enabled": entry.get("enabled", True)})
+        out.sort(key=lambda w: w["start"])
+        return out
+
+    def describe(self, entry):
+        days = ", ".join(LIVE_DAY_NAMES[d][:3] for d in entry.get("days", []))
+        where = f", from {entry['ip']}" if entry.get("ip") else ""
+        return (f"{entry['user']}: {days}, {entry['start']} to {entry['end']}{where}"
+                + ("" if entry.get("enabled", True) else ", switched off"))
+
+
+class LiveStation:
+    """The automation PC's side of a live takeover. A scheduled person asks to take over; the music is
+    timed to end on the show's start (or at the end of the song when it is already past), the stream
+    encoders are let go, the speakers are muted and automation keeps running silently. When the show ends,
+    or the live PC says it is done, or the take-back time passes, the encoders reconnect and the music
+    fades back in."""
+
+    def __init__(self, app):
+        self.app = app
+        self.state = "idle"          # idle, waiting (for the song to end), handed (the live PC has the air)
+        self.user = ""
+        self.window = None
+        self.ready = False
+        self.muted_by_us = False
+        self.restart_slots = []
+        self.armed = False
+        self.last_seen = {}
+
+    def setting(self, key, default):
+        try:
+            return type(default)(float(self.app.settings.value(key, default)))
+        except Exception:
+            return default
+
+    def enabled(self):
+        return str(self.app.settings.value("live_enabled", "false")).lower() == "true"
+
+    def brief(self):
+        return {"state": self.state, "user": self.user}
+
+    def log(self, text):
+        RUN_LOG.write("LIVE", text)
+        self.app.vt_activity.append(time.strftime("%I:%M:%S %p ").lstrip("0") + text)
+
+    def status(self, user):
+        app = self.app
+        now = datetime.now()
+        engine = app.rotation
+        deck = engine.get_live_deck()
+        playing = deck.current_track_path
+        left = 0
+        try:
+            if playing and deck.player.duration() > 0:
+                left = max(0.0, (deck.player.duration() - deck.player.position()) / 1000.0)
+        except Exception:
+            left = 0
+        account = app.vt_accounts.find(user)
+        shows = []
+        if self.enabled() and account is not None and account.get("live"):
+            for w in app.live_shows.windows(now, user, days_ahead=7):
+                if w["enabled"]:
+                    shows.append({"id": w["id"], "start_in": round((w["start"] - now).total_seconds()),
+                                  "end_in": round((w["end"] - now).total_seconds()),
+                                  "text": w["start"].strftime("%a %I:%M %p").replace(" 0", " ") + " to " + w["end"].strftime("%I:%M %p").lstrip("0")})
+        window = None
+        if self.window is not None:
+            window = {"start_in": round((self.window["start"] - now).total_seconds()),
+                      "end_in": round((self.window["end"] - now).total_seconds())}
+        return {"now_playing": format_track_display(playing) if playing else "", "seconds_left": int(left),
+                "automation": bool(engine.is_running and engine.automation_on),
+                "on_break": bool(engine.is_paused_for_sequence),
+                "encoders": ([{"name": s.stream_name, "state": s.state} for s in app.encoder_bank.slots]
+                             if account is not None and account.get("live") else []),
+                "enabled": self.enabled(), "state": self.state, "takeover_user": self.user, "ready": self.ready,
+                "window": window, "shows": shows, "early_minutes": self.setting("live_early_minutes", 15),
+                "server_time": now.isoformat(timespec="seconds")}
+
+    def request(self, user, ip):
+        if not self.enabled():
+            raise ValueError("Live takeovers are switched off on this station.")
+        account = self.app.vt_accounts.find(user)
+        if account is None or not account.get("live"):
+            raise ValueError("Your account is not allowed to go live.")
+        now = datetime.now()
+        early = timedelta(minutes=self.setting("live_early_minutes", 15))
+        chosen = None
+        for w in self.app.live_shows.windows(now, user):
+            if not w["enabled"] or (w["ip"] and w["ip"] != ip):
+                continue
+            if w["start"] - early <= now <= w["end"]:
+                chosen = w
+                break
+        if chosen is None:
+            self.log(f"{user} asked to go live from {ip} but has no show scheduled now. Refused.")
+            raise ValueError(f"You have no live show scheduled now. Requests are accepted from "
+                             f"{int(early.total_seconds() // 60)} minutes before a show until it ends.")
+        if self.state != "idle":
+            if self.user.lower() != user.lower():
+                raise ValueError(f"{self.user} already has the air or is waiting for it.")
+            return self.brief()
+        self.user = account["user"]
+        self.window = chosen
+        self.ready = False
+        self.state = "waiting"
+        self.armed = False
+        self.log(f"{self.user} asked to take over for the show starting {chosen['start'].strftime('%I:%M %p').lstrip('0')}.")
+        self.arm_if_needed()
+        return self.brief()
+
+    def target_time(self):
+        now = datetime.now()
+        if self.window["start"] > now:
+            return self.window["start"]
+        engine = self.app.rotation
+        deck = engine.get_live_deck()
+        remaining = 0.5
+        try:
+            if deck.current_track_path and deck.player.duration() > 0:
+                remaining = max(0.5, (deck.player.duration() - deck.player.position()) / 1000.0 + 0.5)
+        except Exception:
+            remaining = 0.5
+        return now + timedelta(seconds=remaining)
+
+    def arm_if_needed(self):
+        if self.state != "waiting" or self.armed:
+            return
+        engine = self.app.rotation
+        if engine.is_paused_for_sequence:
+            return              # a break is playing: arm right after it
+        if not (engine.is_running and engine.automation_on):
+            self.handoff()      # nothing is playing, so the air can be handed over now
+            return
+        engine.arm_break(self.target_time(), "LIVE", self.handoff)
+        self.armed = True
+
+    def handoff(self):
+        app = self.app
+        if self.state != "waiting":
+            return
+        self.armed = False
+        let_go = []
+        for slot in list(app.encoder_bank.slots):
+            if slot.state in ("live", "connecting"):
+                let_go.append(slot)
+                app.encoder_bank.stop_slot(slot)
+        self.restart_slots = let_go
+        if not app.is_muted:
+            app.toggle_mute()
+            self.muted_by_us = True
+        self.state = "handed"
+        self.log(f"The air is handed to {self.user}. {len(let_go)} encoder(s) let go; automation keeps running silently.")
+        app.announce(f"{self.user} is taking the air. The encoders are disconnected.")
+        if app.rotation.is_paused_for_sequence:
+            app.rotation.resume_after_sequence()
+
+    def ready_from(self, user):
+        """The live PC says its encoders are connected and its automation is on."""
+        if self.state == "handed" and self.user.lower() == user.lower():
+            self.ready = True
+            self.log(f"{self.user} is on air.")
+        return self.brief()
+
+    def release_by(self, user, reason):
+        if self.state == "idle":
+            return self.brief()
+        if self.user.lower() != user.lower():
+            raise ValueError("The air is not yours to give back.")
+        self.release(reason)
+        return self.brief()
+
+    def release(self, reason):
+        app = self.app
+        was = self.state
+        who = self.user
+        if was == "waiting" and app.rotation.break_is_armed("LIVE"):
+            app.rotation.disarm_break()
+        self.state = "idle"
+        self.user = ""
+        self.window = None
+        self.ready = False
+        self.armed = False
+        if was == "handed":
+            for slot in self.restart_slots:
+                if slot.state == "offline":
+                    slot.boot_retry_until = time.monotonic() + 120
+                    app.encoder_bank.start_slot(slot)
+            self.restart_slots = []
+            if self.muted_by_us and app.is_muted:
+                app.toggle_mute()
+            self.muted_by_us = False
+            self.fade_in()
+        self.log(f"The air is back with the station ({reason}); {who}'s turn is over.")
+        app.announce("The station has the air back." if was == "handed" else "The live takeover was cancelled.")
+
+    def fade_in(self):
+        try:
+            engine = self.app.rotation
+            deck = engine.get_live_deck()
+            if engine.is_running and deck.current_track_path:
+                level = engine._effective_level() * getattr(deck, "manual_volume", 1.0)
+                deck.audio_output.setVolume(0.0)
+                deck.fader.fade_to(level, steps=30, interval_ms=100)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def tick(self):
+        if self.state == "idle":
+            return
+        if not self.enabled():
+            self.release("live takeovers were switched off")
+            return
+        now = datetime.now()
+        if self.window is None:
+            self.release("no show on record")
+            return
+        grace = timedelta(minutes=self.setting("live_takeback_minutes", 5))
+        if self.state == "waiting":
+            self.arm_if_needed()
+            if now > self.window["end"]:
+                self.release("the show's time passed before the handoff")
+        elif self.state == "handed" and now > self.window["end"] + grace:
+            self.release("the show's end time and the take-back time passed")
+
+
+class LiveLink(QObject):
+    """The live PC's side. It watches the station over the voice tracking link, asks to take over when a
+    scheduled show is near, connects its own encoders when the station lets go, starts its automation,
+    and gives the air back at the show's end."""
+
+    polled = pyqtSignal(object, object, object)       # status, error, what was done
+    CONNECT_LIMIT_SECONDS = 90
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.client = None
+        self.phase = "idle"            # idle, requested, connecting, onair, ending
+        self.busy = False
+        self.pending = None            # "ready" or "release": told to the station on the next round
+        self.done_keys = set()
+        self.current_key = ""
+        self.connect_started = 0.0
+        self.last_error = ""
+        self.last_status = None
+        self.last_text = "Not connected."
+        self.manual_request = False
+        self.polled.connect(self.on_polled)
+        self.timer = QTimer()
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
+
+    def enabled(self):
+        return str(self.app.settings.value("live_link_enabled", "false")).lower() == "true"
+
+    def connection(self):
+        s = self.app.settings
+        password = unprotect_text(str(s.value("vt_client_pass", "")))
+        return (str(s.value("vt_client_host", "")), int(float(s.value("vt_client_port", VT_DEFAULT_PORT))),
+                str(s.value("vt_client_user", "")), password)
+
+    def tick(self):
+        if not (self.enabled() or self.manual_request or self.phase != "idle" or self.pending):
+            return
+        if self.busy:
+            return
+        self.busy = True
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    def worker(self):
+        did = None
+        try:
+            if self.client is None:
+                host, port, user, password = self.connection()
+                if not (host and user and password):
+                    raise ConnectionError("The station address, user name and password are not saved yet. Fill them in on the Voice Tracker screen and tick Remember.")
+                self.client = VTClient(host, port, user, password)
+            if self.pending == "ready":
+                self.client.live_ready()
+                self.pending = None
+                did = "ready"
+            elif self.pending == "release":
+                self.client.live_release()
+                self.pending = None
+                did = "release"
+            status = self.client.status()
+            if self.phase == "idle" and status.get("enabled") and (self.manual_request or self.enabled()):
+                if self.manual_request or self.next_show(status) is not None:
+                    self.client.live_request()
+                    did = "request"
+                    status = self.client.status()
+            self.polled.emit(status, None, did)
+        except Exception as e:
+            try:
+                if self.client is not None:
+                    self.client.close()
+            except Exception:
+                pass
+            self.client = None
+            self.polled.emit(None, e, did)
+
+    def next_show(self, status):
+        early = float(status.get("early_minutes", 15)) * 60
+        for show in status.get("shows", []):
+            key = f"{show['id']}:{int(round((time.time() + show['start_in']) / 60.0))}"
+            if key in self.done_keys:
+                continue
+            if show["start_in"] <= early and show["end_in"] > 0:
+                self.current_key = key
+                return show
+        return None
+
+    def on_polled(self, status, error, did):
+        self.busy = False
+        app = self.app
+        if error is not None:
+            self.last_error = str(error) or type(error).__name__
+            self.last_text = "Cannot reach the station: " + self.last_error
+            return
+        self.last_status = status
+        self.last_error = ""
+        state = status.get("state")
+        mine = str(status.get("takeover_user", "")).lower() == self.connection()[2].lower()
+        if did == "request" and self.phase == "idle":
+            self.phase = "requested"
+            self.manual_request = False
+            app.announce("Takeover requested. The station is finishing its music.")
+        if self.phase == "requested":
+            if state == "handed" and mine:
+                self.phase = "connecting"
+                self.connect_started = time.monotonic()
+                app.announce("The station has let go. Connecting your encoders.")
+            elif state == "idle":
+                self.phase = "idle"
+        if self.phase == "connecting":
+            self.try_connect_encoders()
+        if self.phase == "onair":
+            window = status.get("window")
+            if (window and window.get("end_in", 1) <= 0) or state != "handed" or not mine:
+                self.finish()
+        wait = status.get("window") or {}
+        self.last_text = (f"Phase: {self.phase}. Station: {status.get('now_playing') or 'nothing playing'}, "
+                          f"{status.get('seconds_left', 0)} seconds left. Takeover: {state}.")
+
+    def try_connect_encoders(self):
+        app = self.app
+        slots = list(app.encoder_bank.slots)
+        if not slots:
+            app.announce("This PC has no encoders set up, so it cannot go on air.")
+            self.phase = "idle"
+            self.pending = "release"
+            return
+        for slot in slots:
+            if slot.state == "offline":
+                slot.boot_retry_until = time.monotonic() + 60
+                app.encoder_bank.start_slot(slot)
+        if any(slot.state == "live" for slot in slots):
+            self.phase = "onair"
+            self.pending = "ready"
+            try:
+                if not (app.rotation.is_running and app.rotation.automation_on):
+                    app.start_rotation()
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+            RUN_LOG.write("LIVE", "On air: encoders live and automation started.")
+            app.announce("You are on air.")
+        elif time.monotonic() - self.connect_started > self.CONNECT_LIMIT_SECONDS:
+            RUN_LOG.write("LIVE", "The encoders did not connect in time; giving the air back.")
+            app.announce("The encoders did not connect. Giving the air back to the station.")
+            self.finish(connected=False)
+
+    def release_now(self):
+        if self.phase in ("onair", "connecting", "requested"):
+            self.finish()
+        else:
+            self.app.announce("This PC does not have the air.")
+
+    def finish(self, connected=True):
+        app = self.app
+        self.phase = "idle"
+        self.manual_request = False
+        if self.current_key:
+            self.done_keys.add(self.current_key)
+        if connected:
+            try:
+                app.stop_with_fade()
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+            QTimer.singleShot(6000, self.drop_encoders)      # the station is told once the encoders are down
+        else:
+            self.drop_encoders()
+        app.announce("Your show is over. Giving the air back to the station.")
+
+    def drop_encoders(self):
+        for slot in list(self.app.encoder_bank.slots):
+            if slot.state in ("live", "connecting"):
+                self.app.encoder_bank.stop_slot(slot)
+        self.pending = "release"
+        RUN_LOG.write("LIVE", "Encoders dropped; the air is back with the station.")
+
+    def request_manually(self):
+        self.manual_request = True
+        self.app.announce("Asking the station to let you take over at the end of its song.")
+
+
+class VoiceTrackerPage(QWidget):
+    """The voice tracker's screen: connect to a station, pick an hour and a slot, record, send."""
+
+    done = pyqtSignal(object, object, object)       # finished callback, result, error
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.client = None
+        self.entries = []
+        self.hours = []
+        self.current = None            # (day text, hour)
+        self.preview_player = None
+        self.done.connect(self.on_done)
+        layout = QVBoxLayout()
+        intro = QLabel("Voice track an hour on a station from this PC. Connect with the address, user name and "
+                       "password the station gave you. Choose an open hour, choose a voice track slot, press "
+                       "Ctrl+T to record into it, and the clip is sent to the station.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        s = app.settings
+        self.host_edit = QLineEdit(str(s.value("vt_client_host", "")))
+        self.host_edit.setAccessibleName("Station address")
+        form.addRow("Station address:", self.host_edit)
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setValue(int(float(s.value("vt_client_port", VT_DEFAULT_PORT))))
+        self.port_spin.setAccessibleName("Station port")
+        form.addRow("Port:", self.port_spin)
+        self.user_edit = QLineEdit(str(s.value("vt_client_user", "")))
+        self.user_edit.setAccessibleName("Your user name")
+        form.addRow("User name:", self.user_edit)
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pass_edit.setAccessibleName("Your password")
+        saved = unprotect_text(str(s.value("vt_client_pass", "")))
+        if saved:
+            self.pass_edit.setText(saved)
+        form.addRow("Password:", self.pass_edit)
+        self.remember_check = QCheckBox("Remember the password on this PC (needed for automatic live takeovers)")
+        self.remember_check.setChecked(bool(saved))
+        form.addRow(self.remember_check)
+        layout.addLayout(form)
+        row = QHBoxLayout()
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.connect_btn.clicked.connect(self.connect_clicked)
+        row.addWidget(self.connect_btn)
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.disconnect_btn.clicked.connect(self.disconnect_clicked)
+        row.addWidget(self.disconnect_btn)
+        layout.addLayout(row)
+        self.status_label = QLabel("Not connected.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setAccessibleName("Voice tracker connection status")
+        layout.addWidget(self.status_label)
+        layout.addWidget(QLabel("Open hours:"))
+        self.hours_list = QListWidget()
+        self.hours_list.setAccessibleName("Hours open for voice tracking")
+        self.hours_list.setMaximumHeight(140)
+        self.hours_list.itemActivated.connect(lambda _item: self.load_hour_clicked())
+        layout.addWidget(self.hours_list)
+        load_btn = QPushButton("Load The Selected Hour")
+        load_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        load_btn.clicked.connect(self.load_hour_clicked)
+        layout.addWidget(load_btn)
+        layout.addWidget(QLabel("The hour's playlist:"))
+        self.entries_list = QListWidget()
+        self.entries_list.setAccessibleName("The hour's playlist")
+        layout.addWidget(self.entries_list, 1)
+        for text, handler in (("Record Into The Selected Slot (Ctrl+T)", self.record_clicked),
+                              ("Hear The End Of The Song Before The Slot", lambda: self.preview_clicked("end")),
+                              ("Hear The Start Of The Song After The Slot", lambda: self.preview_clicked("start")),
+                              ("Remove My Selected Clip", self.remove_clicked)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            layout.addWidget(btn)
+        self.live_row = QHBoxLayout()
+        self.takeover_btn = QPushButton("Take Over At The End Of The Station's Song")
+        self.takeover_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.takeover_btn.clicked.connect(lambda: app.live_link.request_manually())
+        self.live_row.addWidget(self.takeover_btn)
+        self.giveback_btn = QPushButton("Give The Air Back")
+        self.giveback_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.giveback_btn.clicked.connect(lambda: app.live_link.release_now())
+        self.live_row.addWidget(self.giveback_btn)
+        layout.addLayout(self.live_row)
+        self.live_label = QLabel("")
+        self.live_label.setWordWrap(True)
+        self.live_label.setAccessibleName("Live takeover status")
+        layout.addWidget(self.live_label)
+        self.setLayout(layout)
+        self.live_timer = QTimer(self)
+        self.live_timer.setInterval(1500)
+        self.live_timer.timeout.connect(self.refresh_live_label)
+        self.live_timer.start()
+
+    # --- background work ---
+    def run_bg(self, work, finished):
+        def target():
+            try:
+                result, error = work(), None
+            except Exception as e:
+                result, error = None, e
+            self.done.emit(finished, result, error)
+        threading.Thread(target=target, daemon=True).start()
+
+    def on_done(self, finished, result, error):
+        try:
+            finished(result, error)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def say(self, text):
+        self.status_label.setText(text)
+        self.app.announce(text)
+
+    # --- connection ---
+    def connect_clicked(self):
+        s = self.app.settings
+        s.setValue("vt_client_host", self.host_edit.text().strip())
+        s.setValue("vt_client_port", self.port_spin.value())
+        s.setValue("vt_client_user", self.user_edit.text().strip())
+        s.setValue("vt_client_pass", protect_text(self.pass_edit.text()) if self.remember_check.isChecked() else "")
+        host, port, user, password = (self.host_edit.text().strip(), self.port_spin.value(),
+                                      self.user_edit.text().strip(), self.pass_edit.text())
+        if not (host and user and password):
+            self.say("Type the station address, your user name and your password first.")
+            return
+        self.status_label.setText("Connecting...")
+        self.run_bg(lambda: self.do_connect(host, port, user, password), self.after_connect)
+
+    def do_connect(self, host, port, user, password):
+        self.close_client()
+        self.client = VTClient(host, port, user, password)
+        return self.client.hours(3)
+
+    def after_connect(self, hours, error):
+        if error is not None:
+            self.client = None
+            self.say("Could not connect: " + (str(error) or type(error).__name__))
+            return
+        self.hours = hours
+        self.fill_hours()
+        self.say(f"Connected as {self.client.user}. {len(hours)} hours are open for voice tracking.")
+        self.hours_list.setFocus()
+
+    def close_client(self):
+        if self.client is not None:
+            self.client.close()
+        self.client = None
+
+    def disconnect_clicked(self):
+        self.close_client()
+        self.entries = []
+        self.hours = []
+        self.hours_list.clear()
+        self.entries_list.clear()
+        self.say("Disconnected.")
+
+    def hour_text(self, item):
+        day = datetime.fromisoformat(item["day"]).date()
+        text = f"{date_label(day)}, {time_label(item['hour'] * 60)}"
+        if item["ready"]:
+            text += f": {item['slots']} slot(s), {item['clips']} clip(s)"
+        else:
+            text += ": not built yet"
+        return text
+
+    def fill_hours(self):
+        self.hours_list.clear()
+        for item in self.hours:
+            self.hours_list.addItem(self.hour_text(item))
+        if self.hours_list.count():
+            self.hours_list.setCurrentRow(0)
+
+    # --- one hour ---
+    def load_hour_clicked(self):
+        row = self.hours_list.currentRow()
+        if self.client is None or not (0 <= row < len(self.hours)):
+            self.say("Connect and choose an hour first.")
+            return
+        item = self.hours[row]
+        client = self.client
+        self.run_bg(lambda: client.hour(item["day"], item["hour"]), lambda r, e: self.after_hour(item, r, e))
+
+    def after_hour(self, item, entries, error):
+        if error is not None:
+            self.say("Could not load that hour: " + (str(error) or type(error).__name__))
+            return
+        self.current = (item["day"], item["hour"])
+        self.set_entries(entries)
+        slots = sum(1 for e in entries if e["kind"] == "slot")
+        day = datetime.fromisoformat(item["day"]).date()
+        self.say(f"{date_label(day)}, {time_label(item['hour'] * 60)} loaded: {len(entries)} items, {slots} empty slot(s).")
+        self.entries_list.setFocus()
+
+    def entry_line(self, number, entry):
+        seconds = entry.get("seconds", 0)
+        length = f" ({seconds // 60}:{seconds % 60:02d})" if seconds else ""
+        if entry["kind"] == "slot":
+            return f"{number}. Voice track slot (empty)"
+        if entry["kind"] == "clip":
+            return f"{number}. {'Your clip' if entry.get('mine') else 'Voice track by someone else'}{length}"
+        if entry["kind"] == "marker":
+            return f"{number}. Hour marker"
+        return f"{number}. {entry['title']}{length}"
+
+    def set_entries(self, entries, keep=None):
+        row = self.entries_list.currentRow() if keep is None else keep
+        self.entries = entries
+        self.entries_list.clear()
+        for number, entry in enumerate(entries, 1):
+            self.entries_list.addItem(self.entry_line(number, entry))
+        if self.entries_list.count():
+            self.entries_list.setCurrentRow(max(0, min(row, self.entries_list.count() - 1)))
+
+    def selected(self):
+        row = self.entries_list.currentRow()
+        return row if 0 <= row < len(self.entries) else None
+
+    def record_clicked(self):
+        index = self.selected()
+        if self.client is None or self.current is None or index is None:
+            self.say("Connect, load an hour and select a slot first.")
+            return
+        entry = self.entries[index]
+        if not (entry["kind"] == "slot" or (entry["kind"] == "clip" and entry.get("mine"))):
+            self.say("Select an empty voice track slot, or one of your own clips to record again.")
+            return
+        day, hour = self.current
+        where = f"into slot {index + 1} of the {time_label(hour * 60)} hour"
+        clip = self.app.capture_voice_clip(where)
+        if not clip:
+            return
+        path, seconds, underlay = clip
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            self.say("The recording could not be read back.")
+            return
+        client = self.client
+        self.status_label.setText("Sending the clip to the station...")
+        self.run_bg(lambda: client.put(day, hour, index, data, underlay), lambda r, e: self.after_put(index, seconds, r, e))
+
+    def after_put(self, index, seconds, result, error):
+        if error is not None:
+            self.say("The station did not accept the clip: " + (str(error) or type(error).__name__) + " Your recording is kept in the VoiceTracks folder.")
+            return
+        self.set_entries(result["entries"], keep=index)
+        self.say(f"Voice track of {int(round(seconds))} seconds sent and placed in slot {index + 1}.")
+        self.entries_list.setFocus()
+
+    def remove_clicked(self):
+        index = self.selected()
+        if self.client is None or self.current is None or index is None or not (
+                self.entries[index]["kind"] == "clip" and self.entries[index].get("mine")):
+            self.say("Select one of your own clips first.")
+            return
+        day, hour = self.current
+        client = self.client
+        self.run_bg(lambda: client.clear(day, hour, index), lambda r, e: self.after_remove(index, r, e))
+
+    def after_remove(self, index, result, error):
+        if error is not None:
+            self.say("Could not remove it: " + (str(error) or type(error).__name__))
+            return
+        self.set_entries(result["entries"], keep=index)
+        self.say("Your clip was removed; the slot is empty again.")
+
+    # --- hearing the songs around a slot ---
+    def preview_clicked(self, part):
+        index = self.selected()
+        if self.client is None or self.current is None or index is None:
+            self.say("Connect, load an hour and select a slot first.")
+            return
+        if part == "end":
+            candidates = [i for i in range(index - 1, -1, -1) if self.entries[i]["kind"] == "song"]
+        else:
+            candidates = [i for i in range(index + 1, len(self.entries)) if self.entries[i]["kind"] == "song"]
+        if not candidates:
+            self.say("There is no song there to hear.")
+            return
+        song = candidates[0]
+        day, hour = self.current
+        client = self.client
+        title = self.entries[song]["title"]
+        self.status_label.setText("Fetching the audio...")
+        self.run_bg(lambda: client.preview(day, hour, song, part, 12),
+                    lambda r, e: self.after_preview(part, title, r, e))
+
+    def after_preview(self, part, title, data, error):
+        if error is not None:
+            self.say("Could not fetch the audio: " + (str(error) or type(error).__name__))
+            return
+        path = os.path.join(tempfile.gettempdir(), "vs_vt_preview.wav")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        try:
+            if self.preview_player is None:
+                self.preview_player = QMediaPlayer()
+                self._preview_out = QAudioOutput()
+                self.preview_player.setAudioOutput(self._preview_out)
+            self.preview_player.setSource(QUrl.fromLocalFile(path))
+            self.preview_player.play()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.say(("Playing the end of " if part == "end" else "Playing the start of ") + title + ".")
+
+    # --- live takeover status ---
+    def refresh_live_label(self):
+        link = self.app.live_link
+        status = link.last_status
+        shown = link.enabled() or link.phase != "idle"
+        for widget in (self.takeover_btn, self.giveback_btn, self.live_label):
+            widget.setVisible(shown)
+        if shown:
+            self.live_label.setText(link.last_text)
 
 
 
@@ -10707,6 +11651,15 @@ class BroadcastingApp(QWidget):
         self.vt_accounts = VTAccounts(self.settings)
         self.gui_caller = GuiCaller()
         self.vt_service = VTService(self)
+        self.voice_only = str(self.settings.value("voice_only_mode", "false")).lower() == "true"
+        self.live_shows = LiveShows(self.settings)
+        self.live_station = LiveStation(self)
+        self.vt_service.live = self.live_station
+        self.live_link = LiveLink(self)
+        self.live_timer = QTimer()
+        self.live_timer.setInterval(1000)
+        self.live_timer.timeout.connect(self.on_live_tick)
+        self.live_timer.start()
         self.vt_server = VTServer(self.vt_accounts, lambda: self.vt_service, self.gui_caller.call,
                                   lambda text: RUN_LOG.write("VTREMOTE", text),
                                   lambda text: self.vt_activity.append(time.strftime("%I:%M:%S %p ").lstrip("0") + text))
@@ -10733,11 +11686,13 @@ class BroadcastingApp(QWidget):
         # is built and shown in the queue right away (nothing starts playing by itself).
         if self.setup_complete() and self.rotation_library.rotations:
             QTimer.singleShot(1500, lambda: self.ensure_hour_playlists(force=True))
-        QTimer.singleShot(6000, self.encoder_bank.resume_saved)
+        QTimer.singleShot(6000, lambda: None if self.voice_only else self.encoder_bank.resume_saved())
         self.report_ready.connect(self.on_library_report_ready)
         QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
         QTimer.singleShot(3000, self.apply_remote_vt)
+        if self.voice_only:
+            QTimer.singleShot(500, self.show_voice_tracker)
         try:
             QApplication.instance().aboutToQuit.connect(self.vt_server.stop)
         except Exception:
@@ -10839,6 +11794,7 @@ class BroadcastingApp(QWidget):
             "mute_all": self.toggle_mute,
             "open_options": self.open_options,
             "send_to_tray": self.hide_to_tray,
+            "show_voice_tracker": self.show_voice_tracker,
             "toggle_recording": self.toggle_recording,
             "new_item": self.new_item,
             "generate_now": self.generate_now,
@@ -11338,7 +12294,7 @@ class BroadcastingApp(QWidget):
     def start_library_tagging(self):
         folder = self.settings.value("music_library_folder", "")
         if not folder or not os.path.isdir(folder):
-            self.announce("Choose the music library folder in Settings, General, first.")
+            self.announce("Choose the music library folder in Settings, Folders, first.")
             return
         if self.tagger.start(folder):
             self.tag_status_label.setText("Tagging: started.")
@@ -11407,13 +12363,51 @@ class BroadcastingApp(QWidget):
         self.announce("Settings. Use the up and down arrows to choose a section, then Tab. "
                       "Press Ctrl+O or Escape to go back to the on-air screen.")
 
+    def show_voice_tracker(self):
+        self.pages.setCurrentIndex(2)
+        self.vt_page.host_edit.setFocus()
+        self.announce("Voice tracker. Connect to a station, choose an hour and a slot, then press Control T to record.")
+
+    def toggle_voice_only(self, on):
+        """File menu: collapses the program to the voice tracker, or brings everything back."""
+        action = self.menu_actions.get("voice_only_mode", (None, ""))[0]
+
+        def set_box(value):
+            if action is not None:
+                action.blockSignals(True)
+                action.setChecked(value)
+                action.blockSignals(False)
+        if on:
+            busy = self.rotation.is_running or any(slot.state != "offline" for slot in self.encoder_bank.slots)
+            if busy:
+                set_box(False)
+                self.announce("Stop automation and disconnect the encoders first, then turn on voice tracking only.")
+                return
+            self.voice_only = True
+            self.settings.setValue("voice_only_mode", "true")
+            self.vt_server.stop()
+            self.show_voice_tracker()
+            self.announce("Voice tracking only. Everything else is collapsed. Turn this off in the Voice Track menu to bring it back.")
+        else:
+            self.voice_only = False
+            self.settings.setValue("voice_only_mode", "false")
+            self.apply_remote_vt()
+            self.pages.setCurrentIndex(0)
+            self.queue_list.setFocus()
+            self.announce("Voice tracking only is off. The whole program is back.")
+
     def show_onair(self):
+        if self.voice_only:
+            self.show_voice_tracker()
+            return
         self.pages.setCurrentIndex(0)
         self.queue_list.setFocus()
         self.announce("On-air screen.")
 
     def on_escape_pressed(self):
         if self.pages.currentIndex() == 1:
+            self.show_onair()
+        elif self.pages.currentIndex() == 2 and not self.voice_only:
             self.show_onair()
 
     def new_item(self):
@@ -11846,7 +12840,7 @@ class BroadcastingApp(QWidget):
 
     def ensure_hour_playlists(self, force=False):
         """Makes sure the queue holds this hour's playlist, and next hour's once the hour is near its end."""
-        if not self.rotation_library.rotations or not self.playlists_enabled():
+        if self.voice_only or not self.rotation_library.rotations or not self.playlists_enabled():
             return False
         now = datetime.now()
         tag = marker_for(now.date(), now.hour)[len(HOUR_MARKER_TOKEN):]
@@ -12017,6 +13011,10 @@ class BroadcastingApp(QWidget):
 
         add(voice_menu, "voice_track_before", "Record a voice track before the selected queue item", self.voice_track_before)
         add(voice_menu, "voice_track_after", "Record a voice track after the selected queue item", self.voice_track_after)
+        voice_menu.addSeparator()
+        add(voice_menu, "show_voice_tracker", "Voice tracker: record on a station from this PC", self.show_voice_tracker)
+        only = add(voice_menu, "voice_only_mode", "Voice tracking only (collapse everything else)", self.toggle_voice_only, checkable=True)
+        only.setChecked(self.voice_only)
         layout.setMenuBar(self.menu_bar)
         self.refresh_menu_labels()
 
@@ -12151,6 +13149,8 @@ class BroadcastingApp(QWidget):
 
     def resume_after_start(self):
         """Puts the speakers and automation back the way they were when the program closed."""
+        if self.voice_only:
+            return
         try:
             if str(self.settings.value("speakers_muted", "false")).lower() == "true" and not self.is_muted:
                 self.toggle_mute()
@@ -12208,7 +13208,7 @@ class BroadcastingApp(QWidget):
         draft_path = os.path.join(get_voice_folder(), time.strftime("voicetrack_%Y-%m-%d_%H%M%S_draft.wav"))
         recorder = VoiceRecorder(self.settings, self.update_status)
         if not recorder.start(draft_path):
-            self.announce("The voice track could not start. Check the microphone in the Settings tab.")
+            self.announce("The voice track could not start. Check the microphone in Settings, Audio Devices.")
             return None
         self._voice_recording = True
         RUN_LOG.write("VOICE", f"Recording a voice track {where}.")
@@ -12249,6 +13249,9 @@ class BroadcastingApp(QWidget):
         Station Playlist. A selected voice track slot is filled instead. The music keeps playing while
         you talk; when the voice track is done the next song fades in by itself."""
         if self._voice_recording:
+            return
+        if self.pages.currentIndex() == 2:
+            self.vt_page.record_clicked()           # on the Voice Tracker screen the keys fill the station's slots
             return
         if (self.pages.currentIndex() == 1 and self.tabs.currentWidget() is self.vt_hour_tab):
             self.vt_hour_tab.record_into_selected()          # on the Voice Track Hour screen the keys fill its slots
@@ -12674,6 +13677,166 @@ class BroadcastingApp(QWidget):
     report_ready = pyqtSignal(str)
 
     # --- remote voice tracking (the receiver on the station) ---
+    def on_live_tick(self):
+        try:
+            self.live_station.tick()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def build_live_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("Live takeover lets a scheduled person on another PC take the air from this station. This is "
+                       "off until you switch it on. Add the person's show to the schedule below, and tick \"may go live\" "
+                       "for that person in Remote Voice Tracking. At the show's start the station finishes its song "
+                       "(or fits its music to end on the start), lets go of its stream encoders, mutes its speakers and keeps "
+                       "running silently. When the show ends, or the other PC gives the air back, the encoders reconnect "
+                       "and the music fades in.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.live_enable_check = QCheckBox("Allow live takeovers on this station")
+        self.live_enable_check.setChecked(str(self.settings.value("live_enabled", "false")).lower() == "true")
+        form.addRow(self.live_enable_check)
+        self.live_early_spin = QSpinBox()
+        self.live_early_spin.setRange(1, 240)
+        self.live_early_spin.setValue(int(float(self.settings.value("live_early_minutes", 15))))
+        self.live_early_spin.setAccessibleName("Minutes before a show when its person may ask to take over")
+        form.addRow("A person may ask to take over this many minutes before the show:", self.live_early_spin)
+        self.live_back_spin = QSpinBox()
+        self.live_back_spin.setRange(0, 120)
+        self.live_back_spin.setValue(int(float(self.settings.value("live_takeback_minutes", 5))))
+        self.live_back_spin.setAccessibleName("Minutes after a show's end when the station takes the air back by itself")
+        form.addRow("The station takes the air back this many minutes after the show ends:", self.live_back_spin)
+        self.live_link_check = QCheckBox("This PC goes live on another station: ask for the air by itself when my show is near "
+                                         "(uses the connection saved on the Voice Tracker screen)")
+        self.live_link_check.setChecked(str(self.settings.value("live_link_enabled", "false")).lower() == "true")
+        form.addRow(self.live_link_check)
+        layout.addLayout(form)
+        save_btn = QPushButton("Save Live Takeover Settings")
+        save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save_btn.clicked.connect(self.save_live_settings)
+        layout.addWidget(save_btn)
+        self.live_status_label = QLabel("")
+        self.live_status_label.setWordWrap(True)
+        self.live_status_label.setAccessibleName("Live takeover status on this station")
+        layout.addWidget(self.live_status_label)
+
+        layout.addWidget(QLabel("Live shows:"))
+        self.live_show_list = QListWidget()
+        self.live_show_list.setAccessibleName("Live shows")
+        self.live_show_list.setMaximumHeight(140)
+        self.live_show_list.currentRowChanged.connect(self.on_live_show_selected)
+        layout.addWidget(self.live_show_list)
+        show_form = QFormLayout()
+        self.live_user_combo = QComboBox()
+        self.live_user_combo.setAccessibleName("Person who hosts the show")
+        show_form.addRow("Person:", self.live_user_combo)
+        self.live_day_checks = []
+        days_row = QHBoxLayout()
+        for number, name in enumerate(LIVE_DAY_NAMES):
+            box = QCheckBox(name[:3])
+            box.setAccessibleName(name)
+            self.live_day_checks.append(box)
+            days_row.addWidget(box)
+        show_form.addRow("Days:", days_row)
+        self.live_start_edit = QLineEdit("18:00")
+        self.live_start_edit.setAccessibleName("Show start time, for example 18:00")
+        show_form.addRow("Starts:", self.live_start_edit)
+        self.live_end_edit = QLineEdit("00:00")
+        self.live_end_edit.setAccessibleName("Show end time, for example 00:00 for midnight")
+        show_form.addRow("Ends:", self.live_end_edit)
+        self.live_ip_edit = QLineEdit()
+        self.live_ip_edit.setAccessibleName("Tailscale address the person must connect from. Leave empty for any")
+        self.live_ip_edit.setPlaceholderText("Empty = any address")
+        show_form.addRow("Tailscale address of the live PC:", self.live_ip_edit)
+        self.live_show_enabled = QCheckBox("This show is on")
+        self.live_show_enabled.setChecked(True)
+        show_form.addRow(self.live_show_enabled)
+        layout.addLayout(show_form)
+        for text, handler in (("Add Or Update Show", self.add_live_show), ("Remove Selected Show", self.remove_live_show)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            layout.addWidget(btn)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        self.live_selected_id = None
+        self.refresh_live_shows()
+        self.live_refresh_timer = QTimer(self)
+        self.live_refresh_timer.setInterval(2000)
+        self.live_refresh_timer.timeout.connect(self.refresh_live_status)
+        self.live_refresh_timer.start()
+        return page
+
+    def refresh_live_shows(self):
+        self.live_show_list.clear()
+        for entry in self.live_shows.items:
+            self.live_show_list.addItem(self.live_shows.describe(entry))
+        current = self.live_user_combo.currentText()
+        self.live_user_combo.clear()
+        for item in self.vt_accounts.items:
+            if item.get("live"):
+                self.live_user_combo.addItem(item["user"])
+        index = self.live_user_combo.findText(current)
+        if index >= 0:
+            self.live_user_combo.setCurrentIndex(index)
+
+    def refresh_live_status(self):
+        station = self.live_station
+        if station.state == "idle":
+            self.live_status_label.setText("Live takeover: no one has the air." if station.enabled() else "Live takeover is off.")
+        else:
+            self.live_status_label.setText(f"Live takeover: {station.user} is {'waiting for the song to end' if station.state == 'waiting' else 'on the air'}.")
+
+    def on_live_show_selected(self, row):
+        if 0 <= row < len(self.live_shows.items):
+            entry = self.live_shows.items[row]
+            self.live_selected_id = entry["id"]
+            index = self.live_user_combo.findText(entry["user"])
+            if index >= 0:
+                self.live_user_combo.setCurrentIndex(index)
+            for number, box in enumerate(self.live_day_checks):
+                box.setChecked(number in entry.get("days", []))
+            self.live_start_edit.setText(entry["start"])
+            self.live_end_edit.setText(entry["end"])
+            self.live_ip_edit.setText(entry.get("ip", ""))
+            self.live_show_enabled.setChecked(bool(entry.get("enabled", True)))
+
+    def add_live_show(self):
+        days = [n for n, box in enumerate(self.live_day_checks) if box.isChecked()]
+        problem = self.live_shows.add(self.live_user_combo.currentText(), days, self.live_start_edit.text(),
+                                      self.live_end_edit.text(), self.live_ip_edit.text(),
+                                      self.live_show_enabled.isChecked(), show_id=self.live_selected_id)
+        if problem:
+            self.announce(problem)
+            return
+        self.live_selected_id = None
+        self.refresh_live_shows()
+        self.announce("The live show was saved.")
+
+    def remove_live_show(self):
+        row = self.live_show_list.currentRow()
+        if not (0 <= row < len(self.live_shows.items)):
+            self.announce("Select a show first.")
+            return
+        self.live_shows.remove(self.live_shows.items[row]["id"])
+        self.live_selected_id = None
+        self.refresh_live_shows()
+        self.announce("The live show was removed.")
+
+    def save_live_settings(self):
+        self.settings.setValue("live_enabled", "true" if self.live_enable_check.isChecked() else "false")
+        self.settings.setValue("live_early_minutes", self.live_early_spin.value())
+        self.settings.setValue("live_takeback_minutes", self.live_back_spin.value())
+        self.settings.setValue("live_link_enabled", "true" if self.live_link_check.isChecked() else "false")
+        if self.live_enable_check.isChecked() and str(self.settings.value("vt_enabled", "false")).lower() != "true":
+            self.announce("Live takeover settings saved. Live takeovers also need Accept remote voice tracking switched on in Remote Voice Tracking.")
+        else:
+            self.announce("Live takeover settings saved.")
+        if not self.live_enable_check.isChecked() and self.live_station.state != "idle":
+            self.live_station.release("live takeovers were switched off")
+
     def build_remote_vt_tab(self):
         page = QWidget()
         layout = QVBoxLayout()
@@ -12741,6 +13904,8 @@ class BroadcastingApp(QWidget):
         self.vt_user_enabled = QCheckBox("This person may connect")
         self.vt_user_enabled.setChecked(True)
         account_form.addRow(self.vt_user_enabled)
+        self.vt_user_live = QCheckBox("This person may go live (take over the air for their scheduled shows)")
+        account_form.addRow(self.vt_user_live)
         layout.addLayout(account_form)
         for text, handler in (("Add Or Update Person", self.add_vt_account), ("Remove Selected Person", self.remove_vt_account)):
             btn = QPushButton(text)
@@ -12785,17 +13950,21 @@ class BroadcastingApp(QWidget):
             self.vt_password_edit.clear()
             self.vt_ip_edit.setText(item.get("ip", ""))
             self.vt_user_enabled.setChecked(bool(item.get("enabled", True)))
+            self.vt_user_live.setChecked(bool(item.get("live", False)))
 
     def add_vt_account(self):
         user = self.vt_user_edit.text().strip()
         problem = self.vt_accounts.add(user, self.vt_password_edit.text(), self.vt_ip_edit.text(),
-                                       self.vt_user_enabled.isChecked(), keep_password=True)
+                                       self.vt_user_enabled.isChecked(), keep_password=True,
+                                       live=self.vt_user_live.isChecked())
         if problem:
             self.announce(problem)
             return
         RUN_LOG.write("VTREMOTE", f"Voice tracker account saved: {user}.")
         self.vt_password_edit.clear()
         self.refresh_vt_accounts()
+        if hasattr(self, "live_user_combo"):
+            self.refresh_live_shows()
         self.announce(f"{user} can voice track" + (" from that address only." if self.vt_ip_edit.text().strip() else "."))
 
     def remove_vt_account(self):
@@ -12827,6 +13996,9 @@ class BroadcastingApp(QWidget):
         self.apply_remote_vt(announce=True)
 
     def apply_remote_vt(self, announce=False):
+        if self.voice_only:
+            self.vt_server.stop()
+            return
         if str(self.settings.value("vt_enabled", "false")).lower() != "true":
             self.vt_server.stop()
             if announce:
@@ -12854,7 +14026,7 @@ class BroadcastingApp(QWidget):
         layout = QVBoxLayout()
         intro = QLabel("These rules keep the programming inside the US webcasting limits that Live365 publishes, and they are "
                        "never relaxed: a song that would break a rule is skipped, and another song that passes is borrowed "
-                       "from the rest of the library. The hours a song and its artist are held back are set in General. "
+                       "from the rest of the library. The hold on a played song and artist is set here too. "
                        "Change the numbers here if your station is licensed another way.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -13354,8 +14526,19 @@ class BroadcastingApp(QWidget):
         self.tab_jingles.setLayout(layout_j)
 
         # --- Tab 3: Audio Settings ---
-        self.tab_audio = QWidget()
-        layout_a = QFormLayout()
+        # Each feature has its own Settings page. The widgets are the same ones as before and every page's
+        # Save button saves them all, so nothing about what is saved has changed.
+        self.settings_forms = {}
+        for key in ("folders", "devices", "startup", "playlists", "breaks", "processor", "voice"):
+            self.settings_forms[key] = QFormLayout()
+        form_folders = self.settings_forms["folders"]
+        form_devices = self.settings_forms["devices"]
+        form_startup = self.settings_forms["startup"]
+        form_playlists = self.settings_forms["playlists"]
+        form_breaks = self.settings_forms["breaks"]
+        form_proc = self.settings_forms["processor"]
+        form_voice = self.settings_forms["voice"]
+        layout_a = form_folders
 
         self.input_combo = QComboBox()
         self.output_combo = QComboBox()
@@ -13392,8 +14575,8 @@ class BroadcastingApp(QWidget):
         log_label.setAccessibleName(f"Log folder: {RUN_LOG.folder}")
         layout_a.addRow("Log folder (one file per day, plus errors.log):", log_label)
 
-        layout_a.addRow("Microphone/Line-In:", self.input_combo)
-        layout_a.addRow("Speaker/Interface:", self.output_combo)
+        form_devices.addRow("Microphone/Line-In:", self.input_combo)
+        form_devices.addRow("Speaker/Interface:", self.output_combo)
 
         self.live_mix_check = QCheckBox("Stream the live mix of music, jingles and microphone (restart to apply)")
         self.live_mix_check.setChecked(str(self.settings.value("use_live_mix", "true")).lower() != "false")
@@ -13403,31 +14586,31 @@ class BroadcastingApp(QWidget):
         self.break_style_combo.addItem("Let the song finish, then start the break", "finish_song")
         style_index = self.break_style_combo.findData(str(self.settings.value("break_style", "fade_at_mark")))
         self.break_style_combo.setCurrentIndex(max(0, style_index))
-        layout_a.addRow("Break style:", self.break_style_combo)
+        form_breaks.addRow("Break style:", self.break_style_combo)
 
         self.top_hour_ads_check = QCheckBox("Also play a commercial break in the top of the hour (otherwise only its jingle plays)")
         self.top_hour_ads_check.setChecked(str(self.settings.value("top_hour_ads", "false")).lower() == "true")
-        layout_a.addRow(self.top_hour_ads_check)
+        form_breaks.addRow(self.top_hour_ads_check)
 
         self.autostart_check = QCheckBox("Start Vision Studio when Windows starts (it opens in the system tray)")
         self.autostart_check.setChecked(autostart_enabled())
         self.autostart_check.toggled.connect(self.on_autostart_toggled)
-        layout_a.addRow(self.autostart_check)
+        form_startup.addRow(self.autostart_check)
         self.close_to_tray_check = QCheckBox("Closing the window sends Vision Studio to the system tray instead of exiting")
         self.close_to_tray_check.setChecked(str(self.settings.value("close_to_tray", "false")).lower() == "true")
         self.close_to_tray_check.toggled.connect(self.on_close_to_tray_toggled)
-        layout_a.addRow(self.close_to_tray_check)
+        form_startup.addRow(self.close_to_tray_check)
         self.start_in_tray_check = QCheckBox("When it starts with Windows, open in the system tray instead of showing the window")
         self.start_in_tray_check.setChecked(str(self.settings.value("start_in_tray", "false")).lower() == "true")
-        layout_a.addRow(self.start_in_tray_check)
+        form_startup.addRow(self.start_in_tray_check)
         self.autoplay_check = QCheckBox("When it starts with Windows, begin playing automatically")
         self.autoplay_check.setChecked(str(self.settings.value("autoplay_on_boot", "false")).lower() == "true")
-        layout_a.addRow(self.autoplay_check)
+        form_startup.addRow(self.autoplay_check)
         self.resume_automation_check = QCheckBox("When the program starts, turn automation back on if it was on when the program closed")
         self.resume_automation_check.setChecked(str(self.settings.value("resume_automation", "true")).lower() != "false")
-        layout_a.addRow(self.resume_automation_check)
+        form_startup.addRow(self.resume_automation_check)
 
-        layout_a.addRow(self.live_mix_check)
+        form_devices.addRow(self.live_mix_check)
 
         # Playlist generation
         self.playlist_mode_combo = QComboBox()
@@ -13438,7 +14621,7 @@ class BroadcastingApp(QWidget):
             self.playlist_mode_combo.addItem(label, value)
         index = self.playlist_mode_combo.findData(str(self.settings.value("playlist_mode", "midnight_full_day")))
         self.playlist_mode_combo.setCurrentIndex(max(0, index))
-        layout_a.addRow("Generate playlists:", self.playlist_mode_combo)
+        form_playlists.addRow("Generate playlists:", self.playlist_mode_combo)
 
         self.playlist_lead_spin = QSpinBox()
         self.playlist_lead_spin.setRange(0, 3600)
@@ -13447,48 +14630,48 @@ class BroadcastingApp(QWidget):
             self.playlist_lead_spin.setValue(int(self.settings.value("playlist_lead_seconds", 0)))
         except Exception:
             pass
-        layout_a.addRow("Seconds early to write playlists (0 = exactly at midnight):", self.playlist_lead_spin)
+        form_playlists.addRow("Seconds early to write playlists (0 = exactly at midnight):", self.playlist_lead_spin)
 
         self.queue_lead_spin = QSpinBox()
         self.queue_lead_spin.setRange(10, 3000)
         self.queue_lead_spin.setAccessibleName("Seconds before the hour ends to add the next hour to the queue")
         self.queue_lead_spin.setValue(self.queue_lead_seconds())
-        layout_a.addRow("Add the next hour to the queue this many seconds before the hour ends:", self.queue_lead_spin)
+        form_playlists.addRow("Add the next hour to the queue this many seconds before the hour ends:", self.queue_lead_spin)
 
         self.playlist_times_edit = QLineEdit(str(self.settings.value("playlist_fixed_times", "00:00")))
         self.playlist_times_edit.setAccessibleName("Fixed generation times, hours and minutes separated by commas")
-        layout_a.addRow("Fixed times (for example 00:00, 12:00):", self.playlist_times_edit)
+        form_playlists.addRow("Fixed times (for example 00:00, 12:00):", self.playlist_times_edit)
 
         self.playlist_folder_label = self.folder_labels["playlist_output_folder"]
 
         self.playlist_autoload_check = QCheckBox("Build hourly playlists and keep the queue filled from them")
         self.playlist_autoload_check.setChecked(str(self.settings.value("playlist_autoload", "true")).lower() != "false")
-        layout_a.addRow(self.playlist_autoload_check)
+        form_playlists.addRow(self.playlist_autoload_check)
 
         wizard_btn = QPushButton("Run Setup Wizard Again")
         wizard_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         wizard_btn.clicked.connect(self.run_setup_wizard)
-        layout_a.addRow(wizard_btn)
+        form_folders.addRow(wizard_btn)
 
         auto_btn = QPushButton("Automation On / Off (A)")
         auto_btn.setAccessibleName("Automation on or off. Keyboard shortcut A.")
         auto_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         auto_btn.clicked.connect(self.automation_toggle)
-        layout_a.addRow(auto_btn)
+        form_startup.addRow(auto_btn)
         stop_fade_btn = QPushButton("Stop With Fade (S)")
         stop_fade_btn.setAccessibleName("Stop with fade. The record stays on the deck. Keyboard shortcut S.")
         stop_fade_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         stop_fade_btn.clicked.connect(self.stop_with_fade)
-        layout_a.addRow(stop_fade_btn)
+        form_startup.addRow(stop_fade_btn)
         stop_all_btn = QPushButton("Stop Everything At Once (Ctrl+Shift+S)")
         stop_all_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         stop_all_btn.clicked.connect(self.stop_everything)
-        layout_a.addRow(stop_all_btn)
+        form_startup.addRow(stop_all_btn)
 
         generate_btn = QPushButton("Generate Playlists Now (Ctrl+Shift+G)")
         generate_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         generate_btn.clicked.connect(self.generate_now)
-        layout_a.addRow(generate_btn)
+        form_playlists.addRow(generate_btn)
 
         # Break protection
         self.break_hold_spin = QSpinBox()
@@ -13498,18 +14681,18 @@ class BroadcastingApp(QWidget):
             self.break_hold_spin.setValue(break_window_seconds(self.settings))
         except Exception:
             self.break_hold_spin.setValue(BREAK_WINDOW_DEFAULT)
-        layout_a.addRow("Break window, seconds before the mark (a song ending inside it starts the break):", self.break_hold_spin)
+        form_breaks.addRow("Break window, seconds before the mark (a song ending inside it starts the break):", self.break_hold_spin)
 
         # Processing
         self.proc_master_check = QCheckBox("Process the stream with the broadcast processor (AGC, 5-band compressor, limiter)")
         self.proc_master_check.setChecked(str(self.settings.value("proc_master", "true")).lower() != "false")
-        layout_a.addRow(self.proc_master_check)
+        form_proc.addRow(self.proc_master_check)
         self.proc_preset_combo = QComboBox()
         self.proc_preset_combo.setAccessibleName("Processor preset")
         for name in PROCESSOR_PRESETS:
             self.proc_preset_combo.addItem(name)
         self.proc_preset_combo.setCurrentText(str(self.settings.value("proc_preset", "Broadcast")))
-        layout_a.addRow("Processor preset:", self.proc_preset_combo)
+        form_proc.addRow("Processor preset:", self.proc_preset_combo)
         self.proc_ceiling_spin = QSpinBox()
         self.proc_ceiling_spin.setRange(-12, 0)
         self.proc_ceiling_spin.setAccessibleName("Limiter ceiling in decibels")
@@ -13517,7 +14700,7 @@ class BroadcastingApp(QWidget):
             self.proc_ceiling_spin.setValue(int(float(self.settings.value("proc_ceiling_db", -1))))
         except Exception:
             self.proc_ceiling_spin.setValue(-1)
-        layout_a.addRow("Limiter ceiling (dB):", self.proc_ceiling_spin)
+        form_proc.addRow("Limiter ceiling (dB):", self.proc_ceiling_spin)
         self.proc_source_checks = {}
         for key, label in (("proc_deck_a", "Also process Deck A on its own"),
                            ("proc_deck_b", "Also process Deck B on its own"),
@@ -13526,11 +14709,11 @@ class BroadcastingApp(QWidget):
             check = QCheckBox(label)
             check.setChecked(str(self.settings.value(key, "false")).lower() == "true")
             self.proc_source_checks[key] = check
-            layout_a.addRow(check)
+            form_proc.addRow(check)
         note = QLabel("The processor shapes what goes out to your stream. Your own speakers play the "
                       "loudness-matched tracks without it.")
         note.setWordWrap(True)
-        layout_a.addRow(note)
+        form_proc.addRow(note)
 
         self.separation_spin = QSpinBox()
         self.separation_spin.setRange(1, 12)
@@ -13547,7 +14730,7 @@ class BroadcastingApp(QWidget):
             self.break_estimate_spin.setValue(int(float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))))
         except Exception:
             self.break_estimate_spin.setValue(DEFAULT_BREAK_ESTIMATE_SECONDS)
-        layout_a.addRow("Estimated length of one break, seconds (used to fit a built hour):", self.break_estimate_spin)
+        form_breaks.addRow("Estimated length of one break, seconds (used to fit a built hour):", self.break_estimate_spin)
         self.voice_slot_spin = QSpinBox()
         self.voice_slot_spin.setRange(5, 120)
         self.voice_slot_spin.setAccessibleName("Seconds reserved for each empty voice track slot")
@@ -13555,7 +14738,7 @@ class BroadcastingApp(QWidget):
             self.voice_slot_spin.setValue(int(float(self.settings.value("voice_slot_seconds", DEFAULT_VOICE_SLOT_SECONDS))))
         except Exception:
             self.voice_slot_spin.setValue(DEFAULT_VOICE_SLOT_SECONDS)
-        layout_a.addRow("Seconds reserved for each voice track slot:", self.voice_slot_spin)
+        form_voice.addRow("Seconds reserved for each voice track slot:", self.voice_slot_spin)
         self.break_gap_spin = QSpinBox()
         self.break_gap_spin.setRange(0, 3000)
         self.break_gap_spin.setSingleStep(50)
@@ -13564,16 +14747,38 @@ class BroadcastingApp(QWidget):
             self.break_gap_spin.setValue(int(float(self.settings.value("break_item_gap_ms", 250))))
         except Exception:
             self.break_gap_spin.setValue(250)
-        layout_a.addRow("Silence between break items, milliseconds:", self.break_gap_spin)
+        form_breaks.addRow("Silence between break items, milliseconds:", self.break_gap_spin)
 
-        save_audio_btn = QPushButton("Save Settings")
-        save_audio_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        save_audio_btn.clicked.connect(self.save_audio_settings)
-        layout_a.addRow(save_audio_btn)
-        self.tab_audio.setLayout(layout_a)
-        self.tab_audio_scroll = QScrollArea()
-        self.tab_audio_scroll.setWidgetResizable(True)
-        self.tab_audio_scroll.setWidget(self.tab_audio)
+        intros = {
+            "folders": "Where your music, jingles, ads and playlists live, and the setup wizard.",
+            "devices": "Which microphone and speakers Vision Studio uses, and whether the live mix is streamed.",
+            "startup": "What happens when Windows starts or the window closes, and the automation buttons.",
+            "playlists": "When hourly playlists are written and how far ahead the queue is filled.",
+            "breaks": "How breaks start and how long they are estimated to take.",
+            "processor": "The broadcast processor that shapes what goes out to your stream.",
+            "voice": "How much time each empty voice track slot reserves in an hour.",
+        }
+        titles = {"folders": "Folders", "devices": "Audio Devices", "startup": "Startup and Tray",
+                  "playlists": "Playlists", "breaks": "Breaks", "processor": "Stream Processor", "voice": "Voice Tracks"}
+        self.settings_pages = {}
+        for key, form in self.settings_forms.items():
+            page = QWidget()
+            outer = QVBoxLayout()
+            note_label = QLabel(intros[key])
+            note_label.setWordWrap(True)
+            outer.addWidget(note_label)
+            outer.addLayout(form)
+            save_btn = QPushButton("Save Settings")
+            save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            save_btn.setAccessibleName(f"Save {titles[key]} settings")
+            save_btn.clicked.connect(self.save_audio_settings)
+            outer.addWidget(save_btn)
+            outer.addStretch(1)
+            page.setLayout(outer)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self.settings_pages[key] = scroll
 
         # --- New tabs ---
         self.rotations_tab = RotationsTab(self)
@@ -13591,12 +14796,17 @@ class BroadcastingApp(QWidget):
         self.folder_tab = self.build_folder_tab()
         self.rules_tab = self.build_rules_tab()
         self.remote_vt_tab = self.build_remote_vt_tab()
-        sections = (("General", self.tab_audio_scroll), ("Rotations", self.rotations_tab),
+        self.live_tab = self.build_live_tab()
+        self.vt_page = VoiceTrackerPage(self)
+        sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
+                    ("Startup and Tray", self.settings_pages["startup"]), ("Playlists", self.settings_pages["playlists"]),
+                    ("Breaks", self.settings_pages["breaks"]), ("Stream Processor", self.settings_pages["processor"]),
+                    ("Voice Tracks", self.settings_pages["voice"]), ("Rotations", self.rotations_tab),
                     ("Schedule", self.schedule_tab), ("Categories", self.categories_tab),
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
@@ -13623,6 +14833,7 @@ class BroadcastingApp(QWidget):
         self.pages = QStackedWidget()
         self.pages.addWidget(rotation_scroll)
         self.pages.addWidget(settings_page)
+        self.pages.addWidget(self.vt_page)
         self.escape_shortcut = QShortcut(QKeySequence("Escape"), self)
         self.escape_shortcut.activated.connect(self.on_escape_pressed)
 
@@ -13818,6 +15029,8 @@ class BroadcastingApp(QWidget):
 
     def on_break_upcoming(self, slot, target):
         """About two minutes before a mark: the engine starts protecting the song on air."""
+        if self.rotation.break_is_armed("LIVE"):
+            return          # a live takeover has the next mark
         if not self.break_marks.enabled(target.date(), target.hour, slot):
             return          # this mark is switched off for that hour
         if self.rotation.is_running and self.rotation.automation_on and not self.rotation.is_paused_for_sequence:
@@ -13828,6 +15041,8 @@ class BroadcastingApp(QWidget):
         """The clock reached the mark. If the engine is already managing this break, leave it to the engine."""
         if not self.rotation.automation_on:
             return          # automation is off: no jingles or breaks fire by themselves
+        if self.rotation.break_is_armed("LIVE") or self.live_station.state == "waiting":
+            return          # a live takeover has the mark
         now = datetime.now()
         if not self.break_marks.enabled(now.date(), now.hour, slot):
             self.update_status(f"The {slot} break is switched off for this hour.")
@@ -13911,6 +15126,9 @@ class BroadcastingApp(QWidget):
                 label.setAccessibleName(f"{title} folder: {text}")
 
     def start_rotation(self):
+        if self.voice_only:
+            self.announce("Voice tracking only is on. Turn it off in the Voice Track menu to run the station.")
+            return
         if not self.rotation_library.rotations and not self.settings.value("music_library_folder", ""):
             self.announce("No music folder is set. Open Settings with Control O and choose your music library folder.")
             return
