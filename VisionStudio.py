@@ -11876,6 +11876,10 @@ class StationLauncher(QWidget):
         self.totals_label.setWordWrap(True)
         self.totals_label.setAccessibleName("Total memory and processor use")
         layout.addWidget(self.totals_label)
+        off_btn = QPushButton("Turn Off Multiple Stations (applies the next time Vision Studio starts)")
+        off_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        off_btn.clicked.connect(self.turn_off_multi)
+        layout.addWidget(off_btn)
         quit_btn = QPushButton("Quit Everything (stops every station)")
         quit_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         quit_btn.clicked.connect(self.quit_everything)
@@ -12007,6 +12011,11 @@ class StationLauncher(QWidget):
         self.running_ids.discard(station_id)
         self.statuses.pop(station_id, None)
         QTimer.singleShot(2500, self.refresh_list)
+
+    def turn_off_multi(self):
+        self.settings.setValue("multi_station_enabled", "false")
+        self.tell("Multiple stations is off. The next time Vision Studio starts it opens as a single station. "
+                  "Stop the stations that are running with Quit Everything when you are ready.")
 
     def quit_everything(self):
         running = [i for i in self.store.items if self.is_running(i["id"])]
@@ -14594,13 +14603,16 @@ class BroadcastingApp(QWidget):
         layout.addWidget(intro)
         self.stations_enable_check = QCheckBox("Run more than one station on this PC (takes effect the next time Vision Studio starts)")
         self.stations_enable_check.setChecked(launcher_enabled())
-        if STATION_CHILD:
-            self.stations_enable_check.setEnabled(False)
+        self.stations_enable_check.setAccessibleName("Run more than one station on this PC")
+        intro.setFocusPolicy(Qt.FocusPolicy.StrongFocus)          # so a screen reader can land on the explanation
         layout.addWidget(self.stations_enable_check)
-        self.stations_note = QLabel("Manage stations in the station list. In it, Enter expands or collapses the selected station and "
-                                    "Ctrl+Alt+1 to 9 toggle stations one to nine." if STATION_CHILD else "")
-        self.stations_note.setWordWrap(True)
-        layout.addWidget(self.stations_note)
+        if STATION_CHILD:
+            self.stations_note = QLabel("Manage stations in the station list. In it, Enter expands or collapses the selected station and "
+                                        "Ctrl+Alt+1 to 9 toggle stations one to nine. Unticking the box above and saving makes "
+                                        "Vision Studio start as a single station the next time it opens.")
+            self.stations_note.setWordWrap(True)
+            self.stations_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            layout.addWidget(self.stations_note)
         save = QPushButton("Save Station Settings")
         save.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save.clicked.connect(self.save_stations_settings)
@@ -16084,7 +16096,7 @@ if __name__ == "__main__":
     if STATION_CHILD and station_running(STATION_ID):
         RUN_LOG.write("STATION", f"{STATION_NAME} is already running; this second copy is closing.")
         sys.exit(0)
-    if not STATION_CHILD and launcher_enabled():
+    if not STATION_CHILD and launcher_enabled() and "--single" not in sys.argv:
         try:
             launcher = StationLauncher()
             launcher.show()
