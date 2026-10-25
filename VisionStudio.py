@@ -2163,6 +2163,7 @@ class PlaylistGenerator:
 DEFAULT_SHORTCUTS = [
     ("insert_tracks", "Insert tracks into the queue", "Ins", True),
     ("insert_tracks_alt", "Insert tracks (alternate key)", "Ctrl+I", True),
+    ("paste_music", "Paste music: new songs are copied in, songs you already have are used, not copied again", "Alt+P", True),
     ("automation_toggle", "Automation on / off (the first song goes onto the deck, like Station Playlist)", "A", True),
     ("stop_fade", "Stop with fade (the record stays on the deck)", "S", True),
     ("start_rotation", "Automation on", "Ctrl+Return", True),
@@ -5590,9 +5591,16 @@ class MusicDucker:
 
 CONFERENCE_SERVICES = [
     # key, name shown in the list, program file names to look for, a note shown under the list
-    ("zoom", "Zoom", ("zoom.exe",), "Sign in to Zoom as you always do. Vision Studio only takes Zoom's sound."),
-    ("teams", "Microsoft Teams", ("ms-teams.exe", "teams.exe"), "Sign in to Teams as you always do."),
-    ("webex", "Cisco Webex", ("webex.exe", "ciscocollabhost.exe", "atmgr.exe"), "Sign in to Webex as you always do."),
+    ("vb_zoom", "Zoom in the Vision Browser (built in)", (), "Opens Zoom's web version in a Vision Browser window and sign-ins are remembered. "
+     "Paste a meeting link in the box below to join straight away. The web version has fewer features than the Zoom program."),
+    ("zoom", "Zoom (the Zoom program on this PC)", ("zoom.exe",), "Sign in to Zoom as you always do. Vision Studio only takes Zoom's sound."),
+    ("vb_teams", "Microsoft Teams in the Vision Browser (built in)", (), "Opens Teams in a Vision Browser window and sign-ins are remembered."),
+    ("teams", "Microsoft Teams (the Teams program on this PC)", ("ms-teams.exe", "teams.exe"), "Sign in to Teams as you always do."),
+    ("vb_webex", "Cisco Webex in the Vision Browser (built in)", (), "Opens Webex in a Vision Browser window and sign-ins are remembered."),
+    ("webex", "Cisco Webex (the Webex program on this PC)", ("webex.exe", "ciscocollabhost.exe", "atmgr.exe"), "Sign in to Webex as you always do."),
+    ("vb_fcc", "Free Conference Call in the Vision Browser (built in)", (), "Opens Free Conference Call in a Vision Browser window and sign-ins are remembered."),
+    ("vb_meet", "Google Meet in the Vision Browser (built in)", (), "Google often will not let you sign in to your account inside another browser; joining a meeting link as a guest works."),
+    ("vb_jitsi", "Jitsi Meet in the Vision Browser (built in)", (), "Jitsi Meet needs no account."),
     ("discord", "Discord", ("discord.exe",), "Use this for Discord calls."),
     ("slack", "Slack huddles", ("slack.exe",), "Use this for Slack huddles."),
     ("chrome", "Web meeting in Google Chrome", ("chrome.exe",),
@@ -5613,6 +5621,10 @@ def conference_service(key):
         if item[0] == key:
             return item
     return CONFERENCE_SERVICES[0]
+
+
+def default_conference_service():
+    return "vb_zoom"
 
 
 def get_capture_helper_path():
@@ -5699,8 +5711,11 @@ class ConferenceCapture:
         self.list_processes = list_processes or list_running_processes
         self.helper_path = helper_path
         self.spawn = spawn
-        self.service_key = "zoom"
+        self.service_key = "vb_zoom"
         self.other_exe = ""
+        self.meeting_link = ""
+        self.browser = None                 # the Vision Browser window process, when this program opened one
+        self.open_browser = None            # test hook: function(service key, link) -> process
         self.level_percent = 100
         self.active = False
         self.proc = None
@@ -5717,42 +5732,87 @@ class ConferenceCapture:
 
     # --- choices ---
     def target_names(self):
+        if self.is_browser():
+            return ()
         if self.service_key == "other":
             return (self.other_exe,) if self.other_exe else ()
         return conference_service(self.service_key)[2]
 
     def display_name(self):
+        if self.is_browser():
+            return conference_service(self.service_key)[1].replace(" (built in)", "")
         if self.service_key == "other":
             return self.other_exe or "the chosen program"
         return conference_service(self.service_key)[1]
 
-    def set_target(self, service_key, other_exe=""):
+    def is_browser(self):
+        return self.service_key.startswith("vb_")
+
+    def set_target(self, service_key, other_exe="", meeting_link=""):
         changed = (service_key != self.service_key) or (service_key == "other" and other_exe.lower() != self.other_exe)
         self.service_key = service_key
         self.other_exe = (other_exe or "").lower()
+        self.meeting_link = (meeting_link or "").strip()
+        if changed:
+            self.close_browser()
         if changed and self.active:
             self.stop_helper()
+            if self.is_browser():
+                self.show_browser()
             self.tick()
+
+    # --- the built-in Vision Browser window ---
+    def browser_running(self):
+        return self.browser is not None and self.browser.poll() is None
+
+    def show_browser(self):
+        """Opens the Vision Browser window for the chosen service if it is not open."""
+        if not self.is_browser() or self.browser_running():
+            return
+        try:
+            if self.open_browser is not None:
+                self.browser = self.open_browser(self.service_key, self.meeting_link)
+            else:
+                command = self_command() + ["--meeting", self.service_key]
+                if self.meeting_link:
+                    command += ["--meeting-url", self.meeting_link]
+                self.browser = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+            RUN_LOG.write("CONFERENCE", f"Opened the Vision Browser for {self.service_key}.")
+        except Exception as e:
+            self.browser = None
+            self.status = f"The Vision Browser could not open: {e}"
+            RUN_LOG.write("CONFERENCE", self.status)
+
+    def close_browser(self):
+        proc, self.browser = self.browser, None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
     def helper(self):
         return self.helper_path if self.helper_path is not None else get_capture_helper_path()
 
     # --- running ---
-    def start(self):
+    def start(self, open_window=True):
         if os.name != "nt" and self.spawn is None:
             self.status = "Capturing one program's sound needs Windows."
             return False
-        if not self.helper() and self.spawn is None:
+        if not self.helper() and self.spawn is None and self.open_browser is None:
             self.status = ("The conference audio helper is not part of this build, so a conferencing program cannot be captured. "
                            "Install the newest Vision Studio.")
             return False
         self.active = True
+        if open_window and self.is_browser():
+            self.show_browser()
         self.tick()
         return True
 
     def stop(self):
         self.active = False
         self.stop_helper()
+        self.close_browser()
         self.status = "Conference audio is off."
 
     def stop_helper(self):
@@ -5778,6 +5838,20 @@ class ConferenceCapture:
     def tick(self):
         """Keeps the capture attached to the right program and updates the status line."""
         if not self.active:
+            return
+        if self.is_browser():
+            if not self.browser_running():
+                if self.helper_running():
+                    self.stop_helper()
+                self.status = ("The Vision Browser window is closed. Press Save Conference Call Settings to open it again.")
+                return
+            pid, exe = self.browser.pid, "visionstudio.exe"
+            if self.helper_running() and pid == self.pid:
+                self.status = self.running_status()
+                return
+            if self.helper_running():
+                self.stop_helper()
+            self.launch(pid, exe)
             return
         names = self.target_names()
         if not names:
@@ -5871,6 +5945,308 @@ class ConferenceCapture:
             self.mixer.push_float(GUEST_SOURCE, data)
         except Exception:
             pass
+
+
+
+# ---------------------------------------------------------------------------
+# Adding music by paste (Alt+P): songs that are already in a folder the program watches are used where they
+# are, never copied a second time; new songs are copied into the "New Music" folder and then used.
+# ---------------------------------------------------------------------------
+
+NEW_MUSIC_FOLDER_NAME = "New Music"
+
+
+def _letters(text):
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def _inside(path, folder):
+    try:
+        p = os.path.normcase(os.path.abspath(path))
+        f = os.path.normcase(os.path.abspath(folder))
+        return os.path.commonpath([p, f]) == f
+    except ValueError:
+        return False
+
+
+def expand_audio_paths(paths):
+    """Files stay; folders become the audio files inside them. Returns (audio files, skipped count)."""
+    found, skipped, seen = [], 0, set()
+    for path in paths:
+        if os.path.isdir(path):
+            items = scan_audio_files(path)
+        elif os.path.isfile(path) and path.lower().endswith(SUPPORTED_AUDIO):
+            items = [path]
+        else:
+            skipped += 1
+            continue
+        for item in items:
+            key = os.path.normcase(os.path.abspath(item))
+            if key not in seen:
+                seen.add(key)
+                found.append(item)
+    return found, skipped
+
+
+class MusicImporter:
+    """Decides, for each pasted song, whether it is already in the library, probably already there (ask), or new."""
+
+    def __init__(self, watched_folders, new_music_dir, metadata_fn=None):
+        roots = []
+        for folder in watched_folders:
+            if folder and os.path.isdir(folder) and not any(_inside(folder, r) for r in roots):
+                roots = [r for r in roots if not _inside(r, folder)] + [folder]
+        self.roots = roots
+        self.new_music_dir = new_music_dir
+        self.metadata_fn = metadata_fn or get_track_metadata
+        self.by_name_size = {}
+        self.by_stem = {}
+        for root in self.roots:
+            for path in scan_audio_files(root):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                name = os.path.basename(path).lower()
+                self.by_name_size.setdefault((name, size), path)
+                self.by_stem.setdefault(_letters(os.path.splitext(os.path.basename(path))[0]), []).append(path)
+
+    def in_library(self, path):
+        return any(_inside(path, r) for r in self.roots)
+
+    def similar_candidate(self, path):
+        """A library song that looks like the same recording: same file name with another size, or a file whose name
+        holds both the artist and the title from the tags, confirmed by its own tags."""
+        stem = _letters(os.path.splitext(os.path.basename(path))[0])
+        if stem and stem in self.by_stem:
+            return self.by_stem[stem][0]
+        meta = self.metadata_fn(path)
+        artist, title = _letters(meta.get("artist", "")), _letters(meta.get("title", ""))
+        if not artist or not title or len(title) < 3:
+            return ""
+        for key, paths in self.by_stem.items():
+            if artist in key and title in key:
+                for candidate in paths:
+                    other = self.metadata_fn(candidate)
+                    if _letters(other.get("artist", "")) == artist and _letters(other.get("title", "")) == title:
+                        return candidate
+        return ""
+
+    def plan(self, paths):
+        """[(kind, source path, library path or '')] where kind is inside, same, similar or new."""
+        result = []
+        for path in paths:
+            if self.in_library(path):
+                result.append(("inside", path, path))
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            existing = self.by_name_size.get((os.path.basename(path).lower(), size))
+            if existing:
+                result.append(("same", path, existing))
+                continue
+            candidate = self.similar_candidate(path)
+            result.append(("similar", path, candidate) if candidate else ("new", path, ""))
+        return result
+
+    def destination(self, path):
+        os.makedirs(self.new_music_dir, exist_ok=True)
+        name = os.path.basename(path)
+        target = os.path.join(self.new_music_dir, name)
+        base, ext = os.path.splitext(name)
+        number = 2
+        while os.path.exists(target):
+            target = os.path.join(self.new_music_dir, f"{base} ({number}){ext}")
+            number += 1
+        return target
+
+    def execute(self, plan, use_existing):
+        """use_existing: function(source, library path) -> True to use the library copy of a 'similar' song.
+        Returns a dict: songs (paths to use, in order), copied, reused, failed (list of (path, reason))."""
+        songs, copied, reused, failed = [], [], [], []
+        for kind, source, library_path in plan:
+            if kind == "inside":
+                songs.append(library_path)
+                reused.append(library_path)
+            elif kind == "same" or (kind == "similar" and use_existing(source, library_path)):
+                songs.append(library_path)
+                reused.append(library_path)
+            else:
+                try:
+                    target = self.destination(source)
+                    shutil.copy2(source, target)
+                    songs.append(target)
+                    copied.append(target)
+                except OSError as e:
+                    failed.append((source, str(e) or type(e).__name__))
+        return {"songs": songs, "copied": copied, "reused": reused, "failed": failed}
+
+
+def paste_summary(result, skipped, queued):
+    parts = []
+    added = len(result["copied"])
+    reused = len(result["reused"])
+    if added:
+        parts.append(f"{added} new song{'s' if added != 1 else ''} copied into {NEW_MUSIC_FOLDER_NAME}")
+    if reused:
+        parts.append(f"{reused} already in your library, so I used {'those' if reused != 1 else 'that one'} and did not copy {'them' if reused != 1 else 'it'}")
+    if result["failed"]:
+        parts.append(f"{len(result['failed'])} could not be copied")
+    if skipped:
+        parts.append(f"{skipped} skipped because {'they are' if skipped != 1 else 'it is'} not audio")
+    text = ". ".join(p[0].upper() + p[1:] for p in parts) + "." if parts else "Nothing to add."
+    if queued:
+        text += f" {queued} added to the queue."
+    return text
+
+
+
+# ---------------------------------------------------------------------------
+# Vision Browser: a meeting window with its own saved sign-ins for each service. It runs as a separate small
+# copy of the program (--meeting), so the meeting's sound belongs to that copy alone and the conference
+# capture can take it without anything else on this PC. Needs the Qt WebEngine add-on in the build.
+# ---------------------------------------------------------------------------
+
+VISION_BROWSER_SERVICES = {
+    # key: (name, start page, note)
+    "vb_zoom": ("Zoom", "https://app.zoom.us/wc", "Opens Zoom's web version. Paste a meeting link in the box above to join straight away."),
+    "vb_teams": ("Microsoft Teams", "https://teams.microsoft.com", "Opens Teams in the Vision Browser."),
+    "vb_webex": ("Cisco Webex", "https://web.webex.com", "Opens Webex in the Vision Browser."),
+    "vb_fcc": ("Free Conference Call", "https://www.freeconferencecall.com", "Opens Free Conference Call in the Vision Browser."),
+    "vb_meet": ("Google Meet", "https://meet.google.com",
+                "Opens Google Meet. Google often will not let you sign in to your account here; joining a meeting link as a guest works."),
+    "vb_jitsi": ("Jitsi Meet", "https://meet.jit.si", "Opens Jitsi Meet, which needs no account."),
+}
+
+
+def is_vision_browser_service(key):
+    return key in VISION_BROWSER_SERVICES
+
+
+def browser_profile_folder(key):
+    base = os.path.join(os.path.expanduser("~"), "VisionStudio", "Browser", re.sub(r"[^a-z0-9_]", "", key.lower()))
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        base = os.path.join(tempfile.gettempdir(), "VisionStudioBrowser", re.sub(r"[^a-z0-9_]", "", key.lower()))
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+def meeting_main():
+    """Runs the Vision Browser window. Returns the exit code."""
+    key = _arg_value("--meeting") or "vb_zoom"
+    name, start_page, _note = VISION_BROWSER_SERVICES.get(key, VISION_BROWSER_SERVICES["vb_zoom"])
+    url = _arg_value("--meeting-url") or start_page
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    # screen readers need the page's accessibility tree, and meetings must be able to start sound without a click
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " --force-renderer-accessibility --autoplay-policy=no-user-gesture-required").strip()
+    try:
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+        from PyQt6.QtCore import QCoreApplication
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+    except Exception as e:
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "Vision Browser", "The Vision Browser is not part of this build of Vision Studio, so "
+                             f"meetings cannot open inside the program.\n\n{type(e).__name__}: {e}\n\n"
+                             "Choose the desktop program for this service in Settings, Conference Call instead.")
+        return 1
+    install_crash_guard()
+    app = QApplication(sys.argv)
+    app.setApplicationName("Vision Browser")
+    folder = browser_profile_folder(key)
+    profile = QWebEngineProfile("vision_" + key, app)
+    profile.setPersistentStoragePath(os.path.join(folder, "storage"))
+    profile.setCachePath(os.path.join(folder, "cache"))
+    profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+    try:
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+    except Exception:
+        pass
+    windows = []
+
+    class MeetingPage(QWebEnginePage):
+        def __init__(self, owner):
+            super().__init__(profile, owner)
+            self.owner_window = owner
+            if hasattr(self, "permissionRequested"):          # newer Qt
+                self.permissionRequested.connect(self.on_permission)
+            else:
+                self.featurePermissionRequested.connect(self.on_feature)
+
+        def on_permission(self, permission):
+            try:
+                kinds = QWebEnginePermission.PermissionType
+                wanted = (kinds.MediaAudioCapture, kinds.MediaVideoCapture, kinds.MediaAudioVideoCapture)
+                permission.grant() if permission.permissionType() in wanted else permission.deny()
+            except Exception as e:
+                RUN_LOG.write("BROWSER", f"Permission error: {e}")
+
+        def on_feature(self, origin, feature):
+            allowed = (QWebEnginePage.Feature.MediaAudioCapture, QWebEnginePage.Feature.MediaVideoCapture,
+                       QWebEnginePage.Feature.MediaAudioVideoCapture)
+            policy = (QWebEnginePage.PermissionPolicy.PermissionGrantedByUser if feature in allowed
+                      else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+            self.setFeaturePermission(origin, feature, policy)
+
+        def createWindow(self, window_type):            # sign-in and meeting pop-ups open in their own window
+            popup = MeetingWindow("")
+            return popup.view.page()
+
+    class MeetingWindow(QWidget):
+        def __init__(self, address):
+            super().__init__()
+            windows.append(self)
+            self.setWindowTitle(f"Vision Browser - {name}")
+            self.resize(1100, 760)
+            layout = QVBoxLayout()
+            self.address = QLineEdit(address)
+            self.address.setAccessibleName("Address. Type or paste a meeting link and press Enter")
+            self.address.returnPressed.connect(self.go)
+            layout.addWidget(self.address)
+            self.view = QWebEngineView()
+            self.view.setAccessibleName("Meeting page")
+            self.view.setPage(MeetingPage(self.view))
+            self.view.page().settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
+            self.view.urlChanged.connect(lambda u: self.address.setText(u.toString()) if not self.address.hasFocus() else None)
+            self.view.titleChanged.connect(lambda t: self.setWindowTitle(f"{t} - Vision Browser" if t else f"Vision Browser - {name}"))
+            self.view.loadFinished.connect(lambda ok: self.view.setFocus())
+            layout.addWidget(self.view, 1)
+            self.setLayout(layout)
+            for keys, handler in (("Ctrl+L", lambda: (self.address.setFocus(), self.address.selectAll())),
+                                  ("F5", lambda: self.view.reload()), ("Alt+Left", lambda: self.view.back()),
+                                  ("Alt+Right", lambda: self.view.forward())):
+                shortcut = QShortcut(QKeySequence(keys), self)
+                shortcut.activated.connect(handler)
+            if address:
+                self.view.setUrl(QUrl(address))
+            self.show()
+
+        def go(self):
+            text = self.address.text().strip()
+            if not text:
+                return
+            if "://" not in text:
+                text = "https://" + text
+            self.view.setUrl(QUrl(text))
+
+        def closeEvent(self, event):
+            if self in windows:
+                windows.remove(self)
+            event.accept()
+            if not windows:
+                QTimer.singleShot(0, QApplication.quit)
+
+    try:
+        from PyQt6.QtWebEngineCore import QWebEnginePermission
+    except Exception:
+        QWebEnginePermission = None
+    first = MeetingWindow(url)
+    RUN_LOG.write("BROWSER", f"Vision Browser opened for {name}: {url}")
+    return app.exec()
 
 
 
@@ -13089,6 +13465,7 @@ class BroadcastingApp(QWidget):
         return {
             "insert_tracks": self.insert_tracks,
             "insert_tracks_alt": self.insert_tracks,
+            "paste_music": self.paste_music,
             "automation_toggle": self.automation_toggle,
             "stop_fade": self.stop_with_fade,
             "start_rotation": self.start_rotation,
@@ -13792,6 +14169,81 @@ class BroadcastingApp(QWidget):
         self.announce(f"Inserted {len(files)} track(s) {where}.")
         self.queue_list.setFocus()
 
+    def watched_music_folders(self):
+        folders = [str(self.settings.value("music_library_folder", "") or "")]
+        try:
+            folders += [r.folder for r in self.rotation_library.rotations if r.folder]
+        except Exception:
+            pass
+        return [f for f in folders if f]
+
+    def paste_music(self):
+        """Alt+P: songs copied in Explorer (or picked here) are added. A song that is already in a folder the program
+        watches is used where it is and is never copied again; new songs are copied into the New Music folder."""
+        root = str(self.settings.value("music_library_folder", "") or "")
+        if not root or not os.path.isdir(root):
+            self.announce("Set the music folder in Settings first, so there is somewhere to keep new songs.")
+            return
+        paths = []
+        try:
+            mime = QApplication.clipboard().mimeData()
+            if mime is not None and mime.hasUrls():
+                paths = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+        except Exception:
+            paths = []
+        if not paths:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Add music (nothing copied was found, so choose songs)", root,
+                "Audio files (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.wma *.opus);;All files (*.*)")
+            if not files:
+                return
+            paths = list(files)
+        songs, skipped = expand_audio_paths(paths)
+        if not songs:
+            self.announce("No audio files were found to add." if not skipped else f"{skipped} item(s) skipped: they are not audio files.")
+            return
+        self.announce(f"Checking {len(songs)} song(s) against your library.")
+        QApplication.processEvents()
+        importer = MusicImporter(self.watched_music_folders(), os.path.join(root, NEW_MUSIC_FOLDER_NAME))
+        plan = importer.plan(songs)
+        sticky = {"answer": None}
+
+        def use_existing(source, library_path):
+            if sticky["answer"] is not None:
+                return sticky["answer"]
+            box = QMessageBox(self)
+            box.setWindowTitle("This song may already be in your library")
+            box.setText(f"{os.path.basename(source)} looks like {os.path.basename(library_path)} in your library "
+                        f"({os.path.dirname(library_path)}). Use the one you already have and do not copy this one?")
+            yes = box.addButton("Use The One I Have", QMessageBox.ButtonRole.YesRole)
+            no = box.addButton("Copy This One As New", QMessageBox.ButtonRole.NoRole)
+            yes_all = box.addButton("Use Existing For All Like This", QMessageBox.ButtonRole.AcceptRole)
+            no_all = box.addButton("Copy All Like This", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is yes_all:
+                sticky["answer"] = True
+            elif clicked is no_all:
+                sticky["answer"] = False
+            return clicked in (yes, yes_all)
+
+        result = importer.execute(plan, use_existing)
+        queued = 0
+        if str(self.settings.value("paste_adds_to_queue", "true")).lower() != "false" and result["songs"]:
+            row = self.queue_list.currentRow()
+            header = self.queue_list.header_count
+            index = max(0, row - header + 1) if row >= 0 else None
+            for offset, path in enumerate(result["songs"]):
+                self.rotation.insert_queue_item(path, None if index is None else index + offset)
+            queued = len(result["songs"])
+        if result["copied"]:
+            self.normalizer.start(result["copied"], priority=True)
+            QTimer.singleShot(800, self.rescan_library)
+        RUN_LOG.write("IMPORT", f"Paste: {len(result['copied'])} copied, {len(result['reused'])} used where they were, "
+                                f"{len(result['failed'])} failed, {skipped} skipped.")
+        self.announce(paste_summary(result, skipped, queued))
+        self.queue_list.setFocus()
+
     def insert_hour_marker(self):
         row = self.queue_list.currentRow()
         header = self.queue_list.header_count
@@ -14302,6 +14754,7 @@ class BroadcastingApp(QWidget):
         add(file_menu, "send_to_tray", "Send to the system tray (keeps playing)", self.hide_to_tray)
         file_menu.addSeparator()
         add(file_menu, "insert_tracks", "Insert tracks into the queue", self.insert_tracks)
+        add(file_menu, "paste_music", "Paste music (copies new songs in, uses the ones you already have)", self.paste_music)
         add(file_menu, "automation_toggle", "Automation on or off", self.automation_toggle)
         add(file_menu, "stop_fade", "Stop with fade (the record stays on the deck)", self.stop_with_fade)
         add(file_menu, "stop_rotation", "Stop everything at once", self.stop_everything)
@@ -15175,7 +15628,7 @@ class BroadcastingApp(QWidget):
         self.conf_service_combo.setAccessibleName("Conferencing service")
         for key, name, _exes, _note in CONFERENCE_SERVICES:
             self.conf_service_combo.addItem(name, key)
-        current = str(self.settings.value("conference_service", "zoom"))
+        current = str(self.settings.value("conference_service", default_conference_service()))
         self.conf_service_combo.setCurrentIndex(max(0, [i[0] for i in CONFERENCE_SERVICES].index(current) if current in [i[0] for i in CONFERENCE_SERVICES] else 0))
         self.conf_service_combo.currentIndexChanged.connect(self.on_conference_service_changed)
         form.addRow("Service:", self.conf_service_combo)
@@ -15184,6 +15637,10 @@ class BroadcastingApp(QWidget):
         self.conf_note_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.conf_note_label.setAccessibleName("About this service")
         form.addRow(self.conf_note_label)
+        self.conf_link_edit = QLineEdit(str(self.settings.value("conference_link", "") or ""))
+        self.conf_link_edit.setAccessibleName("Meeting link to open in the Vision Browser, optional")
+        self.conf_link_edit.setPlaceholderText("Optional: paste a meeting link")
+        form.addRow("Meeting link (Vision Browser):", self.conf_link_edit)
         self.conf_other_combo = QComboBox()
         self.conf_other_combo.setEditable(True)
         self.conf_other_combo.setAccessibleName("Program to capture, used when Another program is chosen")
@@ -15288,6 +15745,7 @@ class BroadcastingApp(QWidget):
         key = self.conf_service_combo.currentData()
         self.conf_note_label.setText(conference_service(key)[3])
         self.conf_other_combo.setEnabled(key == "other")
+        self.conf_link_edit.setEnabled(key.startswith("vb_"))
 
     def refresh_conference_programs(self):
         names = other_program_names(list_running_processes())
@@ -15314,6 +15772,7 @@ class BroadcastingApp(QWidget):
         values = {"conference_enabled": "true" if self.conf_enable_check.isChecked() else "false",
                   "conference_service": self.conf_service_combo.currentData(),
                   "conference_other_exe": self.conf_other_combo.currentText().strip(),
+                  "conference_link": self.conf_link_edit.text().strip(),
                   "guest_level_percent": self.conf_level_spin.value(),
                   "guest_clean_on": "true" if self.conf_clean_check.isChecked() else "false",
                   "guest_noise_strength": self.conf_strength_spin.value(),
@@ -15327,10 +15786,10 @@ class BroadcastingApp(QWidget):
                   "guest_duck_host_mic": "true" if self.conf_duck_mic_check.isChecked() else "false"}
         for key, value in values.items():
             self.settings.setValue(key, value)
-        self.apply_conference_settings()
+        self.apply_conference_settings(from_save=True)
         self.announce("Conference call settings saved. " + self.conference.status)
 
-    def apply_conference_settings(self):
+    def apply_conference_settings(self, from_save=False):
         cleaner = self.guest_cleaner
         if cleaner is not None:
             cleaner.enabled = self.conf_bool("guest_clean_on")
@@ -15339,12 +15798,16 @@ class BroadcastingApp(QWidget):
                               leveler_on=self.conf_bool("guest_leveler_on"), leveler_target_db=self.conf_number("guest_leveler_target_db"))
         self.guest_ducker.configure(self.conf_bool("guest_duck_on"), self.conf_number("guest_duck_db"), self.conf_bool("guest_duck_host_mic"))
         self.conference.level_percent = self.conf_number("guest_level_percent")
-        self.conference.set_target(str(self.settings.value("conference_service", "zoom")), str(self.settings.value("conference_other_exe", "") or ""))
+        self.conference.set_target(str(self.settings.value("conference_service", default_conference_service())),
+                                   str(self.settings.value("conference_other_exe", "") or ""),
+                                   str(self.settings.value("conference_link", "") or ""))
         wanted = self.conf_bool("conference_enabled")
         if wanted and not (self.mixer.available and cleaner is not None):
             self.conference.status = "Conference audio needs the stream mixer, which is not available (" + self.mixer.unavailable_reason() + ")."
         elif wanted and not self.conference.active:
-            self.conference.start()
+            self.conference.start(open_window=from_save)
+        elif wanted and from_save and self.conference.is_browser():
+            self.conference.show_browser()          # saving again brings a closed Vision Browser window back
         elif not wanted and self.conference.active:
             self.conference.stop()
         elif not wanted:
@@ -16886,6 +17349,8 @@ if __name__ == "__main__":
         _target = sys.argv[sys.argv.index("--make-icon") + 1] if len(sys.argv) > sys.argv.index("--make-icon") + 1 else "VisionStudio.ico"
         write_icon_file(_target)
         sys.exit(0)
+    if "--meeting" in sys.argv:                 # the Vision Browser window: a separate small copy of the program
+        sys.exit(meeting_main())
     install_crash_guard()
     disable_power_throttling()
     app = QApplication(sys.argv)

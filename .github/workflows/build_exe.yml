@@ -22,6 +22,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Add the built-in Vision Browser (optional)
+        shell: pwsh
+        run: |
+          # The Vision Browser needs Qt WebEngine at the same version as the rest of Qt. If it cannot be added,
+          # the program still builds and its Conference Call page says the Vision Browser is missing.
+          try {
+            pip install "PyQt6-WebEngine>=6.7,<6.13" "PyQt6-WebEngine-Qt6>=6.7,<6.13" "PyQt6>=6.7,<6.13" "PyQt6-Qt6>=6.7,<6.13"
+            if ($LASTEXITCODE -ne 0) { throw "pip could not install the browser engine" }
+            python -c "from PyQt6.QtWebEngineWidgets import QWebEngineView; from PyQt6.QtWebEngineCore import QWebEngineProfile; print('browser engine ok')"
+            if ($LASTEXITCODE -ne 0) { throw "the browser engine would not load" }
+            "VS_WEBENGINE=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Host "::notice title=Vision Browser::browser engine added"
+          } catch {
+            $msg = ($_ | Out-String) -replace "`r", "" -replace "`n", "%0A"
+            Write-Host "::warning title=Vision Browser missing::$msg"
+          }
+
       - name: Check the toolkit still supports Windows 10
         shell: pwsh
         run: |
@@ -74,6 +91,7 @@ jobs:
         run: |
           $extra = @()
           if (Test-Path helper\vs_appcapture.exe) { $extra += @("--add-binary", "helper\vs_appcapture.exe;helper") } else { Write-Host "Building without the conference-call helper." }
+          if ($env:VS_WEBENGINE -eq "1") { $extra += @("--hidden-import", "PyQt6.QtWebEngineWidgets", "--hidden-import", "PyQt6.QtWebEngineCore") } else { Write-Host "Building without the Vision Browser." }
           pyinstaller --noconfirm --onefile --windowed --icon VisionStudio.ico --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" @extra VisionStudio.py
 
       - name: Upload Artifacts

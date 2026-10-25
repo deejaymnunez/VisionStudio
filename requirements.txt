@@ -5,3 +5,4 @@ PyQt6-Qt6>=6.7,<6.13
 mutagen
 numpy
 pyinstaller
+# The Vision Browser (meeting window) also needs PyQt6-WebEngine and PyQt6-WebEngine-Qt6 at the same version; the build adds them in an optional step.
