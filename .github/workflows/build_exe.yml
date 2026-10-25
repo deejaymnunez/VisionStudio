@@ -48,9 +48,25 @@ jobs:
         run: |
           python VisionStudio.py --make-icon VisionStudio.ico
 
-      - name: Build with PyInstaller
+      - name: Build the conference-call audio helper (optional)
+        id: helper
+        continue-on-error: true
+        shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --windowed --icon VisionStudio.ico --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" VisionStudio.py
+          # Captures one program's sound (Zoom and so on) without a virtual audio cable. If this step ever fails,
+          # the program still builds; the Conference Call settings page then says the helper is missing.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio build tools were not found" }
+          cmd /c "call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /EHsc /O2 /W3 helper\vs_appcapture.cpp /Fe:helper\vs_appcapture.exe /link ole32.lib mmdevapi.lib"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path helper\vs_appcapture.exe)) { throw "The helper did not compile" }
+          Get-Item helper\vs_appcapture.exe
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          $extra = @()
+          if (Test-Path helper\vs_appcapture.exe) { $extra += @("--add-binary", "helper\vs_appcapture.exe;helper") } else { Write-Host "Building without the conference-call helper." }
+          pyinstaller --noconfirm --onefile --windowed --icon VisionStudio.ico --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" @extra VisionStudio.py
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

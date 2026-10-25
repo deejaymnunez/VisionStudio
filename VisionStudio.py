@@ -4626,6 +4626,9 @@ class ProgramMixer:
         self.master_processor = None
         self.source_processors = {}
         self.source_processing = {}   # source name -> bool
+        self.custom_processors = {}   # source name -> object with process() and reset() (the conference guest's cleaner)
+        self.ducker = None            # MusicDucker: lowers other sources while the guest speaks
+        self.last_duck_time = None
         self.processor_preset = "Broadcast"
         self.processor_ceiling_db = -1.0
         if NUMPY_AVAILABLE:
@@ -4707,7 +4710,14 @@ class ProgramMixer:
         if source is None:
             return
         data = pcm_to_stereo_float(raw, sample_rate, channels, sample_format)
-        if data is None or len(data) == 0:
+        self.push_float(name, data)
+
+    def push_float(self, name, data):
+        """Adds float32 stereo audio (already at the stream rate) to a source."""
+        if not self.timer.isActive():
+            return
+        source = self.sources.get(name)
+        if source is None or data is None or len(data) == 0:
             return
         try:
             source.peak = float(np.max(np.abs(data)))
@@ -4742,6 +4752,8 @@ class ProgramMixer:
             if self.master_processor is not None:
                 self.master_processor.reset()
             for proc in self.source_processors.values():
+                proc.reset()
+            for proc in self.custom_processors.values():
                 proc.reset()
             self.timer.start()
 
@@ -4787,14 +4799,24 @@ class ProgramMixer:
             if count <= 0:
                 return
             mix = np.zeros((count, 2), dtype=np.float32)
+            ducker = self.ducker
+            guest = self.custom_processors.get("guest")
+            if ducker is not None and ducker.enabled:
+                ducker.update(bool(guest is not None and guest.speaking), elapsed)
             for source in self.sources.values():
                 chunk = self._pull(source, count)
                 try:
                     gain = float(source.gain_fn())
+                    if ducker is not None:
+                        gain *= ducker.gain_for(source.name)
                 except Exception:
                     gain = 0.0
+                custom = self.custom_processors.get(source.name)
+                if custom is not None and chunk is None:
+                    custom.speaking = False                                # nothing is arriving, so nobody is speaking
+                    custom.hold = 0
                 if chunk is not None:
-                    proc = self._source_processor(source.name)
+                    proc = custom if custom is not None else self._source_processor(source.name)
                     if proc is not None:
                         chunk = proc.process(chunk)
                     ramp = np.linspace(source.last_gain, gain, count, dtype=np.float32)[:, None]
@@ -5331,6 +5353,523 @@ class VoiceRecorder:
             if self.path and os.path.exists(self.path):
                 os.remove(self.path)
         except OSError:
+            pass
+
+
+
+# ---------------------------------------------------------------------------
+# Conference calls: the guest's voice is taken from the conferencing program itself (no virtual cable),
+# cleaned so the voice stands out from hiss and room noise, and the music is lowered while they speak.
+# ---------------------------------------------------------------------------
+
+GUEST_SOURCE = "guest"
+
+GUEST_DEFAULTS = {
+    "guest_clean_on": "true",       # the cleaning chain below (when the conference source is on)
+    "guest_noise_strength": 60,     # 0 to 100: how hard steady hiss and room noise are pushed down
+    "guest_highpass_hz": 90,        # removes rumble and thumps
+    "guest_presence_db": 2.5,       # lifts the part of the voice that carries the words
+    "guest_gate_db": 14,            # how far the line is lowered between words (0 turns it off)
+    "guest_leveler_on": "true",     # quiet guests are brought up, loud ones held back
+    "guest_leveler_target_db": -20,
+    "guest_duck_on": "true",        # music lowers while the guest speaks
+    "guest_duck_db": 10,
+    "guest_duck_host_mic": "false",
+    "guest_level_percent": 100,
+}
+
+
+class GuestCleaner:
+    """Cleans one voice that arrives over a call. Mono, frequency-domain (numpy only): a speech-aware noise
+    reducer that learns the steady background by itself, a rumble filter, a presence lift, a gate that lowers the
+    line between words, and a leveler. `speaking` says whether the guest is talking right now (used to lower the
+    music), and it is not fooled by steady noise. It adds about 25 ms of delay."""
+
+    FRAME = 1024
+    HOP = 512
+
+    def __init__(self, sample_rate=44100):
+        self.sr = float(sample_rate)
+        n = self.FRAME
+        self.window = np.sqrt(0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)).astype(np.float32)
+        self.freqs = np.fft.rfftfreq(n, 1.0 / self.sr)
+        self.enabled = True
+        self.noise_strength = 60.0
+        self.highpass_hz = 90.0
+        self.presence_db = 2.5
+        self.gate_db = 14.0
+        self.leveler_on = True
+        self.leveler_target_db = -20.0
+        self.speaking = False
+        self.level_db = -90.0
+        self.noise_floor_db = -90.0
+        self._set_curve()
+        self.reset()
+
+    # --- settings ---
+    def configure(self, strength=None, highpass_hz=None, presence_db=None, gate_db=None, leveler_on=None, leveler_target_db=None):
+        if strength is not None:
+            self.noise_strength = float(min(100.0, max(0.0, strength)))
+        if highpass_hz is not None:
+            self.highpass_hz = float(min(300.0, max(0.0, highpass_hz)))
+        if presence_db is not None:
+            self.presence_db = float(min(8.0, max(-4.0, presence_db)))
+        if gate_db is not None:
+            self.gate_db = float(min(40.0, max(0.0, gate_db)))
+        if leveler_on is not None:
+            self.leveler_on = bool(leveler_on)
+        if leveler_target_db is not None:
+            self.leveler_target_db = float(min(-10.0, max(-35.0, leveler_target_db)))
+        self._set_curve()
+
+    def _set_curve(self):
+        f = np.maximum(self.freqs, 1.0)
+        curve = np.ones_like(f)
+        if self.highpass_hz > 0:
+            curve *= 1.0 / np.sqrt(1.0 + (self.highpass_hz / f) ** 4)       # second-order rumble filter
+        if abs(self.presence_db) > 0.01:
+            bell = np.exp(-0.5 * (np.log2(f / 2800.0) / 0.7) ** 2)
+            curve *= 10.0 ** (self.presence_db * bell / 20.0)
+        curve[0] = 0.0
+        self.curve = curve.astype(np.float32)
+
+    def reset(self):
+        n = self.FRAME
+        self.in_fifo = np.zeros(0, dtype=np.float32)
+        self.ola = np.zeros(n, dtype=np.float32)
+        self.out_fifo = np.zeros(0, dtype=np.float32)
+        bins = n // 2 + 1
+        self.noise = None
+        self.smooth_power = None
+        self.prev_gain = np.ones(bins, dtype=np.float32)
+        self.warmup = 0
+        self.hold = 0
+        self.gate_gain = 1.0
+        self.level_gain = 1.0
+        self.speaking = False
+        self.level_db = -90.0
+        self.noise_floor_db = -90.0
+
+    def _rms_db(self, spec):
+        energy = (abs(spec[0]) ** 2 + abs(spec[-1]) ** 2 + 2.0 * float(np.sum(np.abs(spec[1:-1]) ** 2))) / float(self.FRAME)
+        rms_windowed = np.sqrt(energy / float(self.FRAME))
+        return float(20.0 * np.log10(rms_windowed / 0.7071 + 1e-9))
+
+    # --- one frame of spectrum ---
+    def _frame(self, spec):
+        power = (spec.real ** 2 + spec.imag ** 2).astype(np.float32) / float(self.FRAME)
+        if self.smooth_power is None:
+            self.smooth_power = power.copy()
+        else:
+            self.smooth_power = 0.55 * self.smooth_power + 0.45 * power
+        sp = self.smooth_power
+        in_db = self._rms_db(spec)
+        if self.noise is None:
+            self.noise = np.maximum(sp, 1e-9)
+        elif in_db < -80.0:
+            pass                                                          # digital silence teaches nothing about the background
+        elif self.warmup < 12:
+            self.noise = 0.7 * self.noise + 0.3 * sp                      # first moments: assume the line is quiet
+        elif self.hold == 0 and not self.speaking:
+            # between words: learn what the background is (it drops faster than it rises, so a loud start is forgotten)
+            self.noise = np.where(sp < self.noise, 0.8 * self.noise + 0.2 * sp, 0.92 * self.noise + 0.08 * sp)
+        else:
+            # while talking, follow it down, and only creep up, so a new background is still found
+            self.noise = np.where(sp < self.noise, 0.7 * self.noise + 0.3 * sp, self.noise * 1.003)
+        self.warmup += 1
+        band = (self.freqs > 200.0) & (self.freqs < 4000.0)
+        frame_db = 10.0 * np.log10(float(np.mean(sp[band])) + 1e-12)
+        floor_db = 10.0 * np.log10(float(np.mean(self.noise[band])) + 1e-12)
+        self.noise_floor_db = floor_db
+        # speech is when the voice band is clearly above the background
+        active = (frame_db - floor_db) > 8.0 and in_db > -60.0
+        if active:
+            self.hold = 12                          # about 140 ms, so short pauses do not chop words
+        elif self.hold > 0:
+            self.hold -= 1
+        voiced = active or self.hold > 0
+        self.speaking = bool(voiced)
+
+        # noise reduction gain per frequency
+        strength = self.noise_strength / 100.0
+        max_cut_db = 6.0 + 24.0 * strength
+        floor_gain = 10.0 ** (-max_cut_db / 20.0)
+        over = 1.0 + 2.2 * strength
+        snr = np.maximum(sp, 1e-12) / np.maximum(self.noise * over, 1e-12)
+        gain = np.sqrt(np.clip(1.0 - 1.0 / np.maximum(snr, 1e-6), 0.0, 1.0))
+        gain = np.maximum(gain, floor_gain)
+        if strength <= 0.0:
+            gain = np.ones_like(gain)
+        gain = np.maximum(gain, 0.75 * self.prev_gain)         # releases smoothly, so no watery 'musical' bursts
+        gain = (np.concatenate([gain[1:2], gain[:-1]]) * 0.25 + gain * 0.5 + np.concatenate([gain[1:], gain[-2:-1]]) * 0.25)
+        self.prev_gain = gain.astype(np.float32)
+
+        # gate: lowers the line between words
+        if self.gate_db > 0:
+            target = 1.0 if voiced else 10.0 ** (-self.gate_db / 20.0)
+            rate = 0.55 if target > self.gate_gain else 0.88
+            self.gate_gain = target + (self.gate_gain - target) * (1.0 - rate)
+        else:
+            self.gate_gain = 1.0
+
+        out = spec * (gain * self.curve).astype(np.float32)
+
+        # leveler: only follows the voice, never the noise between words
+        out_db = self._rms_db(out)
+        self.level_db = out_db if voiced else self.level_db * 0.9 + out_db * 0.1
+        if self.leveler_on:
+            if active:
+                want = float(np.clip(self.leveler_target_db - out_db, -6.0, 12.0))
+                self.level_gain += (10.0 ** (want / 20.0) - self.level_gain) * 0.04
+            elif not voiced:
+                self.level_gain += (1.0 - self.level_gain) * 0.02
+            out = out * np.float32(self.level_gain)
+        out = out * np.float32(self.gate_gain)                          # the gate comes last, so the leveler never lifts the pauses
+        return out
+
+    def process(self, block):
+        """block: float32 (n, 2). Returns the cleaned voice as float32 (n, 2)."""
+        n = len(block)
+        if n == 0:
+            return block
+        mono = block.mean(axis=1).astype(np.float32)
+        if not self.enabled:
+            level = float(np.sqrt(np.mean(mono ** 2)) + 1e-9)
+            self.level_db = 20.0 * np.log10(level)
+            self.speaking = self.level_db > -45.0
+            return block
+        self.in_fifo = np.concatenate([self.in_fifo, mono])
+        while len(self.in_fifo) >= self.FRAME:
+            frame = self.in_fifo[:self.FRAME] * self.window
+            self.in_fifo = self.in_fifo[self.HOP:]
+            spec = np.fft.rfft(frame)
+            spec = self._frame(spec)
+            out = np.fft.irfft(spec, n=self.FRAME).astype(np.float32) * self.window
+            self.ola += out
+            self.out_fifo = np.concatenate([self.out_fifo, self.ola[:self.HOP]])
+            self.ola = np.concatenate([self.ola[self.HOP:], np.zeros(self.HOP, dtype=np.float32)])
+        if len(self.out_fifo) < n:
+            self.out_fifo = np.concatenate([self.out_fifo, np.zeros(n - len(self.out_fifo), dtype=np.float32)])
+        chunk = self.out_fifo[:n]
+        self.out_fifo = self.out_fifo[n:]
+        chunk = np.tanh(chunk * 1.05) / 1.05 if float(np.max(np.abs(chunk))) > 0.9 else chunk      # soft ceiling
+        return np.stack([chunk, chunk], axis=1)
+
+
+class MusicDucker:
+    """Lowers the music (and, if wanted, the host microphone) on the stream while the guest speaks, and eases it back."""
+
+    def __init__(self):
+        self.enabled = False
+        self.depth_db = 10.0
+        self.names = {"deck_a", "deck_b", "sequence"}
+        self.level = 1.0
+
+    def configure(self, enabled, depth_db, include_mic=False):
+        self.enabled = bool(enabled)
+        self.depth_db = float(min(30.0, max(0.0, depth_db)))
+        self.names = {"deck_a", "deck_b", "sequence"} | ({"mic"} if include_mic else set())
+        if not self.enabled:
+            self.level = 1.0
+
+    def update(self, speaking, seconds):
+        """Moves the duck level toward its target and returns it. Down takes about 0.25 s, back up about 0.9 s."""
+        target = 10.0 ** (-self.depth_db / 20.0) if (self.enabled and speaking) else 1.0
+        time_constant = 0.25 if target < self.level else 0.9
+        step = min(1.0, max(0.0, seconds) / time_constant)
+        self.level += (target - self.level) * step
+        return self.level
+
+    def gain_for(self, name):
+        return self.level if (self.enabled and name in self.names) else 1.0
+
+
+# ---------------------------------------------------------------------------
+# Finding the conferencing program and capturing only its sound
+# ---------------------------------------------------------------------------
+
+CONFERENCE_SERVICES = [
+    # key, name shown in the list, program file names to look for, a note shown under the list
+    ("zoom", "Zoom", ("zoom.exe",), "Sign in to Zoom as you always do. Vision Studio only takes Zoom's sound."),
+    ("teams", "Microsoft Teams", ("ms-teams.exe", "teams.exe"), "Sign in to Teams as you always do."),
+    ("webex", "Cisco Webex", ("webex.exe", "ciscocollabhost.exe", "atmgr.exe"), "Sign in to Webex as you always do."),
+    ("discord", "Discord", ("discord.exe",), "Use this for Discord calls."),
+    ("slack", "Slack huddles", ("slack.exe",), "Use this for Slack huddles."),
+    ("chrome", "Web meeting in Google Chrome", ("chrome.exe",),
+     "For Google Meet, Free Conference Call, Jitsi, Zoom in the browser and other meetings in a browser. Everything Chrome plays is "
+     "captured, so close other tabs that make sound."),
+    ("edge", "Web meeting in Microsoft Edge", ("msedge.exe",),
+     "For meetings in Edge. Everything Edge plays is captured, so close other tabs that make sound."),
+    ("firefox", "Web meeting in Firefox", ("firefox.exe",),
+     "For meetings in Firefox. Everything Firefox plays is captured, so close other tabs that make sound."),
+    ("brave", "Web meeting in Brave", ("brave.exe",),
+     "For meetings in Brave. Everything Brave plays is captured, so close other tabs that make sound."),
+    ("other", "Another program (choose it from the list)", (), "Pick any running program. Only its sound is captured."),
+]
+
+
+def conference_service(key):
+    for item in CONFERENCE_SERVICES:
+        if item[0] == key:
+            return item
+    return CONFERENCE_SERVICES[0]
+
+
+def get_capture_helper_path():
+    names = ("vs_appcapture.exe",)
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)), "helper"))
+        bases.append(os.path.join(os.path.dirname(sys.executable), "helper"))
+    bases.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "helper"))
+    for base in bases:
+        for name in names:
+            candidate = os.path.join(base, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+def list_running_processes():
+    """[(pid, parent pid, lower-case program file name)] for everything running. Windows only (empty elsewhere)."""
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+        kernel = ctypes.windll.kernel32
+        kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        snap = kernel.CreateToolhelp32Snapshot(0x2, 0)
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return []
+        found = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                found.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), entry.szExeFile.lower()))
+                ok = kernel.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel.CloseHandle(snap)
+        return found
+    except Exception:
+        return []
+
+
+def find_root_process(processes, exe_names):
+    """The process to capture: of the programs with these file names, one whose parent is not another of them
+    (so the whole program, with the pieces it started, is covered). Returns (pid, exe) or (0, "")."""
+    names = {n.lower() for n in exe_names}
+    mine = [p for p in processes if p[2] in names]
+    if not mine:
+        return 0, ""
+    mine_pids = {p[0] for p in mine}
+    roots = sorted((p for p in mine if p[1] not in mine_pids), key=lambda p: p[0])
+    chosen = roots[0] if roots else sorted(mine, key=lambda p: p[0])[0]
+    return chosen[0], chosen[2]
+
+
+def other_program_names(processes):
+    skip = {"system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe", "lsass.exe", "svchost.exe",
+            "fontdrvhost.exe", "dwm.exe", "winlogon.exe", "conhost.exe", "dllhost.exe", "runtimebroker.exe", "searchhost.exe",
+            "sihost.exe", "ctfmon.exe", "taskhostw.exe", "system idle process", "memory compression", "wudfhost.exe",
+            "spoolsv.exe", "audiodg.exe", "visionstudio.exe", "vs_appcapture.exe", "ffmpeg.exe", "explorer.exe"}
+    return sorted({p[2] for p in processes if p[2] and p[2] not in skip})
+
+
+class ConferenceCapture:
+    """Starts the capture helper for the chosen conferencing program and feeds what it hears into the mixer's guest
+    source. tick() is called every few seconds: it follows the program if it restarts and reports what is happening."""
+
+    CHUNK_BYTES = 17640          # 100 ms of 44.1 kHz stereo 16-bit
+
+    def __init__(self, mixer, list_processes=None, helper_path=None, spawn=None):
+        self.mixer = mixer
+        self.list_processes = list_processes or list_running_processes
+        self.helper_path = helper_path
+        self.spawn = spawn
+        self.service_key = "zoom"
+        self.other_exe = ""
+        self.level_percent = 100
+        self.active = False
+        self.proc = None
+        self.pid = 0
+        self.exe = ""
+        self.status = "Conference audio is off."
+        self.helper_message = ""
+        self.peak = 0.0
+        self.peak_time = 0.0
+        self.last_data = 0.0
+        self.bytes_total = 0
+        self.lock = threading.Lock()
+        self.generation = 0
+
+    # --- choices ---
+    def target_names(self):
+        if self.service_key == "other":
+            return (self.other_exe,) if self.other_exe else ()
+        return conference_service(self.service_key)[2]
+
+    def display_name(self):
+        if self.service_key == "other":
+            return self.other_exe or "the chosen program"
+        return conference_service(self.service_key)[1]
+
+    def set_target(self, service_key, other_exe=""):
+        changed = (service_key != self.service_key) or (service_key == "other" and other_exe.lower() != self.other_exe)
+        self.service_key = service_key
+        self.other_exe = (other_exe or "").lower()
+        if changed and self.active:
+            self.stop_helper()
+            self.tick()
+
+    def helper(self):
+        return self.helper_path if self.helper_path is not None else get_capture_helper_path()
+
+    # --- running ---
+    def start(self):
+        if os.name != "nt" and self.spawn is None:
+            self.status = "Capturing one program's sound needs Windows."
+            return False
+        if not self.helper() and self.spawn is None:
+            self.status = ("The conference audio helper is not part of this build, so a conferencing program cannot be captured. "
+                           "Install the newest Vision Studio.")
+            return False
+        self.active = True
+        self.tick()
+        return True
+
+    def stop(self):
+        self.active = False
+        self.stop_helper()
+        self.status = "Conference audio is off."
+
+    def stop_helper(self):
+        proc, self.proc = self.proc, None
+        self.pid = 0
+        self.generation += 1
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def helper_running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def tick(self):
+        """Keeps the capture attached to the right program and updates the status line."""
+        if not self.active:
+            return
+        names = self.target_names()
+        if not names:
+            self.status = "Choose a program from the list."
+            return
+        pid, exe = find_root_process(self.list_processes(), names)
+        if pid == 0:
+            if self.helper_running():
+                self.stop_helper()
+            self.status = f"Waiting for {self.display_name()}. Start it and join your meeting; capture begins by itself."
+            return
+        if self.helper_running() and pid == self.pid:
+            self.status = self.running_status()
+            return
+        if self.helper_running():
+            self.stop_helper()
+        self.launch(pid, exe)
+
+    def running_status(self):
+        now = time.time()
+        if self.last_data and now - self.last_data < 2.0:
+            if now - self.peak_time < 1.0 and self.peak > 0.004:
+                return f"Capturing {self.display_name()}. Its sound is arriving."
+            return f"Capturing {self.display_name()}. It is quiet right now (nobody is talking, or the meeting has not started)."
+        return f"Capturing {self.display_name()}. It has not played any sound yet."
+
+    def launch(self, pid, exe):
+        helper = self.helper()
+        self.helper_message = ""
+        try:
+            if self.spawn is not None:
+                proc = self.spawn(pid)
+            else:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                proc = subprocess.Popen([helper, str(pid), "include"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        stdin=subprocess.DEVNULL, creationflags=flags)
+        except Exception as e:
+            self.proc = None
+            self.status = f"The capture helper could not start: {e}"
+            RUN_LOG.write("CONFERENCE", self.status)
+            return
+        self.proc, self.pid, self.exe = proc, pid, exe
+        self.generation += 1
+        gen = self.generation
+        self.last_data = 0.0
+        threading.Thread(target=self.read_audio, args=(proc, gen), daemon=True).start()
+        threading.Thread(target=self.read_messages, args=(proc, gen), daemon=True).start()
+        self.status = f"Starting the capture of {self.display_name()}."
+        RUN_LOG.write("CONFERENCE", f"Capturing {exe} (process {pid}).")
+
+    def read_audio(self, proc, gen):
+        pending = b""
+        try:
+            while gen == self.generation:
+                data = proc.stdout.read(self.CHUNK_BYTES)
+                if not data:
+                    break
+                pending += data
+                usable = len(pending) // 4 * 4
+                if usable == 0:
+                    continue
+                block, pending = pending[:usable], pending[usable:]
+                self.on_audio(block)
+        except Exception:
+            pass
+
+    def read_messages(self, proc, gen):
+        try:
+            for line in iter(proc.stderr.readline, b""):
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    self.helper_message = text
+                    RUN_LOG.write("CONFERENCE", f"helper: {text}")
+                if gen != self.generation:
+                    break
+        except Exception:
+            pass
+
+    def on_audio(self, block):
+        if not NUMPY_AVAILABLE:
+            return
+        data = np.frombuffer(block, dtype="<i2").astype(np.float32).reshape(-1, 2) / 32768.0
+        gain = max(0.0, self.level_percent / 100.0)
+        if gain != 1.0:
+            data = data * np.float32(gain)
+        self.peak = float(np.max(np.abs(data))) if len(data) else 0.0
+        self.peak_time = time.time()
+        self.last_data = self.peak_time
+        self.bytes_total += len(block)
+        try:
+            self.mixer.push_float(GUEST_SOURCE, data)
+        except Exception:
             pass
 
 
@@ -12371,6 +12910,16 @@ class BroadcastingApp(QWidget):
             self.mixer.attach_player("sequence", self.sequence_player.player,
                                      lambda: self.sequence_player.audio_output.volume())
             self.mixer.add_source("mic", lambda: 1.0)       # muting the speakers never mutes the microphone on the stream
+        # Conference calls: the guest's voice from Zoom and others, cleaned, with the music lowered while they speak.
+        self.guest_cleaner = GuestCleaner(STREAM_SAMPLE_RATE) if NUMPY_AVAILABLE else None
+        self.guest_ducker = MusicDucker()
+        self.conference = ConferenceCapture(self.mixer)
+        self._conference_ticks = 0
+        self._conference_state = ""
+        if self.mixer.available and self.guest_cleaner is not None:
+            self.mixer.add_source(GUEST_SOURCE, lambda: 1.0)
+            self.mixer.custom_processors[GUEST_SOURCE] = self.guest_cleaner
+            self.mixer.ducker = self.guest_ducker
 
         RUN_LOG.write("START", "Step 6: audio sources connected.")
         self.warning_beep = HostBeep(get_or_create_warning_beep_path(), output_device)
@@ -12438,6 +12987,11 @@ class BroadcastingApp(QWidget):
         QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
         QTimer.singleShot(3000, self.apply_remote_vt)
+        self.conference_timer = QTimer()
+        self.conference_timer.setInterval(1000)
+        self.conference_timer.timeout.connect(self.on_conference_tick)
+        self.conference_timer.start()
+        QTimer.singleShot(4000, self.apply_conference_settings)
         self.start_station_control()
         if self.voice_only:
             QTimer.singleShot(500, self.show_voice_tracker)
@@ -14208,6 +14762,7 @@ class BroadcastingApp(QWidget):
                      lambda: self.rotation.stop(),
                      lambda: self.sequence_player.player.stop(),
                      lambda: self.microphone.stop(),
+                     lambda: self.conference.stop(),
                      lambda: self.encoder_bank.shutdown(),
                      lambda: self.normalizer.shutdown(),
                      lambda: self.settings.sync()):
@@ -14586,6 +15141,247 @@ class BroadcastingApp(QWidget):
         self.live_selected_id = None
         self.refresh_live_shows()
         self.announce("The live show was removed.")
+
+    # --- conference calls ---
+    def conf_setting(self, key):
+        return self.settings.value(key, GUEST_DEFAULTS.get(key))
+
+    def conf_bool(self, key, default="false"):
+        return str(self.settings.value(key, GUEST_DEFAULTS.get(key, default))).lower() == "true"
+
+    def conf_number(self, key):
+        try:
+            return float(self.settings.value(key, GUEST_DEFAULTS[key]))
+        except Exception:
+            return float(GUEST_DEFAULTS[key])
+
+    def build_conference_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("Bring a conference call, such as a Zoom interview, into the program without a virtual audio cable. "
+                       "Sign in to the meeting program as you always do; Vision Studio never sees your password and never signs "
+                       "you out, so you can switch between services freely. Pick the service below and Vision Studio takes only "
+                       "that program's sound, cleans the guest's voice, and mixes it into the stream and the recording. The guest "
+                       "hears you through the meeting program as usual, so use headphones. For the best result also switch on the "
+                       "meeting program's own background noise suppression. This is off until you switch it on.")
+        intro.setWordWrap(True)
+        intro.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.conf_enable_check = QCheckBox("Bring the conference call into the program")
+        self.conf_enable_check.setChecked(self.conf_bool("conference_enabled"))
+        form.addRow(self.conf_enable_check)
+        self.conf_service_combo = QComboBox()
+        self.conf_service_combo.setAccessibleName("Conferencing service")
+        for key, name, _exes, _note in CONFERENCE_SERVICES:
+            self.conf_service_combo.addItem(name, key)
+        current = str(self.settings.value("conference_service", "zoom"))
+        self.conf_service_combo.setCurrentIndex(max(0, [i[0] for i in CONFERENCE_SERVICES].index(current) if current in [i[0] for i in CONFERENCE_SERVICES] else 0))
+        self.conf_service_combo.currentIndexChanged.connect(self.on_conference_service_changed)
+        form.addRow("Service:", self.conf_service_combo)
+        self.conf_note_label = QLabel("")
+        self.conf_note_label.setWordWrap(True)
+        self.conf_note_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.conf_note_label.setAccessibleName("About this service")
+        form.addRow(self.conf_note_label)
+        self.conf_other_combo = QComboBox()
+        self.conf_other_combo.setEditable(True)
+        self.conf_other_combo.setAccessibleName("Program to capture, used when Another program is chosen")
+        self.conf_other_combo.setEditText(str(self.settings.value("conference_other_exe", "")))
+        form.addRow("Program (for Another program):", self.conf_other_combo)
+        refresh_btn = QPushButton("Refresh The Program List")
+        refresh_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        refresh_btn.clicked.connect(self.refresh_conference_programs)
+        form.addRow(refresh_btn)
+        self.conf_level_spin = QSpinBox()
+        self.conf_level_spin.setRange(0, 300)
+        self.conf_level_spin.setSuffix(" %")
+        self.conf_level_spin.setValue(int(self.conf_number("guest_level_percent")))
+        self.conf_level_spin.setAccessibleName("Guest volume in the stream, percent")
+        form.addRow("Guest volume:", self.conf_level_spin)
+
+        self.conf_clean_check = QCheckBox("Clean the guest's voice (reduce hiss and room noise, lift the words)")
+        self.conf_clean_check.setChecked(self.conf_bool("guest_clean_on"))
+        form.addRow(self.conf_clean_check)
+        self.conf_strength_spin = QSpinBox()
+        self.conf_strength_spin.setRange(0, 100)
+        self.conf_strength_spin.setValue(int(self.conf_number("guest_noise_strength")))
+        self.conf_strength_spin.setAccessibleName("Noise reduction strength, 0 to 100")
+        form.addRow("Noise reduction strength (0 to 100):", self.conf_strength_spin)
+        self.conf_highpass_spin = QSpinBox()
+        self.conf_highpass_spin.setRange(0, 300)
+        self.conf_highpass_spin.setSuffix(" Hz")
+        self.conf_highpass_spin.setValue(int(self.conf_number("guest_highpass_hz")))
+        self.conf_highpass_spin.setAccessibleName("Rumble filter, cuts everything below this pitch, 0 is off")
+        form.addRow("Rumble filter:", self.conf_highpass_spin)
+        self.conf_presence_spin = QSpinBox()
+        self.conf_presence_spin.setRange(-4, 8)
+        self.conf_presence_spin.setSuffix(" dB")
+        self.conf_presence_spin.setValue(int(round(self.conf_number("guest_presence_db"))))
+        self.conf_presence_spin.setAccessibleName("Voice presence lift in decibels")
+        form.addRow("Voice presence lift:", self.conf_presence_spin)
+        self.conf_gate_spin = QSpinBox()
+        self.conf_gate_spin.setRange(0, 40)
+        self.conf_gate_spin.setSuffix(" dB")
+        self.conf_gate_spin.setValue(int(self.conf_number("guest_gate_db")))
+        self.conf_gate_spin.setAccessibleName("How far the line is lowered between words, 0 is off")
+        form.addRow("Lower the line between words by:", self.conf_gate_spin)
+        self.conf_leveler_check = QCheckBox("Even out the guest's volume (brings up a quiet guest, holds back a loud one)")
+        self.conf_leveler_check.setChecked(self.conf_bool("guest_leveler_on"))
+        form.addRow(self.conf_leveler_check)
+        self.conf_target_spin = QSpinBox()
+        self.conf_target_spin.setRange(-35, -10)
+        self.conf_target_spin.setSuffix(" dB")
+        self.conf_target_spin.setValue(int(self.conf_number("guest_leveler_target_db")))
+        self.conf_target_spin.setAccessibleName("Target voice level in decibels below full scale")
+        form.addRow("Target voice level:", self.conf_target_spin)
+
+        self.conf_duck_check = QCheckBox("Lower the music while the guest is speaking")
+        self.conf_duck_check.setChecked(self.conf_bool("guest_duck_on"))
+        form.addRow(self.conf_duck_check)
+        self.conf_duck_spin = QSpinBox()
+        self.conf_duck_spin.setRange(0, 30)
+        self.conf_duck_spin.setSuffix(" dB")
+        self.conf_duck_spin.setValue(int(self.conf_number("guest_duck_db")))
+        self.conf_duck_spin.setAccessibleName("How far the music is lowered while the guest speaks")
+        form.addRow("Lower the music by:", self.conf_duck_spin)
+        self.conf_duck_mic_check = QCheckBox("Also lower the host microphone while the guest speaks")
+        self.conf_duck_mic_check.setChecked(self.conf_bool("guest_duck_host_mic"))
+        form.addRow(self.conf_duck_mic_check)
+        layout.addLayout(form)
+
+        row = QHBoxLayout()
+        save_btn = QPushButton("Save Conference Call Settings")
+        save_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save_btn.clicked.connect(self.save_conference_settings)
+        row.addWidget(save_btn)
+        reset_btn = QPushButton("Use The Recommended Voice Settings")
+        reset_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        reset_btn.clicked.connect(self.reset_conference_voice_settings)
+        row.addWidget(reset_btn)
+        layout.addLayout(row)
+        self.conf_status_label = QLabel("Conference audio is off.")
+        self.conf_status_label.setWordWrap(True)
+        self.conf_status_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.conf_status_label.setAccessibleName("Conference audio status")
+        layout.addWidget(self.conf_status_label)
+        self.conf_meter_label = QLabel("")
+        self.conf_meter_label.setWordWrap(True)
+        self.conf_meter_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.conf_meter_label.setAccessibleName("Guest level")
+        layout.addWidget(self.conf_meter_label)
+        limits = QLabel("The cleaned guest is added to the stream and the recording while an encoder or the recorder is running. "
+                        "Cleaning lowers steady hiss and room noise a lot but cannot remove everything, and a very strong setting can "
+                        "make the voice sound thin. A guest on a phone line only has narrow audio to begin with.")
+        limits.setWordWrap(True)
+        limits.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(limits)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        self.on_conference_service_changed()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
+
+    def on_conference_service_changed(self, *_ignored):
+        key = self.conf_service_combo.currentData()
+        self.conf_note_label.setText(conference_service(key)[3])
+        self.conf_other_combo.setEnabled(key == "other")
+
+    def refresh_conference_programs(self):
+        names = other_program_names(list_running_processes())
+        text = self.conf_other_combo.currentText()
+        self.conf_other_combo.clear()
+        self.conf_other_combo.addItems(names)
+        self.conf_other_combo.setEditText(text)
+        self.announce(f"{len(names)} running programs listed." if names else "No running programs could be listed.")
+
+    def reset_conference_voice_settings(self):
+        self.conf_clean_check.setChecked(GUEST_DEFAULTS["guest_clean_on"] == "true")
+        self.conf_strength_spin.setValue(int(GUEST_DEFAULTS["guest_noise_strength"]))
+        self.conf_highpass_spin.setValue(int(GUEST_DEFAULTS["guest_highpass_hz"]))
+        self.conf_presence_spin.setValue(int(round(float(GUEST_DEFAULTS["guest_presence_db"]))))
+        self.conf_gate_spin.setValue(int(GUEST_DEFAULTS["guest_gate_db"]))
+        self.conf_leveler_check.setChecked(GUEST_DEFAULTS["guest_leveler_on"] == "true")
+        self.conf_target_spin.setValue(int(GUEST_DEFAULTS["guest_leveler_target_db"]))
+        self.conf_duck_check.setChecked(GUEST_DEFAULTS["guest_duck_on"] == "true")
+        self.conf_duck_spin.setValue(int(GUEST_DEFAULTS["guest_duck_db"]))
+        self.conf_level_spin.setValue(int(GUEST_DEFAULTS["guest_level_percent"]))
+        self.announce("The recommended voice settings are filled in. Save to keep them.")
+
+    def save_conference_settings(self):
+        values = {"conference_enabled": "true" if self.conf_enable_check.isChecked() else "false",
+                  "conference_service": self.conf_service_combo.currentData(),
+                  "conference_other_exe": self.conf_other_combo.currentText().strip(),
+                  "guest_level_percent": self.conf_level_spin.value(),
+                  "guest_clean_on": "true" if self.conf_clean_check.isChecked() else "false",
+                  "guest_noise_strength": self.conf_strength_spin.value(),
+                  "guest_highpass_hz": self.conf_highpass_spin.value(),
+                  "guest_presence_db": self.conf_presence_spin.value(),
+                  "guest_gate_db": self.conf_gate_spin.value(),
+                  "guest_leveler_on": "true" if self.conf_leveler_check.isChecked() else "false",
+                  "guest_leveler_target_db": self.conf_target_spin.value(),
+                  "guest_duck_on": "true" if self.conf_duck_check.isChecked() else "false",
+                  "guest_duck_db": self.conf_duck_spin.value(),
+                  "guest_duck_host_mic": "true" if self.conf_duck_mic_check.isChecked() else "false"}
+        for key, value in values.items():
+            self.settings.setValue(key, value)
+        self.apply_conference_settings()
+        self.announce("Conference call settings saved. " + self.conference.status)
+
+    def apply_conference_settings(self):
+        cleaner = self.guest_cleaner
+        if cleaner is not None:
+            cleaner.enabled = self.conf_bool("guest_clean_on")
+            cleaner.configure(strength=self.conf_number("guest_noise_strength"), highpass_hz=self.conf_number("guest_highpass_hz"),
+                              presence_db=self.conf_number("guest_presence_db"), gate_db=self.conf_number("guest_gate_db"),
+                              leveler_on=self.conf_bool("guest_leveler_on"), leveler_target_db=self.conf_number("guest_leveler_target_db"))
+        self.guest_ducker.configure(self.conf_bool("guest_duck_on"), self.conf_number("guest_duck_db"), self.conf_bool("guest_duck_host_mic"))
+        self.conference.level_percent = self.conf_number("guest_level_percent")
+        self.conference.set_target(str(self.settings.value("conference_service", "zoom")), str(self.settings.value("conference_other_exe", "") or ""))
+        wanted = self.conf_bool("conference_enabled")
+        if wanted and not (self.mixer.available and cleaner is not None):
+            self.conference.status = "Conference audio needs the stream mixer, which is not available (" + self.mixer.unavailable_reason() + ")."
+        elif wanted and not self.conference.active:
+            self.conference.start()
+        elif not wanted and self.conference.active:
+            self.conference.stop()
+        elif not wanted:
+            self.conference.status = "Conference audio is off."
+
+    def on_conference_tick(self):
+        try:
+            self._conference_ticks += 1
+            if self.conference.active and self._conference_ticks % 3 == 0:
+                self.conference.tick()
+            status = self.conference.status
+            state = ("sound" if "sound is arriving" in status else "waiting" if status.startswith("Waiting") else
+                     "capturing" if status.startswith("Capturing") else "")
+            if state != self._conference_state and self.conference.active:
+                if state == "sound" and self._conference_state in ("", "waiting", "capturing"):
+                    self.announce(f"{self.conference.display_name()} audio is coming in.")
+                elif state == "waiting" and self._conference_state in ("sound", "capturing"):
+                    self.announce(f"{self.conference.display_name()} closed. Waiting for it.")
+            self._conference_state = state if self.conference.active else ""
+            if getattr(self, "conf_status_label", None) is not None:
+                if self.conf_status_label.text() != status:
+                    self.conf_status_label.setText(status)
+                if self.conference.active:
+                    cleaner = self.guest_cleaner
+                    peak = self.conference.peak if time.time() - self.conference.peak_time < 1.0 else 0.0
+                    peak_db = 20.0 * math.log10(peak) if peak > 0.00001 else -90.0
+                    talking = bool(cleaner is not None and cleaner.speaking)
+                    text = (f"Guest sound: {peak_db:.0f} dB. Speaking: {'yes' if talking else 'no'}. "
+                            f"Music lowered by {-20.0 * math.log10(max(self.guest_ducker.level, 0.001)):.0f} dB.")
+                    if not self.mixer.timer.isActive():
+                        text += " The guest is mixed in once an encoder or the recorder is running."
+                else:
+                    text = ""
+                if self.conf_meter_label.text() != text:
+                    self.conf_meter_label.setText(text)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
 
     def build_stations_tab(self):
         page = QWidget()
@@ -15603,6 +16399,7 @@ class BroadcastingApp(QWidget):
         self.remote_vt_tab = self.build_remote_vt_tab()
         self.live_tab = self.build_live_tab()
         self.stations_tab = self.build_stations_tab()
+        self.conference_tab = self.build_conference_tab()
         self.vt_page = VoiceTrackerPage(self)
         sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
                     ("Startup and Tray", self.settings_pages["startup"]), ("Playlists", self.settings_pages["playlists"]),
@@ -15612,7 +16409,7 @@ class BroadcastingApp(QWidget):
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
