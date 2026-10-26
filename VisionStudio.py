@@ -257,6 +257,9 @@ BUILD_DATE = "2026-10-20"         # the day this build was made
 BUILD_ID = f"{BUILD_DATE}.{BUILD_NUMBER}"      # kept for the log
 
 
+PRACTICE = {"on": False}        # Practice mode: nothing reaches the stream, the recording, the as-run log or the saved play history
+
+
 class RunLog:
     """A plain text as-run log, one file per day: what played, which break items ran, alerts and errors."""
 
@@ -271,6 +274,10 @@ class RunLog:
         return os.path.join(self.folder, time.strftime("%Y-%m-%d") + ".log")
 
     def write(self, kind, text):
+        if PRACTICE["on"]:
+            if kind in ("PLAY", "BREAK", "SHOWS"):
+                return
+            text = "(practice) " + text
         try:
             with self.lock:
                 os.makedirs(self.folder, exist_ok=True)
@@ -858,6 +865,10 @@ def get_track_metadata(file_path):
 # --- audio devices -----------------------------------------------------------
 def get_selected_output_device(settings):
     wanted = settings.value("output_device", "")
+    if PRACTICE["on"]:
+        practice = str(settings.value("practice_output_device", "") or "")
+        if practice:
+            wanted = practice
     devices = QMediaDevices.audioOutputs()
     for device in devices:
         if device.description() == wanted:
@@ -2286,6 +2297,7 @@ DEFAULT_SHORTCUTS = [
     ("assist_hold_toggle", "Live Assist: wait for me at the end of a song, or carry on by itself", "Shift+L", True),
     ("say_next", "Announce the next song, its length and about how long its intro is", "Ctrl+Alt+N", True),
     ("mic_toggle", "Microphone on / off (the music ducks while you talk)", "F10", True),
+    ("practice_toggle", "Practice mode on / off: try everything without anything going on the air", "Ctrl+Shift+P", True),
     ("queue_move_up", "Queue list: move the selected track up", "Ctrl+Up", False),
     ("queue_move_down", "Queue list: move the selected track down", "Ctrl+Down", False),
     ("queue_remove", "Queue list: remove the selected track", "Del", False),
@@ -2852,7 +2864,7 @@ class PersistentPlayHistory(PlayHistory):
                     self.last_played_artist[artist] = stamp
 
     def save(self):
-        if self.settings is None:
+        if self.settings is None or PRACTICE["on"]:
             return
         now = time.time()
         recent = {p: t for p, t in self.last_played_track.items() if now - t < self.keep_seconds}
@@ -2863,7 +2875,14 @@ class PersistentPlayHistory(PlayHistory):
 
     def record_play(self, file_path):
         super().record_play(file_path)
-        self.save()
+        if not PRACTICE["on"]:
+            self.save()
+
+    def forget_all(self):
+        """After Practice mode: drop what the rehearsal played and read the real history back."""
+        self.last_played_track.clear()
+        self.last_played_artist.clear()
+        self.load()
 
     def recent(self, separation_seconds):
         """(path, played_at, available_at) for everything still held back, newest first."""
@@ -7802,6 +7821,9 @@ class EncoderSlot(QObject):
         self.retry_timer.stop()
         if self.state != "offline":
             return False
+        if PRACTICE["on"]:
+            self.message.emit(f"{self.stream_name} cannot start: Practice mode is on, and nothing is sent to a stream in it.")
+            return False
         problem = self.validate()
         if problem:
             self.retry_pending = False
@@ -10701,6 +10723,8 @@ class ProgramRecorder(QObject):
         """Returns (ok, message)."""
         if self.recording:
             return True, "Already recording."
+        if PRACTICE["on"]:
+            return False, "Practice mode is on, and nothing is recorded in it."
         bitrate = self.bitrate()
         if not bitrate:
             return False, "Choose a recording bitrate first."
@@ -16983,6 +17007,8 @@ class ContentSourceDialog(QDialog):
         if re.search(r"explicit|dirty|uncensored|uncut", low):
             self.content_combo.setCurrentIndex(1)
         layout.addRow("This folder is:", self.content_combo)
+        self.schedule_check = QCheckBox("Spread it across the everyday schedule now (this resets hours you set by hand in the Schedule)")
+        layout.addRow(self.schedule_check)
         note = QLabel("If you have the same songs in two folders, one clean and one explicit, import both and mark each. "
                       "Which version plays is set on the DJ tab.")
         note.setWordWrap(True)
@@ -16995,7 +17021,8 @@ class ContentSourceDialog(QDialog):
         self.name_edit.setFocus()
 
     def values(self):
-        return (self.name_edit.text().strip() or "Music", self.kind_combo.currentData(), self.content_combo.currentData())
+        return (self.name_edit.text().strip() or "Music", self.kind_combo.currentData(), self.content_combo.currentData(),
+                self.schedule_check.isChecked())
 
 
 
@@ -17360,6 +17387,7 @@ class BroadcastingApp(QWidget):
             "assist_hold_toggle": self.assist_hold_toggle,
             "say_next": self.say_next,
             "mic_toggle": self.mic_toggle,
+            "practice_toggle": self.practice_toggle,
         }
 
     def rebuild_shortcuts(self):
@@ -18016,6 +18044,8 @@ class BroadcastingApp(QWidget):
             text = "A scheduled break is on."
         elif playing:
             text = "Rotation is playing."
+        elif PRACTICE["on"]:
+            text = "Practice mode is on. Nothing is on the air."
         elif self.rotation.is_running and self.rotation.assist_waiting:
             text = "Live Assist: waiting for you. Press N to play the next song."
         elif self.rotation.is_running:
@@ -18660,6 +18690,7 @@ class BroadcastingApp(QWidget):
         add(dj_menu, "live_assist_toggle", "Live Assist on or off", self.live_assist_toggle)
         add(dj_menu, "assist_play_next", "Live Assist: play the next song now", self.assist_play_next)
         add(dj_menu, "assist_hold_toggle", "Live Assist: wait for me, or carry on by itself", self.assist_hold_toggle)
+        add(dj_menu, "practice_toggle", "Practice mode on or off (nothing goes on the air)", self.practice_toggle)
         add(dj_menu, "say_next", "Announce the next song and its intro", self.say_next)
         add(dj_menu, "mic_toggle", "Microphone on or off", self.mic_toggle)
         dj_menu.addSeparator()
@@ -19255,7 +19286,7 @@ class BroadcastingApp(QWidget):
                 continue
             mine = list(range(index, len(sp.items), 2)) if sp.active else []
             if sp.active and sp.item_index in mine:
-                widgets["live_indicator"].setText("● ON AIR")
+                widgets["live_indicator"].setText("● PRACTICE" if PRACTICE["on"] else "● ON AIR")
                 widgets["item_label"].setText(os.path.basename(sp.items[sp.item_index]))
                 self.update_artwork_display(widgets["artwork_label"], sp.items[sp.item_index], f"Deck {name} artwork")
             else:
@@ -20228,7 +20259,7 @@ class BroadcastingApp(QWidget):
     def refresh_live_indicators(self):
         for name, widgets in self.deck_widgets.items():
             if name == self.rotation.live_deck_name and widgets["track_label"].text() != "(no track loaded)":
-                widgets["live_indicator"].setText("● ON AIR")
+                widgets["live_indicator"].setText("● PRACTICE" if PRACTICE["on"] else "● ON AIR")
             else:
                 widgets["live_indicator"].setText("")
 
@@ -20537,6 +20568,12 @@ class BroadcastingApp(QWidget):
             choose.setStyleSheet(BUTTON_STYLE_CONSOLE)
             choose.clicked.connect(lambda _checked=False, k=key, t=title: self.choose_folder_setting(k, t))
             layout_a.addRow(choose)
+
+        music_head = QLabel("Music folders: add as many as you like. Each is marked Clean or Explicit, and each becomes a rotation.")
+        music_head.setWordWrap(True)
+        music_head.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout_a.addRow(music_head)
+        layout_a.addRow(self.build_music_folders_widget())
 
         log_label = QLabel(RUN_LOG.folder)
         log_label.setWordWrap(True)
@@ -21371,30 +21408,30 @@ class BroadcastingApp(QWidget):
         form.addRow("Which songs may air:", mode_combo)
         form.addRow("When a song is in a clean and an explicit folder, play the:", prefer_combo)
         layout.addLayout(form)
-        layout.addWidget(QLabel("Music folders:"))
-        self.content_list = QListWidget()
-        self.content_list.setAccessibleName("Music folders and whether each is clean or explicit")
-        layout.addWidget(self.content_list, 1)
-        row = QHBoxLayout()
-        for text, kind in (("Import Classics Folder...", "classics"), ("Import New School Folder...", "newschool"),
-                           ("Import Another Folder...", "other")):
-            button = QPushButton(text)
-            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
-            button.clicked.connect(lambda _c=False, k=kind: self.import_content_folder(k))
-            row.addWidget(button)
-        layout.addLayout(row)
-        row2 = QHBoxLayout()
-        for text, slot in (("Change Selected Folder's Type...", self.change_content_type), ("Remove Selected Folder From This List", self.remove_content_folder),
-                           ("Read Explicit Flags From The Songs Now", self.scan_explicit_tags)):
-            button = QPushButton(text)
-            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
-            button.clicked.connect(lambda _c=False, f=slot: f())
-            row2.addWidget(button)
-        layout.addLayout(row2)
-        self.content_status = QLabel("")
-        self.content_status.setWordWrap(True)
-        self.content_status.setAccessibleName("Music folder status")
-        layout.addWidget(self.content_status)
+        folders_note = QLabel("Your music folders (Classics, New school and so on) are added on the Folders page of Settings, "
+                              "with as many as you like. Whether each is clean or explicit is set there.")
+        folders_note.setWordWrap(True)
+        folders_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(folders_note)
+        go_folders = QPushButton("Go To The Folders Page")
+        go_folders.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        go_folders.clicked.connect(lambda _c=False: self.show_settings_section("Folders"))
+        layout.addWidget(go_folders)
+        practice_note = QLabel("Practice mode lets you try Live Assist and your mixes before a real show. While it is on, nothing is sent to "
+                               "the stream or the recording, nothing is written to the as-run log, and the plays are forgotten afterwards. "
+                               "It always starts off. Stop your encoders and recording first.")
+        practice_note.setWordWrap(True)
+        practice_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(practice_note)
+        practice_form = QFormLayout()
+        outputs = [("", "Same as the normal speaker/interface")] + [(d.description(), d.description()) for d in QMediaDevices.audioOutputs()]
+        practice_form.addRow("Practice listening device:", self.mix_setting_combo("practice_output_device", outputs, "",
+                                                                                   "Device to listen on in Practice mode"))
+        self.practice_button = QPushButton("Practice Mode On / Off (Ctrl+Shift+P)")
+        self.practice_button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        self.practice_button.clicked.connect(lambda _c=False: self.practice_toggle())
+        practice_form.addRow(self.practice_button)
+        layout.addLayout(practice_form)
         assist = QFormLayout()
         assist.addRow(QLabel("Live Assist: you start each song with N; the program keeps the queue, the breaks, the hour timing and the mixing running."))
         self.assist_enable_check = self.mix_setting_check("Live Assist is on", "live_assist_enabled")
@@ -21411,6 +21448,39 @@ class BroadcastingApp(QWidget):
         page.setLayout(layout)
         self.refresh_content_list()
         return page
+
+    def build_music_folders_widget(self):
+        """The list of named music folders (as many as you like), each Clean or Explicit, with the import buttons."""
+        holder = QWidget()
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(QLabel("Music folders:"))
+        self.content_list = QListWidget()
+        self.content_list.setAccessibleName("Music folders and whether each is clean or explicit")
+        box.addWidget(self.content_list, 1)
+        row = QHBoxLayout()
+        for text, kind in (("Import Classics Folder...", "classics"), ("Import New School Folder...", "newschool"),
+                           ("Import Another Folder...", "other")):
+            button = QPushButton(text)
+            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            button.clicked.connect(lambda _c=False, k=kind: self.import_content_folder(k))
+            row.addWidget(button)
+        box.addLayout(row)
+        row2 = QHBoxLayout()
+        for text, slot in (("Change Selected Folder's Type...", self.change_content_type), ("Remove Selected Folder From This List", self.remove_content_folder),
+                           ("Read Explicit Flags From The Songs Now", self.scan_explicit_tags)):
+            button = QPushButton(text)
+            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            button.clicked.connect(lambda _c=False, f=slot: f())
+            row2.addWidget(button)
+        box.addLayout(row2)
+        self.content_status = QLabel("")
+        self.content_status.setWordWrap(True)
+        self.content_status.setAccessibleName("Music folder status")
+        box.addWidget(self.content_status)
+        holder.setLayout(box)
+        self.refresh_content_list()
+        return holder
 
     def on_content_setting_changed(self):
         self.content_rules.load()
@@ -21441,18 +21511,20 @@ class BroadcastingApp(QWidget):
         dialog = ContentSourceDialog(self, folder, kind)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        name, picked_kind, content = dialog.values()
+        name, picked_kind, content, spread = dialog.values()
         source = self.content_rules.add_source(name, picked_kind, folder, content)
-        added = self.ensure_rotation_for_folder(source)
+        added = self.ensure_rotation_for_folder(source, spread)
         self.content_rules.load()
         self.refresh_content_list()
         text = f"{name} added as {content}. "
-        text += (f"It is a new rotation named {added}; put it in the Schedule to use it. " if added else "")
+        if added:
+            text += (f"It is a new rotation named {added}, spread across the schedule. " if spread else
+                     f"It is a new rotation named {added}; choose its hours in Settings, Schedule. ")
         self.content_status.setText(text)
         self.announce(text)
         self.scan_explicit_tags(only=folder)
 
-    def ensure_rotation_for_folder(self, source):
+    def ensure_rotation_for_folder(self, source, spread=False):
         """A folder outside the music library becomes a rotation; one inside it already has one. Returns the new name or ''."""
         norm = norm_path(source["folder"])
         for rotation in self.rotation_library.rotations:
@@ -21461,7 +21533,14 @@ class BroadcastingApp(QWidget):
         root = self.settings.value("music_library_folder", "")
         if root and (norm == norm_path(root) or norm.startswith(norm_path(root).rstrip(os.sep) + os.sep)):
             return ""
-        rotation = self.rotation_library.add_rotation(source["name"], source["folder"], True, auto=False, regular=False)
+        rotation = self.rotation_library.add_rotation(source["name"], source["folder"], True, auto=False, regular=bool(spread))
+        if spread:
+            self.rotation_schedule.regenerate_even()
+        try:
+            self.rotations_tab.refresh()
+            self.schedule_tab.refresh()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
         return rotation.name
 
     def change_content_type(self):
@@ -21547,6 +21626,52 @@ class BroadcastingApp(QWidget):
                     if engine.assist_guard_ms > 0 else "")
             return "Live Assist is on. The next song waits for you: press N to play it." + tail
         return "Live Assist is on, and songs carry on by themselves. Press N to bring the next song in early."
+
+    # --- Practice mode -------------------------------------------------------------------------
+    def practice_blockers(self):
+        problems = []
+        try:
+            if any(slot.state != "offline" for slot in self.encoder_bank.slots):
+                problems.append("a stream is connected (stop the encoders)")
+        except Exception:
+            pass
+        try:
+            if self.recorder.recording:
+                problems.append("a recording is running (stop it)")
+        except Exception:
+            pass
+        return problems
+
+    def set_practice(self, on):
+        if on == PRACTICE["on"]:
+            return True
+        if on:
+            problems = self.practice_blockers()
+            if problems:
+                self.announce("Practice mode did not start because " + " and ".join(problems) + ". It never runs with a stream or recording on.")
+                return False
+        PRACTICE["on"] = bool(on)
+        device = get_selected_output_device(self.settings)
+        self.rotation.apply_output_device(device)
+        self.sequence_player.apply_output_device(device)
+        if on:
+            self.setWindowTitle("Vision Studio - PRACTICE MODE, nothing is on the air")
+            self.onair_status_label.setText("PRACTICE MODE: nothing goes to the stream, the recording or the logs.")
+            self.announce("Practice mode is on. You are hearing the program on your own speakers only. Nothing goes to the stream, "
+                          "the recording or the as-run log. Press Control Shift P to go back to the real show.")
+        else:
+            try:
+                self.rotation.play_history.forget_all()
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+            self.setWindowTitle("Vision Studio" + (f" - {STATION_NAME}" if STATION_CHILD else ""))
+            self.onair_status_label.setText("On Air: music rotation playing.")
+            self.announce("Practice mode is off. What you played in practice has been forgotten. You are back to the real show.")
+        self.refresh_live_indicators()
+        return True
+
+    def practice_toggle(self):
+        self.set_practice(not PRACTICE["on"])
 
     def typing_in_field(self):
         try:
