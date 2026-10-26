@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QLabel, QFileDialog, QTabWidget, QFormLayout, QComboBox,
                              QHBoxLayout, QLineEdit, QScrollArea, QMessageBox, QSlider,
                              QCheckBox, QListWidget, QListWidgetItem, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox,
+                             QTableWidgetItem, QHeaderView, QKeySequenceEdit, QSpinBox, QDoubleSpinBox,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
                              QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
                              QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget, QAbstractSpinBox, QPlainTextEdit)
@@ -166,6 +166,20 @@ def get_recordings_folder():
     if _writable_dir(fallback):
         return fallback
     return tempfile.gettempdir()
+
+
+def get_data_folder(name):
+    """A named folder next to Logs, Playlists and VoiceTracks (Tag Backups, Shows, Mixes)."""
+    if getattr(sys, "frozen", False):
+        candidate = os.path.join(os.path.dirname(sys.executable), profile_sub(), name)
+        if _writable_dir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), "VisionStudio", profile_sub(), name)
+    if _writable_dir(fallback):
+        return fallback
+    folder = os.path.join(tempfile.gettempdir(), "VisionStudio_" + name.replace(" ", "_"))
+    os.makedirs(folder, exist_ok=True)
+    return folder
 
 
 # --- Start with Windows (current user, no administrator rights needed) ---
@@ -741,10 +755,76 @@ class NormalizeManager(QObject):
             job.wait(5000)
 
 
+# --- cleaning DJ-edit words out of titles -----------------------------------
+DEFAULT_INTRO_WORDS = ["intro", "dj intro", "dj edit", "quick hit", "extended intro", "clean intro", "dirty intro"]
+_DISPLAY_CLEAN = {"on": False, "words": None}
+
+
+def set_display_clean(on, words=None):
+    _DISPLAY_CLEAN["on"] = bool(on)
+    _DISPLAY_CLEAN["words"] = list(words) if words else None
+
+
+def parse_word_list(text):
+    """Words typed one per line or separated by commas or semicolons."""
+    if isinstance(text, (list, tuple)):
+        items = [str(t) for t in text]
+    else:
+        items = re.split(r"[\n,;]+", str(text or ""))
+    seen = []
+    for item in items:
+        item = item.strip()
+        if item and item.lower() not in [w.lower() for w in seen]:
+            seen.append(item)
+    return seen
+
+
+def _intro_regex(words):
+    parts = []
+    for word in (words if words else DEFAULT_INTRO_WORDS):
+        word = str(word).strip()
+        if word:
+            parts.append(re.escape(word).replace(r"\ ", r"[\s_\-]+"))
+    parts.append(r"\d+[\s_\-]*bars?")
+    return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(parts) + r")(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def has_intro_words(text, words=None):
+    return bool(text) and bool(_intro_regex(words).search(text))
+
+
+def clean_title(title, words=None):
+    """Takes '8 Bar Intro' style endings off a title: '(Intro)', '[8 Bar Intro]', ' - Intro', ' 8 Bar Intro'.
+    Never returns an empty title."""
+    if not title:
+        return title
+    rx = _intro_regex(words)
+    text = re.sub(r"\s*[\(\[\{]([^\)\]\}]*)[\)\]\}]", lambda m: " " if rx.search(m.group(1)) else m.group(0), title)
+    match = re.search(r"\s+[-\u2013\u2014]\s+([^-\u2013\u2014]*)$", text)
+    if match and rx.search(match.group(1)):
+        text = text[:match.start()]
+    text = re.sub(r"\s+(?:dj\s+)?\d+[\s_\-]*bars?\s+intro\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s{2,}", " ", text).strip(" -\u2013\u2014_")
+    return text if text else title
+
+
+# --- songs that live inside a mix file (a mix part holds several songs) -------
+PSEUDO_SONGS = {}
+
+
+def register_pseudo_song(path, meta):
+    """A song played inside a finished mix has no file of its own; this gives it a name the logs and the
+    separation rules can use. `path` looks like mixsong:<show>:<number>."""
+    PSEUDO_SONGS[path] = {k: str(meta.get(k, "") or "") for k in ("artist", "title", "album", "label", "isrc")}
+
+
 # --- track metadata ----------------------------------------------------------
 def get_track_metadata(file_path):
     """Returns artist, title and album for a file, with the file name as a fallback title."""
     meta = {"artist": "", "title": "", "album": ""}
+    if file_path in PSEUDO_SONGS:
+        known = PSEUDO_SONGS[file_path]
+        return {"artist": known["artist"], "title": known["title"], "album": known["album"]}
     if MUTAGEN_AVAILABLE and file_path and os.path.isfile(file_path):
         try:
             audio = mutagen.File(file_path, easy=True)
@@ -757,6 +837,8 @@ def get_track_metadata(file_path):
             pass
     if not meta["title"]:
         meta["title"] = os.path.splitext(os.path.basename(file_path or ""))[0]
+    if _DISPLAY_CLEAN["on"]:
+        meta["title"] = clean_title(meta["title"], _DISPLAY_CLEAN["words"])
     return meta
 
 
@@ -932,6 +1014,8 @@ def build_artwork_pixmap(file_path, size=ARTWORK_PLACEHOLDER_SIZE):
 
 def get_track_artist(file_path):
     """Reads the lowercased artist tag off a file, used for separation-rule comparisons."""
+    if file_path in PSEUDO_SONGS:
+        return PSEUDO_SONGS[file_path]["artist"].strip().lower()
     if not MUTAGEN_AVAILABLE or not file_path or not os.path.isfile(file_path):
         return ""
     try:
@@ -2972,6 +3056,9 @@ _TAG_CACHE = {}
 
 def track_tags(path):
     """(artist, album, title), lowercased, read once per file. Blank when a tag is missing."""
+    if path in PSEUDO_SONGS:
+        known = PSEUDO_SONGS[path]
+        return (known["artist"].strip().lower(), known["album"].strip().lower(), known["title"].strip().lower())
     if path in _TAG_CACHE:
         return _TAG_CACHE[path]
     artist = album = title = ""
@@ -3411,6 +3498,9 @@ class RotationEngine:
     crossfades: the live deck fades down while the cued deck starts and fades
     up, then the roles swap.
     """
+    show_marks = ()      # safe defaults until __init__ has run
+    passed_hour = None
+
 
     def __init__(self, settings, on_status, on_now_playing, on_track_ending=None,
                  on_crossfader_move=None, on_deck_update=None, normalizer=None,
@@ -3451,6 +3541,7 @@ class RotationEngine:
         self.play_history = PersistentPlayHistory(settings, self.rules.keep_seconds(self.separation_seconds))
         self.pick_problem = ""
         self._borrow_cache = (0.0, [])
+        self.show_marks = []              # clock times where a mix show part starts: the songs before are fitted to end there
         self.passed = []                  # songs of this hour already aired or skipped: [(path, "played" or "skipped")]
         self.passed_hour = None
         self.replaceable = set()          # queued songs the end-of-hour fit may swap (playlist songs, not hand-placed ones)
@@ -3694,6 +3785,34 @@ class RotationEngine:
                 return len([d for d in dropped if not is_hour_marker(d)])
         return 0
 
+    def replace_hour_entries(self, tag, new_entries):
+        """Swaps what is queued for one hour (from its marker up to the next hour's marker) for a new list."""
+        start = None
+        for i, entry in enumerate(self.shuffled_queue):
+            if is_hour_marker(entry) and marker_tag(entry) == tag:
+                start = i
+                break
+        if start is None:
+            return False
+        end = len(self.shuffled_queue)
+        for j in range(start + 1, len(self.shuffled_queue)):
+            entry = self.shuffled_queue[j]
+            if is_hour_marker(entry) and not is_voice_marker(entry):
+                end = j
+                break
+        for item in self.shuffled_queue[start:end]:
+            self.pinned_tracks.discard(item)
+            self.replaceable.discard(item)
+        self.shuffled_queue[start:end] = list(new_entries)
+        for item in new_entries:
+            if not is_hour_marker(item):
+                self.pinned_tracks.add(item)
+                if is_song_entry(item):
+                    self.replaceable.add(item)
+        self.prefetch_upcoming()
+        self._queue_changed()
+        return True
+
     def drop_stale_cue(self):
         """A track already cued from the old hour is thrown away so the new hour starts with its own music."""
         if self.next_track_cued and not self.is_paused_for_sequence:
@@ -3772,6 +3891,11 @@ class RotationEngine:
                 candidate += timedelta(hours=1)
             if best is None or candidate < best:
                 best = candidate
+        now_ = now
+        self.show_marks = [t for t in self.show_marks if t > now_ - timedelta(minutes=2)]
+        for mark in self.show_marks:
+            if mark > now_ and (best is None or mark < best):
+                best = mark
         return best
 
     def fit_candidates(self, prefix):
@@ -5171,6 +5295,23 @@ class SequencePlayer:
             if jingles:
                 self.queue.append(random.choice(jingles))
             return
+        if sequence == "ids":
+            # a commercial-free hour: the station IDs only (jingle, sweeper, jingle), never an ad
+            ids = list(dict.fromkeys(scan_audio_files(jingle_folder) + (
+                self.category_library.files_for_types(("jingle",)) if self.category_library is not None else [])))
+            sweepers = list(dict.fromkeys(self.category_library.files_for_types(("sweeper",)) if self.category_library is not None else []))
+            ids = [j for j in ids if j not in sweepers] or ids
+            if ids and sweepers:
+                first = random.choice(ids)
+                others = [j for j in ids if j != first]
+                self.queue = [first, random.choice(sweepers), random.choice(others) if others else first]
+            elif ids:
+                first = random.choice(ids)
+                others = [j for j in ids if j != first]
+                self.queue = [first, random.choice(others)] if others else [first]
+            elif sweepers:
+                self.queue = [random.choice(sweepers)]
+            return
 
         ads = list(dict.fromkeys(scan_audio_files(self.settings.value("ad_break_folder", ""))
                                  + ads_from_categories))
@@ -6247,6 +6388,1193 @@ def meeting_main():
     first = MeetingWindow(url)
     RUN_LOG.write("BROWSER", f"Vision Browser opened for {name}: {url}")
     return app.exec()
+
+
+
+# ---------------------------------------------------------------------------
+# Song analysis for mixing: tempo, where the beats and bars fall, where the intro ends, and where the hook
+# (chorus) is. The song is decoded to audio data and studied in memory, much faster than it takes to play.
+# Results are kept next to the program's data, so each song is only studied once. Best on songs with a steady
+# tempo (DJ edits, dance, pop); a song that drifts or has no clear chorus gets a low confidence and no hook.
+# ---------------------------------------------------------------------------
+
+ANALYSIS_SR = 22050
+ANALYSIS_HOP = 256
+ANALYSIS_VERSION = 1
+
+
+def decode_for_analysis(path, seconds=900):
+    """Mono float32 audio at ANALYSIS_SR (or None if the song cannot be read)."""
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        out = subprocess.run([get_ffmpeg_path(), "-v", "error", "-nostdin", "-t", str(seconds), "-i", path, "-f", "f32le",
+                              "-ac", "1", "-ar", str(ANALYSIS_SR), "-"], capture_output=True, creationflags=flags, timeout=300)
+        if out.returncode != 0 or not out.stdout:
+            return None
+        return np.frombuffer(out.stdout[: len(out.stdout) // 4 * 4], dtype="<f4").astype(np.float32)
+    except Exception:
+        return None
+
+
+def _frames(x, n_fft, hop):
+    if len(x) < n_fft:
+        x = np.concatenate([x, np.zeros(n_fft - len(x), dtype=np.float32)])
+    count = 1 + (len(x) - n_fft) // hop
+    idx = np.arange(n_fft)[None, :] + hop * np.arange(count)[:, None]
+    return x[idx]
+
+
+def _stft_mag(x, n_fft, hop, chunk=1500):
+    """Magnitude spectra; frame number f is centred on sample f * hop."""
+    window = np.hanning(n_fft).astype(np.float32)
+    x = np.concatenate([np.zeros(n_fft // 2, dtype=np.float32), x, np.zeros(n_fft // 2, dtype=np.float32)])
+    count = 1 + max(0, len(x) - n_fft) // hop
+    out = np.zeros((count, n_fft // 2 + 1), dtype=np.float32)
+    for start in range(0, count, chunk):
+        stop = min(count, start + chunk)
+        seg = x[start * hop: (stop - 1) * hop + n_fft]
+        fr = _frames(seg, n_fft, hop)[: stop - start]
+        out[start:stop] = np.abs(np.fft.rfft(fr * window, axis=1))
+    return out
+
+
+def _interp(env, positions):
+    return np.interp(positions, np.arange(len(env)), env, left=0.0, right=0.0)
+
+
+def _onset_envelopes(x):
+    """Whole-spectrum and low-band onset strength, one value per ANALYSIS_HOP samples."""
+    mag = _stft_mag(x, 1024, ANALYSIS_HOP)
+    comp = np.log1p(30.0 * mag)
+    diff = np.maximum(0.0, comp[1:] - comp[:-1])
+    full = np.concatenate([[0.0], diff.sum(axis=1)])
+    low_bins = int(150.0 / (ANALYSIS_SR / 1024.0)) + 1
+    low = np.concatenate([[0.0], diff[:, :low_bins].sum(axis=1)])
+
+    def clean(env):
+        win = max(3, int(0.5 * ANALYSIS_SR / ANALYSIS_HOP))
+        kernel = np.ones(win) / win
+        local = np.convolve(env, kernel, mode="same")
+        env = np.maximum(0.0, env - local)
+        peak = np.percentile(env, 99) + 1e-9
+        return np.minimum(env / peak, 3.0).astype(np.float32)
+    return clean(full), clean(low)
+
+
+def _comb_scores(env, bpms, phases_per_period):
+    """Best comb score (mean onset strength on the beats) for each tempo, and the phase (in frames) that gave it."""
+    n = len(env)
+    best = np.zeros(len(bpms))
+    best_phase = np.zeros(len(bpms))
+    for i, bpm in enumerate(bpms):
+        period = 60.0 * ANALYSIS_SR / (ANALYSIS_HOP * bpm)
+        phases = np.arange(phases_per_period) * (period / phases_per_period)
+        beats = int((n - period) // period)
+        if beats < 8:
+            continue
+        pos = phases[:, None] + period * np.arange(beats)[None, :]
+        values = _interp(env, pos.ravel()).reshape(pos.shape).mean(axis=1)
+        j = int(np.argmax(values))
+        best[i], best_phase[i] = values[j], phases[j]
+    return best, best_phase
+
+
+def estimate_tempo(env):
+    """(bpm, first beat time in seconds, confidence 0 to 1)."""
+    coarse = np.arange(70.0, 180.5, 0.5)
+    score, phase = _comb_scores(env, coarse, 40)
+    prior = np.exp(-0.5 * (np.log2(coarse / 120.0) / 0.55) ** 2)
+    pick = int(np.argmax(score * (0.55 + 0.45 * prior)))
+    bpm = float(coarse[pick])
+    # a tempo at half or double speed that scores nearly as well is the same groove: keep the one nearer 120
+    for factor in (2.0, 0.5):
+        other = bpm * factor
+        if 70.0 <= other <= 180.0:
+            k = int(np.argmin(np.abs(coarse - other)))
+            if score[k] > 0.92 * score[pick] and abs(np.log2(other / 120.0)) < abs(np.log2(bpm / 120.0)):
+                bpm, pick = float(coarse[k]), k
+    fine = np.arange(bpm - 0.8, bpm + 0.8, 0.02)
+    fscore, fphase = _comb_scores(env, fine, 120)
+    k = int(np.argmax(fscore))
+    bpm = float(fine[k])
+    finer = np.arange(bpm - 0.03, bpm + 0.03, 0.002)
+    gscore, gphase = _comb_scores(env, finer, 240)
+    k = int(np.argmax(gscore))
+    bpm, frame_phase = float(finer[k]), float(gphase[k])
+    # confidence: how much better the best grid is than a typical one, and whether the two halves of the song agree
+    mean_score = float(np.mean(score[score > 0])) if np.any(score > 0) else 1e-9
+    contrast = float(gscore[k]) / (mean_score + 1e-9)
+    half = len(env) // 2
+    agree = 1.0
+    if half > 400:
+        s1, _ = _comb_scores(env[:half], np.array([bpm]), 120)
+        s2, _ = _comb_scores(env[half:], np.array([bpm]), 120)
+        agree = float(min(s1[0], s2[0]) / (max(s1[0], s2[0]) + 1e-9))
+    confidence = float(np.clip((contrast - 1.0) / 1.2, 0.0, 1.0) * (0.4 + 0.6 * agree))
+    return bpm, frame_phase * ANALYSIS_HOP / ANALYSIS_SR, confidence
+
+
+def _chroma_per_frame(x):
+    n_fft, hop = 4096, 2048
+    mag = _stft_mag(x, n_fft, hop)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / ANALYSIS_SR)
+    use = (freqs >= 110.0) & (freqs <= 2000.0)
+    pitch = np.round(12.0 * np.log2(freqs[use] / 440.0)).astype(int) % 12
+    chroma = np.zeros((len(mag), 12), dtype=np.float32)
+    for pc in range(12):
+        chroma[:, pc] = mag[:, use][:, pitch == pc].sum(axis=1)
+    return chroma, hop / ANALYSIS_SR
+
+
+def analyze_samples(x):
+    """Studies mono audio at ANALYSIS_SR. Returns a dictionary (see the keys below)."""
+    duration = len(x) / float(ANALYSIS_SR)
+    result = {"version": ANALYSIS_VERSION, "duration": round(duration, 3), "bpm": 0.0, "first_beat": 0.0, "downbeat": 0.0,
+              "beats_per_bar": 4, "confidence": 0.0, "drop_bar": None, "hooks": [], "hook_confidence": 0.0, "bar_seconds": 0.0}
+    if duration < 20.0 or float(np.max(np.abs(x))) < 1e-4:
+        return result
+    full, low = _onset_envelopes(x)
+    bpm, first_beat, confidence = estimate_tempo(full + 1.5 * low)       # the bass drum is the surest sign of where a beat is
+    period = 60.0 / bpm
+    result.update({"bpm": round(bpm, 3), "first_beat": round(first_beat, 4), "confidence": round(confidence, 3)})
+    # which beat is the first of a bar: the one that carries the most bass and the biggest change in the harmony
+    chroma, chroma_step = _chroma_per_frame(x)
+    beat_count = int((duration - first_beat) / period) - 1
+    beat_times = first_beat + period * np.arange(beat_count)
+    frame_period = period * ANALYSIS_SR / ANALYSIS_HOP
+    low_at = _interp(low, (first_beat * ANALYSIS_SR / ANALYSIS_HOP) + frame_period * np.arange(beat_count))
+    beat_chroma = np.zeros((beat_count, 12), dtype=np.float32)
+    for k in range(beat_count):
+        f0 = int(round(beat_times[k] / chroma_step))
+        f1 = max(f0 + 1, int(round((beat_times[k] + period) / chroma_step)))
+        beat_chroma[k] = chroma[min(f0, len(chroma) - 1):min(f1, len(chroma))].mean(axis=0) if f0 < len(chroma) else 0.0
+    unit = beat_chroma / (np.linalg.norm(beat_chroma, axis=1, keepdims=True) + 1e-9)
+    change = np.zeros(beat_count)
+    change[1:] = 1.0 - np.sum(unit[1:] * unit[:-1], axis=1)
+    score = np.zeros(4)
+    for m in range(4):
+        score[m] = low_at[m::4].sum() / (low_at.sum() + 1e-9) + 1.5 * change[m::4].sum() / (change.sum() + 1e-9)
+    # DJ edits start the music on a bar line: the first strong beat gets a bonus as the bar's first beat
+    strong = np.where(low_at > 0.5)[0]
+    if len(strong):
+        score[int(strong[0]) % 4] += 0.35
+    bar_start = int(np.argmax(score))
+    downbeat = first_beat + period * bar_start
+    while downbeat - 4 * period >= -0.02:
+        downbeat -= 4 * period
+    result["downbeat"] = round(max(0.0, downbeat), 4) if downbeat > -0.02 else round(downbeat + 4 * period, 4)
+    bar = 4 * period
+    result["bar_seconds"] = round(bar, 4)
+    bars = int((duration - result["downbeat"]) / bar)
+    if bars < 10:
+        return result
+    # one feature set per bar: harmony and loudness
+    bar_chroma = np.zeros((bars, 12), dtype=np.float32)
+    bar_energy = np.zeros(bars, dtype=np.float32)
+    for b in range(bars):
+        t0, t1 = result["downbeat"] + b * bar, result["downbeat"] + (b + 1) * bar
+        f0, f1 = int(round(t0 / chroma_step)), max(int(round(t0 / chroma_step)) + 1, int(round(t1 / chroma_step)))
+        bar_chroma[b] = chroma[f0:f1].mean(axis=0)
+        s0, s1 = int(t0 * ANALYSIS_SR), int(t1 * ANALYSIS_SR)
+        seg = x[s0:s1]
+        bar_energy[b] = float(np.sqrt(np.mean(seg ** 2))) if len(seg) else 0.0
+    bar_unit = bar_chroma / (np.linalg.norm(bar_chroma, axis=1, keepdims=True) + 1e-9)
+    # where the intro ends: the first bar that is clearly fuller than the opening bars
+    opening = float(np.mean(bar_energy[:2])) + 1e-9
+    for b in range(2, min(40, bars)):
+        if bar_energy[b] > 1.3 * opening and bar_energy[b] > 0.004:
+            result["drop_bar"] = int(b)
+            break
+    # hooks: the loud section that comes back
+    sim = bar_unit @ bar_unit.T
+    median_energy = float(np.median(bar_energy)) + 1e-9
+    best = None
+    for length, weight in ((8, 1.0), (4, 0.85), (16, 0.9)):
+        if bars < 2 * length + 2:
+            continue
+        starts = bars - length + 1
+        wsim = np.zeros((starts, starts), dtype=np.float32)
+        for t in range(length):
+            wsim += sim[t:t + starts, t:t + starts]
+        wsim /= length
+        wenergy = np.array([bar_energy[i:i + length].mean() for i in range(starts)]) / median_energy
+        for i in range(starts):
+            others = [j for j in range(starts) if abs(j - i) >= length and wsim[i, j] >= 0.9]
+            if not others or wenergy[i] < 1.05:
+                continue
+            picks = [i]
+            for j in sorted(others, key=lambda j: -wsim[i, j]):
+                if all(abs(j - p) >= length for p in picks):
+                    picks.append(j)
+            picks.sort()
+            # windows that touch belong to one section (a 4-bar chord cycle repeating inside one chorus is not two choruses)
+            sections = []
+            for p in picks:
+                if sections and p - sections[-1][1] <= length:
+                    sections[-1][1] = p
+                else:
+                    sections.append([p, p])
+            if len(sections) < 2:
+                continue
+            mean_sim = float(np.mean([wsim[i, j] for j in picks if j != i]))
+            value = weight * wenergy[i] * (1.0 + 0.5 * (len(sections) - 1)) * mean_sim
+            if best is None or value > best[0]:
+                best = (value, length, [(sec[0], sec[1] + length) for sec in sections], mean_sim)
+    if best is not None:
+        _value, length, spans, mean_sim = best
+        result["hooks"] = [{"start": round(result["downbeat"] + first * bar, 3), "end": round(result["downbeat"] + last * bar, 3)}
+                           for first, last in spans]
+        result["hook_confidence"] = round(float(np.clip((mean_sim - 0.85) / 0.12, 0.0, 1.0)), 3)
+        result["hook_bars"] = int(length)
+    return result
+
+
+# --- keeping the results -----------------------------------------------------------------------------------
+def analysis_folder():
+    base = os.path.join(os.path.expanduser("~"), "VisionStudio", "Analysis")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        base = os.path.join(tempfile.gettempdir(), "VisionStudioAnalysis")
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+def analysis_cache_path(path):
+    try:
+        stat = os.stat(path)
+        key = f"{os.path.normcase(os.path.abspath(path))}|{stat.st_size}|{int(stat.st_mtime)}"
+    except OSError:
+        key = os.path.normcase(os.path.abspath(path))
+    return os.path.join(analysis_folder(), hashlib.sha1(key.encode("utf-8", "replace")).hexdigest() + ".json")
+
+
+def load_analysis(path):
+    try:
+        with open(analysis_cache_path(path), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if data.get("version") == ANALYSIS_VERSION else None
+    except Exception:
+        return None
+
+
+def save_analysis(path, data):
+    try:
+        with open(analysis_cache_path(path), "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+    except Exception:
+        pass
+
+
+def get_analysis(path, force=False, decode=None):
+    """The saved analysis for a song, studying it first when needed. Manual marks (set by hand) are kept and win."""
+    cached = None if force else load_analysis(path)
+    manual = (cached or load_analysis(path) or {}).get("manual", {})
+    if cached is not None:
+        return merge_manual(cached)
+    samples = (decode or decode_for_analysis)(path)
+    if samples is None:
+        return None
+    data = analyze_samples(samples)
+    data["manual"] = manual
+    save_analysis(path, data)
+    return merge_manual(data)
+
+
+def merge_manual(data):
+    """Hand-set values (tempo, first beat, hook marks) replace the measured ones."""
+    merged = dict(data)
+    manual = data.get("manual") or {}
+    for key in ("bpm", "downbeat", "drop_bar"):
+        if manual.get(key) is not None:
+            merged[key] = manual[key]
+    if manual.get("hooks"):
+        merged["hooks"] = manual["hooks"]
+        merged["hook_confidence"] = 1.0
+    if manual.get("bpm") is not None or manual.get("downbeat") is not None:
+        merged["confidence"] = 1.0
+        merged["bar_seconds"] = round(4 * 60.0 / merged["bpm"], 4) if merged.get("bpm") else merged.get("bar_seconds", 0.0)
+    return merged
+
+
+def set_manual_mark(path, **marks):
+    data = load_analysis(path)
+    if data is None:
+        data = {"version": ANALYSIS_VERSION, "duration": 0.0, "bpm": 0.0, "hooks": []}
+    manual = dict(data.get("manual") or {})
+    for key, value in marks.items():
+        if value is None:
+            manual.pop(key, None)
+        else:
+            manual[key] = value
+    data["manual"] = manual
+    save_analysis(path, data)
+
+
+def describe_analysis(data):
+    if not data or not data.get("bpm"):
+        return "not analyzed, or no steady tempo found"
+    text = f"{data['bpm']:.1f} BPM ({int(round(data.get('confidence', 0) * 100))}% sure)"
+    hooks = data.get("hooks") or []
+    if hooks:
+        text += ", hook at " + ", ".join(f"{int(h['start'] // 60)}:{int(h['start'] % 60):02d}" for h in hooks[:3])
+        text += f" ({int(round(data.get('hook_confidence', 0) * 100))}% sure)"
+    else:
+        text += ", no clear hook found"
+    if data.get("drop_bar") is not None:
+        text += f", full song starts at bar {data['drop_bar'] + 1}"
+    return text
+
+
+def analysis_report_line(path, data):
+    return f"{os.path.basename(path)}: {describe_analysis(data)}"
+
+
+def analyze_paths(paths, progress=None, should_stop=None):
+    """Studies each song (using saved results where they exist). Returns [(path, analysis or None)]."""
+    results = []
+    for number, path in enumerate(paths, 1):
+        if should_stop is not None and should_stop():
+            break
+        results.append((path, get_analysis(path)))
+        if progress is not None:
+            progress(number, len(paths), path)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Mix blocks: planning and rendering a DJ-style set ahead of time.
+#
+# The songs you pick are beat-matched and blended like a DJ deck: the song going out ramps its last bars to
+# the tempo of the song coming in, so the song coming in never changes speed. The bass swaps from one song to
+# the other, the song leaves at the end of its hook, and when a talk break is attached the last bars of the next
+# song's intro loop under your voice (the music ducks while you talk) and the song drops on the beat when you stop.
+# The result is cut into parts that end exactly on the station's break marks.
+#
+# Everything is worked out with numbers first (plan_block), so the length of each part is known before any audio is
+# made; render_block then makes the audio, one song at a time, so a long set never needs much memory.
+# ---------------------------------------------------------------------------
+
+MIX_SR = 44100
+BEATS_PER_BAR = 4
+
+MIX_DEFAULTS = {
+    "blend_bars": 8,              # bars the two songs play together (4, 8 or 16)
+    "ramp_bars": 8,               # bars before the blend over which the outgoing song changes speed
+    "max_tempo_change": 3.0,      # percent; 0 means a song's speed is never changed
+    "exit": "hook2",              # where a song ends: hook1, hook2 (end of the second hook) or end
+    "loop_bars": 4,               # bars of intro that loop under a talk break (2 or 4)
+    "duck_db": -12.0,             # how far the music goes down while you talk
+    "voice_lead_beats": 2.0,      # the voice starts this many beats into the loop
+    "voice_tail_seconds": 0.4,    # the music stays down this long after the voice stops
+    "swap_fraction": 0.5,         # where in the blend the bass changes over
+    "echo_beats": 0.75,           # delay time of the echo-out, in beats
+    "echo_feedback": 0.55,
+    "echo_tail_beats": 12,
+    "fallback": "delay",          # when two songs cannot be beat-matched: delay (echo-out) or cut
+    "normalize_dbfs": -18.0,      # every song is brought to about this level
+    "voice_dbfs": -17.0,          # your voice is brought to about this level
+    "early_tolerance": 35.0,      # a part may end up to this many seconds before its mark
+    "late_tolerance": 8.0,        # or this many seconds after
+    "min_confidence": 0.3,        # tempo readings below this are not trusted for beat matching
+}
+
+
+def mix_options(settings=None):
+    """The mix settings, with anything changed in Settings applied on top of the defaults."""
+    opts = dict(MIX_DEFAULTS)
+    if settings is None:
+        return opts
+    for key, default in MIX_DEFAULTS.items():
+        raw = settings.value("mix_" + key, None)
+        if raw in (None, ""):
+            continue
+        try:
+            opts[key] = type(default)(float(raw)) if not isinstance(default, str) else str(raw)
+        except Exception:
+            pass
+    opts["blend_bars"] = int(opts["blend_bars"]) if int(opts["blend_bars"]) in (2, 4, 8, 16) else 8
+    opts["loop_bars"] = max(1, min(8, int(opts["loop_bars"])))
+    opts["ramp_bars"] = max(0, min(32, int(opts["ramp_bars"])))
+    opts["max_tempo_change"] = max(0.0, min(12.0, float(opts["max_tempo_change"])))
+    if opts["exit"] not in ("hook1", "hook2", "end"):
+        opts["exit"] = "hook2"
+    if opts["fallback"] not in ("delay", "cut"):
+        opts["fallback"] = "delay"
+    return opts
+
+
+# --- describing a song for mixing ---------------------------------------------------------------------------
+def make_song(path, analysis=None, meta=None):
+    """What the mixer needs to know about a song. `analysis` comes from get_analysis (None: not analyzed)."""
+    a = analysis or {}
+    meta = meta or {}
+    bpm = float(a.get("bpm") or 0.0)
+    duration = float(a.get("duration") or 0.0)
+    song = {
+        "path": path,
+        "artist": meta.get("artist", ""), "title": meta.get("title", "") or os.path.splitext(os.path.basename(path))[0],
+        "album": meta.get("album", ""), "isrc": meta.get("isrc", ""), "label": meta.get("label", ""),
+        "bpm": bpm, "confidence": float(a.get("confidence") or 0.0), "duration": duration,
+        "downbeat": float(a.get("downbeat") or 0.0),
+        "bar": (BEATS_PER_BAR * 60.0 / bpm) if bpm > 0 else 0.0,
+        "drop_bar": a.get("drop_bar"), "hooks": [dict(h) for h in (a.get("hooks") or [])],
+        "hook_confidence": float(a.get("hook_confidence") or 0.0),
+    }
+    return song
+
+
+def song_is_beatmatchable(song, opts):
+    return song["bpm"] > 0 and song["bar"] > 0 and song["confidence"] >= opts["min_confidence"]
+
+
+def snap_to_bar(song, t, direction="down"):
+    """The bar line at or just before (or after) time t."""
+    if song["bar"] <= 0:
+        return t
+    n = (t - song["downbeat"]) / song["bar"]
+    n = math.floor(n + 0.02) if direction == "down" else math.ceil(n - 0.02)
+    return song["downbeat"] + n * song["bar"]
+
+
+def exit_candidates(song):
+    """Places a song can end, earliest first: [(name, source seconds)]. Always includes the natural end."""
+    out = []
+    for number, hook in enumerate(song["hooks"][:3], 1):
+        t = snap_to_bar(song, float(hook["end"]))
+        if 0 < t < song["duration"] - 1.0:
+            out.append((f"hook{number}", t))
+    if song["duration"] > 0:
+        last = snap_to_bar(song, song["duration"] - 0.5) if song["bar"] > 0 else song["duration"] - 0.5
+        if song["bar"] > 0 and last > song["duration"] - 0.5:
+            last -= song["bar"]
+        if not out or last > out[-1][1] + 1.0:
+            out.append(("end", max(1.0, last)))
+    return out
+
+
+def default_exit(song, mode):
+    """The exit this song uses unless the plan changes it: (name, source seconds, note)."""
+    cands = exit_candidates(song)
+    if not cands:
+        return "end", max(1.0, song["duration"] - 0.5), "song length unknown"
+    named = dict(cands)
+    if mode == "end":
+        return "end", named.get("end", cands[-1][1]), ""
+    want = "hook2" if mode == "hook2" else "hook1"
+    if want in named:
+        return want, named[want], ""
+    if "hook1" in named:
+        return "hook1", named["hook1"], "only one hook was found, so it leaves after that one"
+    return "end", named.get("end", cands[-1][1]), "no clear hook was found, so it plays to the end"
+
+
+def intro_bars(song):
+    """Bars before the full song starts (an 8 bar intro gives 8), or 0 when the song has no intro to speak of."""
+    d = song.get("drop_bar")
+    if d is None:
+        return 0
+    return int(d) if 2 <= int(d) <= 32 else 0
+
+
+def pick_window_bars(song, opts):
+    d = intro_bars(song)
+    if 4 <= d <= 16:
+        for n in (16, 8, 4):
+            if d >= n:
+                return n
+    return opts["blend_bars"]
+
+
+def tail_geometry(d_from, d_to, ramp_beats, total_beats):
+    """Output and source times of beats 0..total_beats when the beat spacing slides from d_from to d_to over the
+    first ramp_beats beats and stays at d_to after that. Returns (output times, source times)."""
+    k = np.arange(total_beats + 1)
+    spacing = np.full(total_beats, d_to, dtype=np.float64)
+    if ramp_beats > 0:
+        i = np.arange(ramp_beats)
+        spacing[:ramp_beats] = d_from + (d_to - d_from) * (i + 0.5) / ramp_beats
+    out_t = np.concatenate([[0.0], np.cumsum(spacing)])
+    src_t = k * d_from
+    return out_t, src_t
+
+
+# --- planning -----------------------------------------------------------------------------------------------
+def _out_time(rec, src):
+    """Output time (seconds) of source time `src` in a placed song, before any tail stretching."""
+    t = rec["t_start"] + (src - rec["src_start"])
+    loop = rec.get("loop")
+    if loop and src >= loop["src1"]:
+        t += (loop["count"] - 1) * (loop["src1"] - loop["src0"])
+    return t
+
+
+def _place_song(item, prev, opts, voice_seconds):
+    """Works out where one song starts, how it comes in, and any talk loop. `prev` is the earlier song in the
+    same part (already placed, with its exit chosen) or None. Does not change prev."""
+    song = item["song"]
+    rec = {
+        "song": song, "item": item, "src_start": 0.0, "t_start": 0.0, "loop": None, "voice": None,
+        "in_kind": "start", "in_bars": 0, "notes": [], "out_kind": "end", "ramp_bars": 0, "out_bars": 0,
+        "tail_start": None, "exit_name": "", "exit_src": 0.0, "t_end": 0.0, "tempo_to": 0.0,
+    }
+    start_bar = int(item.get("start_bar") or 0)
+    rec["src_start"] = (song["downbeat"] + start_bar * song["bar"]) if song["bar"] > 0 else 0.0
+    talk = item.get("talk")
+    loop_bars = int(item.get("loop_bars") or opts["loop_bars"])
+    bar = song["bar"] or 2.0
+    pre_bars = 0
+    if talk:
+        d = intro_bars(song)
+        if d >= loop_bars + 0:
+            pre_bars = d - loop_bars
+            loop_src0 = rec["src_start"] + pre_bars * bar
+        else:
+            if d and d < loop_bars:
+                loop_bars = d
+            pre_bars = 0 if d else (0 if prev is None else min(4, opts["blend_bars"]))
+            loop_src0 = rec["src_start"] + pre_bars * bar
+        loop_len = loop_bars * bar
+        lead = opts["voice_lead_beats"] * bar / BEATS_PER_BAR
+        need = lead + float(voice_seconds) + opts["voice_tail_seconds"]
+        count = max(1, int(math.ceil(need / loop_len - 1e-6)))
+        rec["loop"] = {"src0": loop_src0, "src1": loop_src0 + loop_len, "count": count, "bars": loop_bars}
+        rec["voice"] = {"lead": lead, "seconds": float(voice_seconds)}
+        rec["pre_bars"] = pre_bars
+    # --- how it comes in
+    if prev is None:
+        rec["t_start"] = 0.0
+        rec["in_kind"] = "talk" if talk else "start"
+        rec["in_bars"] = pre_bars if talk else 0
+        return rec
+    kind, geom = _plan_transition(prev, rec, item, opts)
+    rec["in_kind"] = kind
+    if kind == "blend":
+        rec["in_bars"] = geom["nb"]
+        rec["t_start"] = geom["window_start"]
+        prev["out_kind"], prev["ramp_bars"], prev["out_bars"] = "blend", geom["ramp"], geom["nb"]
+        prev["tail_start"], prev["tempo_to"] = geom["tail_start"], geom["tempo_to"]
+        prev["t_end"] = geom["t_exit"]
+        rec["notes"].extend(geom["notes"])
+    else:
+        prev["out_kind"] = kind
+        prev["t_end"] = _out_time(prev, prev["exit_src"])
+        rec["t_start"] = prev["t_end"]
+        rec["in_kind"] = kind
+        rec["notes"].extend(geom["notes"])
+    return rec
+
+
+def _plan_transition(prev, rec, item, opts):
+    """Decides between a beat-matched blend and the fallback, and works out the numbers for a blend."""
+    song, ps = rec["song"], prev["song"]
+    mode = item.get("transition", "auto")
+    fallback = opts["fallback"]
+    notes = []
+    if mode in ("delay", "cut"):
+        return mode, {"notes": ["you chose " + ("an echo-out" if mode == "delay" else "a cut") + " for this change"]}
+    if mode == "auto" or mode == "blend":
+        pass
+    if not (song_is_beatmatchable(song, opts) and song_is_beatmatchable(ps, opts)):
+        return fallback, {"notes": ["the speed of one of the two songs could not be read well enough to beat-match"]}
+    cands = [song["bpm"], song["bpm"] * 2, song["bpm"] / 2]
+    target = min(cands, key=lambda b: abs(b / ps["bpm"] - 1.0))
+    change = abs(target / ps["bpm"] - 1.0)
+    limit = opts["max_tempo_change"] / 100.0
+    if change > max(limit, 0.0005) + 1e-9:
+        return fallback, {"notes": [f"the songs are {change * 100:.1f} percent apart in speed, more than the {opts['max_tempo_change']:g} percent allowed"]}
+    pre = rec.get("pre_bars", None)
+    if rec.get("loop") is not None:
+        nb = int(pre or 0)
+        if nb < 2:
+            return fallback, {"notes": ["there is no room in the intro to blend before the loop"]}
+    else:
+        nb = pick_window_bars(song, opts)
+    # how much of the outgoing song is free to be stretched and blended
+    free_from = prev["src_start"]
+    if prev.get("loop"):
+        free_from = prev["loop"]["src1"]
+    elif prev["in_kind"] == "blend":
+        free_from = prev["src_start"] + prev["in_bars"] * ps["bar"]
+    E = prev["exit_src"]
+    avail = int((E - free_from) / ps["bar"] + 0.02)
+    if avail < 2:
+        return fallback, {"notes": ["the outgoing song has no room left for a blend"]}
+    while nb > avail and nb > 2:
+        nb //= 2
+        notes.append(f"the blend was shortened to {nb} bars")
+    if nb > avail:
+        return fallback, {"notes": ["the outgoing song is too short for a blend"]}
+    ramp = 0
+    if change > 0.0005:
+        ramp = min(opts["ramp_bars"], avail - nb)
+        if ramp < 2:
+            return fallback, {"notes": ["there is no room to change the speed gradually before the blend"]}
+    d_from, d_to = 60.0 / ps["bpm"], 60.0 / target
+    total_beats = (ramp + nb) * BEATS_PER_BAR
+    out_t, src_t = tail_geometry(d_from, d_to, ramp * BEATS_PER_BAR, total_beats)
+    tail_start = E - (ramp + nb) * ps["bar"]
+    t_tail = _out_time(prev, tail_start)
+    t_exit = t_tail + float(out_t[-1])
+    window = nb * BEATS_PER_BAR * d_to
+    if ramp:
+        notes.append(f"{prev['song']['title']} changes speed from {ps['bpm']:.1f} to {target:.1f} BPM over {ramp} bars")
+    return "blend", {"nb": nb, "ramp": ramp, "tail_start": tail_start, "t_exit": t_exit, "window_start": t_exit - window,
+                     "tempo_to": target, "notes": notes, "out_t": out_t, "src_t": src_t}
+
+
+def _set_exit(rec, name, src):
+    rec["exit_name"], rec["exit_src"] = name, float(src)
+
+
+def _candidate_end_times(rec):
+    """Output times at which this song would end for each possible exit (as if nothing follows it)."""
+    return [(name, _out_time(rec, src)) for name, src in exit_candidates(rec["song"]) if src > rec["src_start"] + 1.0]
+
+
+def plan_block(items, parts, opts=None):
+    """items: [{'song': make_song(...), 'talk': {'seconds': s} or None, 'exit': None|'hook1'|'hook2'|'end',
+    'transition': 'auto'|'blend'|'delay'|'cut', 'loop_bars': n, 'start_bar': n}]. parts: [{'target': seconds,
+    'latest': seconds, 'name': text}]. Returns the plan: for each part, its songs placed in time, how long it runs, and
+    whether it is early or late for its mark. Nothing is rendered."""
+    opts = opts or mix_options()
+    queue = list(items)
+    result = {"parts": [], "left_over": [], "options": opts}
+    for number, spec in enumerate(parts):
+        last_part = number == len(parts) - 1
+        target = float(spec["target"])
+        latest = float(spec.get("latest", target))
+        recs = []
+        closed = False
+        while queue and not closed:
+            item = queue.pop(0)
+            voice = (item.get("talk") or {}).get("seconds", 0.0)
+            prev = recs[-1] if recs else None
+            if prev is not None and not prev["exit_name"]:
+                _set_exit(prev, *default_exit(prev["song"], item_exit(prev["item"], opts))[:2])
+            rec = _place_song(item, prev, opts, voice)
+            if rec["voice"] is not None:
+                rec["voice"]["t_start"] = _out_time(rec, rec["loop"]["src0"]) + rec["voice"]["lead"]
+            recs.append(rec)
+            name, src, note = default_exit(rec["song"], item_exit(item, opts))
+            if note:
+                rec["notes"].append(note)
+            _set_exit(rec, name, src)
+            cands = _candidate_end_times(rec) or [(name, _out_time(rec, src))]
+            if item.get("exit") in ("hook1", "hook2", "end"):
+                # the user fixed this song's exit: it only closes the part if that exit is near the mark
+                fixed = dict(cands).get(name, cands[-1][1])
+                cands = [(name, fixed)]
+            longest = max(t for _n, t in cands)
+            lo = target - opts["early_tolerance"]
+            hi = (latest if last_part else target + opts["late_tolerance"])
+            in_range = [(n, t) for n, t in cands if lo <= t <= hi]
+            if in_range:
+                pick = min(in_range, key=lambda nt: abs(nt[1] - target))
+                _set_exit(rec, pick[0], dict(exit_candidates(rec["song"])).get(pick[0], rec["exit_src"]))
+                closed = True
+            elif longest >= lo:
+                # no exit lands in range: take the one nearest the mark and report how far off it is
+                pick = min(cands, key=lambda nt: (max(0.0, nt[1] - hi) * 3.0 + max(0.0, lo - nt[1])))
+                _set_exit(rec, pick[0], dict(exit_candidates(rec["song"])).get(pick[0], rec["exit_src"]))
+                closed = True
+            if closed or not queue:
+                if not rec["exit_name"]:
+                    _set_exit(rec, name, src)
+        if not recs:
+            result["parts"].append({"spec": spec, "songs": [], "length": 0.0, "off": -target, "target": target, "latest": latest})
+            continue
+        last = recs[-1]
+        last["out_kind"] = "end"
+        last["t_end"] = _out_time(last, last["exit_src"])
+        length = last["t_end"]
+        result["parts"].append({"spec": spec, "songs": recs, "length": length, "target": target, "latest": latest,
+                                "off": length - target})
+    if queue:
+        result["left_over"] = queue
+        if result["parts"] and result["parts"][-1]["songs"]:
+            pass
+    return result
+
+
+def item_exit(item, opts):
+    return item.get("exit") if item.get("exit") in ("hook1", "hook2", "end") else opts["exit"]
+
+
+def describe_part(part, number):
+    """Plain sentences about one part, for the screen: what it holds and whether it fits its mark."""
+    name = part["spec"].get("name") or f"Part {number}"
+    if not part["songs"]:
+        return [f"{name}: no songs yet."]
+    lines = []
+    songs = part["songs"]
+    talks = sum(1 for r in songs if r.get("loop"))
+    total = part["length"]
+    head = f"{name}: {len(songs)} song{'s' if len(songs) != 1 else ''}"
+    if talks:
+        head += f", {talks} talk break{'s' if talks != 1 else ''}"
+    head += f", {fmt_clock(total)} long"
+    off = part["off"]
+    if abs(off) < 1.0:
+        head += ", ending right on its mark."
+    elif off < 0:
+        head += f", ending {fmt_seconds(-off)} before its mark."
+    else:
+        head += f", ending {fmt_seconds(off)} after its mark."
+    lines.append(head)
+    for r in songs:
+        s = r["song"]
+        label = f"{s['artist']} - {s['title']}" if s["artist"] else s["title"]
+        how = {"start": "starts", "talk": "starts with a talk break over its intro", "blend": "blends in",
+               "delay": "comes in after an echo-out", "cut": "comes in after a cut"}.get(r["in_kind"], "plays")
+        lines.append(f"  {fmt_clock(r['t_start'])}  {label} {how}" + (f" ({len(r['notes'])} note{'s' if len(r['notes']) != 1 else ''})" if r["notes"] else ""))
+        for n in r["notes"]:
+            lines.append("      " + n[0].upper() + n[1:] + ".")
+        if r.get("loop"):
+            lines.append(f"      The last {r['loop']['bars']} bars of its intro loop {r['loop']['count']} time(s) while you talk, then it drops.")
+    return lines
+
+
+def fmt_clock(seconds):
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def fmt_seconds(seconds):
+    seconds = int(round(seconds))
+    if seconds >= 120:
+        return f"{seconds // 60} minutes {seconds % 60} seconds"
+    return f"{seconds} seconds"
+
+
+def suggest_fixes(items, parts, opts, part_index, plan=None):
+    """Things to try when a part misses its mark, each with what it would do to that part. Plain sentences."""
+    plan = plan or plan_block(items, parts, opts)
+    if part_index >= len(plan["parts"]):
+        return []
+    base = plan["parts"][part_index]
+    target = base["target"]
+    off0 = base["off"]
+    tries = []
+
+    def trial(label, new_items, new_opts=None):
+        p = plan_block(new_items, parts, new_opts or opts)
+        if part_index < len(p["parts"]) and p["parts"][part_index]["songs"]:
+            off = p["parts"][part_index]["off"]
+            tries.append((abs(off), label, off))
+
+    for n, item in enumerate(items):
+        song = item["song"]
+        name = song["title"]
+        cands = dict(exit_candidates(song))
+        if off0 > 0 and "hook1" in cands and item_exit(item, opts) != "hook1" and len(song["hooks"]) > 1:
+            new = [dict(i) for i in items]
+            new[n]["exit"] = "hook1"
+            trial(f"Leave '{name}' after its first hook instead of its second", new)
+        if off0 < 0 and "end" in cands and item_exit(item, opts) != "end":
+            new = [dict(i) for i in items]
+            new[n]["exit"] = "end"
+            trial(f"Let '{name}' play to its natural end", new)
+        if item.get("talk") and int(item.get("loop_bars") or opts["loop_bars"]) > 2 and off0 > 0:
+            new = [dict(i) for i in items]
+            new[n]["loop_bars"] = 2
+            trial(f"Use a 2 bar loop under the talk break before '{name}'", new)
+    if off0 > 0 and len(items) > 1:
+        trial("Take the last song out of the mix", items[:-1])
+    if off0 < 0 and len(items) >= 1:
+        pass
+    tries.sort()
+    out = []
+    for _abs, label, off in tries[:4]:
+        if abs(off) < abs(off0) - 1.0:
+            if abs(off) < 1.5:
+                out.append(f"{label}: the part would end on its mark.")
+            elif off < 0:
+                out.append(f"{label}: the part would end {fmt_seconds(-off)} before its mark.")
+            else:
+                out.append(f"{label}: the part would end {fmt_seconds(off)} after its mark.")
+    return out
+
+
+def plan_manifest(plan, base_seconds=0.0):
+    """The list of every song in the plan with the time it comes in, for logging and play history."""
+    out = []
+    for number, part in enumerate(plan["parts"], 1):
+        for rec in part["songs"]:
+            s = rec["song"]
+            out.append({"part": number, "path": s["path"], "artist": s["artist"], "title": s["title"], "album": s["album"],
+                        "isrc": s["isrc"], "label": s["label"], "start": round(rec["t_start"], 2), "end": round(rec["t_end"], 2),
+                        "duration": s["duration"]})
+    return out
+
+
+# --- audio ------------------------------------------------------------------------------------------------
+def decode_stereo(path, start=0.0, duration=None, sr=MIX_SR):
+    """Stereo float32 at `sr`, shape (n, 2); an empty array if the file cannot be read."""
+    cmd = [get_ffmpeg_path(), "-v", "error", "-nostdin"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.4f}"]
+    cmd += ["-i", path]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.4f}"]
+    cmd += ["-f", "f32le", "-ac", "2", "-ar", str(sr), "-"]
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        out = subprocess.run(cmd, capture_output=True, creationflags=flags, timeout=600)
+        raw = out.stdout
+        if out.returncode != 0 or not raw:
+            return np.zeros((0, 2), dtype=np.float32)
+        return np.frombuffer(raw[: len(raw) // 8 * 8], dtype="<f4").astype(np.float32).reshape(-1, 2)
+    except Exception:
+        return np.zeros((0, 2), dtype=np.float32)
+
+
+def level_gain(x, target_dbfs):
+    """Gain that brings the loud parts of x to about target_dbfs (RMS), limited so quiet songs are not wrecked."""
+    if len(x) == 0:
+        return 1.0
+    mono = np.abs(x).mean(axis=1) if x.ndim == 2 else np.abs(x)
+    block = MIX_SR // 4
+    n = len(mono) // block
+    if n < 2:
+        rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2))) + 1e-9
+    else:
+        sq = (x[: n * block].astype(np.float64) ** 2)
+        sq = sq.reshape(n, block, -1).mean(axis=(1, 2))
+        active = sq[sq > (10 ** (-50 / 10))]
+        rms = float(np.sqrt(np.mean(active))) if len(active) else float(np.sqrt(np.mean(sq))) + 1e-9
+    gain = (10 ** (target_dbfs / 20.0)) / max(rms, 1e-6)
+    return float(min(max(gain, 0.2), 5.0))
+
+
+def wsola_warp(x, sr, out_times, src_times, lead):
+    """Changes the speed of x (n, 2) without changing its pitch, following a map from output time to source time
+    (both in seconds, knots in increasing order). The first `lead` samples of the result are the run-in before the
+    speed starts to change; they are returned too so the caller can join smoothly. Length of result: out_times[-1]*sr."""
+    N, Hs = 2048, 1024
+    S = 128
+    window = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N) / N)).astype(np.float32)
+    out_len = int(round(out_times[-1] * sr))
+    frames = out_len // Hs + 2
+    pad = N * 2
+    xp = np.concatenate([x, np.zeros((pad + N, 2), dtype=np.float32)], axis=0)
+    mono = xp.mean(axis=1)
+    n4 = len(mono) // 4 * 4
+    m4 = mono[:n4].reshape(-1, 4).mean(axis=1)
+    out = np.zeros((out_len + N * 2, 2), dtype=np.float32)
+    prev_q = None
+    srcs = np.interp((np.arange(frames) * Hs) / sr, out_times, src_times, right=None) * sr
+    # beyond the last knot the map keeps its final slope
+    last_slope = (src_times[-1] - src_times[-2]) / max(1e-9, out_times[-1] - out_times[-2])
+    beyond = (np.arange(frames) * Hs) / sr > out_times[-1]
+    srcs[beyond] = src_times[-1] * sr + ((np.arange(frames)[beyond] * Hs) / sr - out_times[-1]) * last_slope * sr
+    H4, S4 = Hs // 4, S // 4
+    for j in range(frames):
+        p = int(round(srcs[j]))
+        if prev_q is None:
+            q = max(0, p)
+        else:
+            t0 = (prev_q + Hs) // 4
+            tgt = m4[t0:t0 + H4]
+            lo = max(0, p // 4 - S4)
+            hi = p // 4 + S4
+            if len(tgt) < H4 or hi + H4 > len(m4):
+                q = max(0, p)
+            else:
+                seg = m4[lo:hi + H4]
+                corr = np.correlate(seg, tgt, mode="valid")
+                energy = np.sqrt(np.convolve(seg * seg, np.ones(H4, dtype=np.float32), mode="valid") + 1e-9)
+                score = corr / energy
+                top = float(np.max(np.abs(score))) + 1e-9
+                lags = np.arange(len(score)) + lo - p // 4          # distance from where the speed map says to be
+                score = score / top - 0.12 * np.abs(lags) / S4     # prefer to stay near the map: keeps the beats steady
+                q = max(0, (lo + int(np.argmax(score))) * 4)
+        o = j * Hs
+        frame = xp[q:q + N]
+        if len(frame) < N:
+            frame = np.concatenate([frame, np.zeros((N - len(frame), 2), dtype=np.float32)])
+        out[o:o + N] += frame * window[:, None]
+        prev_q = q
+    return out[:out_len]
+
+
+def split_low_high(x, sr, cutoff=160.0):
+    """Zero-phase split into (low, high); low + high == x."""
+    n = len(x)
+    if n == 0:
+        return x.copy(), x.copy()
+    size = 1 << int(math.ceil(math.log2(max(n, 2))))
+    freqs = np.fft.rfftfreq(size, 1.0 / sr)
+    mask = 1.0 / (1.0 + (freqs / cutoff) ** 8)
+    spec = np.fft.rfft(x, n=size, axis=0)
+    low = np.fft.irfft(spec * mask[:, None], n=size, axis=0)[:n].astype(np.float32)
+    return low, (x - low).astype(np.float32)
+
+
+def echo_ring(x_end, sr, beat, opts):
+    """The echo that rings on after a song is cut at the end of x_end. Returns an array (the ring only)."""
+    delay = max(64, int(round(beat * opts["echo_beats"] * sr)))
+    ring_len = int(beat * opts["echo_tail_beats"] * sr)
+    feed = x_end[-int(beat * 4 * sr):] if len(x_end) else np.zeros((0, 2), dtype=np.float32)
+    total = len(feed) + ring_len
+    y = np.zeros((total + delay, 2), dtype=np.float32)
+    pos = 0
+    block = np.zeros((total, 2), dtype=np.float32)
+    block[:len(feed)] = feed
+    f = float(opts["echo_feedback"])
+    kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
+    # y[n] = x[n - delay] + f * smooth(y[n - delay])
+    for start in range(delay, total, delay):
+        prev = y[start - delay:start] if start - delay >= 0 else 0
+        seg_in = block[start - delay:start]
+        wet = seg_in + f * prev
+        if len(wet) > 3:
+            wet = np.stack([np.convolve(wet[:, c], kernel, mode="same") for c in range(2)], axis=1)
+        y[start:start + len(wet)] = wet[: len(y) - start]
+    ring = y[len(feed):total]
+    fade = np.linspace(1.0, 0.0, min(len(ring), int(beat * 2 * sr)))
+    if len(fade):
+        ring[-len(fade):] *= fade[:, None]
+    return ring.astype(np.float32)
+
+
+def soft_limit(x, knee=0.8):
+    a = np.abs(x)
+    over = a > knee
+    if not np.any(over):
+        return x
+    y = x.copy()
+    y[over] = np.sign(x[over]) * (knee + (1.0 - knee) * np.tanh((a[over] - knee) / (1.0 - knee)))
+    return y
+
+
+def _fade_edges(x, n):
+    n = min(n, len(x) // 2)
+    if n > 1:
+        ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
+        x[:n] *= ramp
+        x[-n:] *= ramp[::-1]
+    return x
+
+
+def _cat(a, b, n):
+    """Joins two arrays end to end with a very short fade out and in so the join cannot click. Length is kept."""
+    if len(a) == 0:
+        return b
+    if len(b) == 0:
+        return a
+    a = a.copy()
+    b = b.copy()
+    k = min(n, len(a), len(b))
+    if k > 1:
+        a[-k:] *= np.linspace(1.0, 0.0, k, dtype=np.float32)[:, None]
+        b[:k] *= np.linspace(0.0, 1.0, k, dtype=np.float32)[:, None]
+    return np.concatenate([a, b], axis=0)
+
+
+def _splice(audio, warped, lead, fade):
+    """Continues `audio` with `warped`, whose sample number `lead` is the same moment as the end of `audio`.
+    A crossfade over `fade` samples hides the join; the length is audio + warped - lead."""
+    fade = min(fade, lead, len(audio))
+    head = audio[:len(audio) - fade]
+    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None] if fade else np.zeros((0, 1), dtype=np.float32)
+    mid = audio[len(audio) - fade:] * (1.0 - ramp) + warped[lead - fade:lead] * ramp if fade else np.zeros((0, 2), dtype=np.float32)
+    return np.concatenate([head, mid, warped[lead:]], axis=0)
+
+
+def render_song(rec, opts, decode=decode_stereo, sr=MIX_SR):
+    """The audio of one placed song as it will sound on the timeline: loops repeated, the tail's speed change
+    applied. Returns (audio (n,2), gain used)."""
+    song = rec["song"]
+    src0 = rec["src_start"]
+    end_src = rec["exit_src"]
+    x_full = decode(song["path"], src0, (end_src - src0) + 1.5, sr)
+    if len(x_full) == 0:
+        return np.zeros((0, 2), dtype=np.float32), 1.0
+    gain = level_gain(x_full, opts["normalize_dbfs"])
+    x_full = x_full * gain
+
+    def seg(a, b):
+        i, j = int(round((a - src0) * sr)), int(round((b - src0) * sr))
+        part = x_full[max(0, i):max(0, j)]
+        need = (j - i) - len(part)
+        if need > 0:
+            part = np.concatenate([part, np.zeros((need, 2), dtype=np.float32)])
+        return part
+    join = int(0.002 * sr)
+    warp_tail = (rec["out_kind"] == "blend" and rec["tail_start"] is not None and rec["ramp_bars"] > 0
+                 and rec["tail_start"] - src0 > 0.3)
+    stop_plain = rec["tail_start"] if warp_tail else end_src
+    loop = rec.get("loop")
+    if loop:
+        audio = seg(src0, loop["src0"])
+        loop_audio = seg(loop["src0"], loop["src1"])
+        for _ in range(loop["count"]):
+            audio = _cat(audio, loop_audio, join)
+        audio = _cat(audio, seg(loop["src1"], stop_plain), join)
+    else:
+        audio = seg(src0, stop_plain)
+    if warp_tail:
+        tail_start = rec["tail_start"]
+        ramp, nb = rec["ramp_bars"], rec["out_bars"]
+        d_from, d_to = 60.0 / song["bpm"], 60.0 / rec["tempo_to"]
+        out_t, src_t = tail_geometry(d_from, d_to, ramp * BEATS_PER_BAR, (ramp + nb) * BEATS_PER_BAR)
+        lead_s = min(0.5, (tail_start - src0) * 0.5)
+        out_k = np.concatenate([[0.0], lead_s + out_t])
+        src_k = np.concatenate([[0.0], lead_s + src_t])
+        region = seg(tail_start - lead_s, end_src + 1.0)
+        warped = wsola_warp(region, sr, out_k, src_k, 0)
+        lead = int(round(lead_s * sr))
+        audio = _splice(audio, warped, lead, 1024)
+    return audio, gain
+
+
+def _voice_prepare(path, opts, sr=MIX_SR, decode=decode_stereo):
+    v = decode(path, 0.0, None, sr)
+    if len(v) == 0:
+        return v
+    g = level_gain(v, opts["voice_dbfs"])
+    return soft_limit(v * g * (10 ** (opts.get("voice_gain_db", 0.0) / 20.0)), 0.9)
+
+
+def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=None, sr=MIX_SR):
+    """Makes one part's audio, exactly part['target'] seconds long. Returns (audio, notes)."""
+    notes = []
+    total = int(round(part["target"] * sr))
+    mix = np.zeros((total + sr * 40, 2), dtype=np.float32)
+    songs = part["songs"]
+    pending = None            # [audio, offset in samples, samples at the start already written]
+    ducks = []
+    voices = []
+
+    def write(audio, offset, skip=0, upto=None):
+        a = audio[skip:upto]
+        if len(a) == 0:
+            return
+        o = offset + skip
+        if o < 0:
+            a = a[-o:]
+            o = 0
+        end = min(len(mix), o + len(a))
+        mix[o:end] += a[: end - o]
+
+    for number, rec in enumerate(songs):
+        if progress is not None:
+            progress(number, len(songs), rec["song"]["title"])
+        audio, _gain = render_song(rec, opts, decode, sr)
+        if len(audio) == 0:
+            notes.append(f"'{rec['song']['title']}' could not be read and was left out.")
+            continue
+        offset = int(round(rec["t_start"] * sr))
+        if rec.get("voice") and voice_loader is not None:
+            vpath = (rec["item"].get("talk") or {}).get("path")
+            v = voice_loader(vpath) if vpath else None
+            if v is not None and len(v):
+                vs = int(round(rec["voice"]["t_start"] * sr))
+                voices.append((vs, v))
+                ducks.append((vs - int(0.06 * sr), vs + len(v) + int(opts["voice_tail_seconds"] * sr)))
+        if pending is None:
+            pending = [audio, offset, 0, rec]
+            continue
+        p_audio, p_off, p_skip, p_rec = pending
+        if rec["in_kind"] == "blend" and p_rec["out_kind"] == "blend":
+            win = int(round(rec["in_bars"] * BEATS_PER_BAR * 60.0 / p_rec["tempo_to"] * sr))
+            win = min(win, len(audio), len(p_audio) - p_skip)
+            write(p_audio, p_off, p_skip, len(p_audio) - win)
+            pa = p_audio[len(p_audio) - win:]
+            ba = audio[:win]
+            a_lo, a_hi = split_low_high(pa, sr)
+            b_lo, b_hi = split_low_high(ba, sr)
+            u = np.linspace(0.0, 1.0, win, dtype=np.float32)
+            g_a = np.cos(u * np.pi / 2)[:, None]
+            g_b = np.sin(u * np.pi / 2)[:, None]
+            swap = opts["swap_fraction"]
+            beat = 60.0 / p_rec["tempo_to"]
+            ramp_w = max(1, int(beat * 0.5 * sr))
+            sw = int(swap * win)
+            low_b = np.clip((np.arange(win) - sw) / ramp_w + 0.5, 0.0, 1.0).astype(np.float32)[:, None]
+            low_a = 1.0 - low_b
+            win_mix = a_hi * g_a + b_hi * g_b + a_lo * low_a + b_lo * low_b
+            write(win_mix, p_off + len(p_audio) - win)
+            pending = [audio, p_off + len(p_audio) - win, win, rec]
+        else:
+            # echo-out or cut: the outgoing song ends on the bar line and the next one starts there
+            beat = 60.0 / max(40.0, p_rec["song"]["bpm"] or 120.0)
+            body = p_audio.copy()
+            if p_rec["out_kind"] == "cut":
+                _fade_edges_tail(body, int(beat * 0.5 * sr))
+            else:
+                _fade_edges_tail(body, int(0.02 * sr))
+            write(body, p_off, p_skip)
+            if p_rec["out_kind"] != "cut":
+                ring = echo_ring(p_audio, sr, beat, opts)
+                write(ring * 0.8, p_off + len(p_audio))
+            pending = [audio, offset, 0, rec]
+    if pending is not None:
+        p_audio, p_off, p_skip, p_rec = pending
+        beat = 60.0 / max(40.0, p_rec["song"]["bpm"] or 120.0)
+        body = p_audio.copy()
+        _fade_edges_tail(body, int(0.03 * sr))
+        write(body, p_off, p_skip)
+        ring = echo_ring(p_audio, sr, beat, opts)
+        write(ring * 0.8, p_off + len(p_audio))
+    # the music goes down under the voice, then the voice goes on top
+    if voices:
+        env = np.ones(len(mix), dtype=np.float32)
+        low = 10 ** (opts["duck_db"] / 20.0)
+        for a, b in ducks:
+            a, b = max(0, a), min(len(env), b)
+            if b <= a:
+                continue
+            seg_env = np.full(b - a, low, dtype=np.float32)
+            ramp_in = min(len(seg_env) // 2, int(0.12 * sr))
+            ramp_out = min(len(seg_env) // 2, int(0.35 * sr))
+            if ramp_in:
+                seg_env[:ramp_in] = np.linspace(1.0, low, ramp_in, dtype=np.float32)
+            if ramp_out:
+                seg_env[-ramp_out:] = np.linspace(low, 1.0, ramp_out, dtype=np.float32)
+            env[a:b] = np.minimum(env[a:b], seg_env)
+        mix *= env[:, None]
+        for start, v in voices:
+            end = min(len(mix), start + len(v))
+            if end > start:
+                mix[start:end] += v[: end - start]
+    out = mix[:total].copy()
+    last_end = max((r["t_end"] for r in songs), default=0.0)
+    if last_end > part["target"] + 0.25:
+        _fade_edges_tail(out, int(min(2.0, last_end - part["target"] + 0.5) * sr))
+        notes.append(f"The last song was {last_end - part['target']:.0f} seconds too long for this part, so its end was faded out on the mark.")
+    elif last_end < part["target"] - 1.0:
+        notes.append(f"The music ends {part['target'] - last_end:.0f} seconds before the mark; the rest is the echo and then silence.")
+    return soft_limit(out), notes
+
+
+def _fade_edges_tail(x, n):
+    n = min(n, len(x))
+    if n > 1:
+        x[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32)[:, None]
+    return x
+
+
+def write_audio_file(path, audio, sr=MIX_SR, bitrate="256k"):
+    """Saves a stereo float array as MP3 (or WAV when the name ends in .wav). Returns True when written."""
+    path = os.fspath(path)
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+    if path.lower().endswith(".wav"):
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(2)
+            handle.setsampwidth(2)
+            handle.setframerate(sr)
+            handle.writeframes(pcm.tobytes())
+        return True
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    cmd = [get_ffmpeg_path(), "-y", "-v", "error", "-f", "s16le", "-ar", str(sr), "-ac", "2", "-i", "-",
+           "-codec:a", "libmp3lame", "-b:a", bitrate, path]
+    try:
+        result = subprocess.run(cmd, input=pcm.tobytes(), capture_output=True, creationflags=flags, timeout=900)
+        return result.returncode == 0 and os.path.isfile(path)
+    except Exception:
+        return False
 
 
 
@@ -8022,6 +9350,9 @@ def read_licensing_tags(path):
     """Artist, title, album, record label and ISRC as stored in the file (blank when missing)."""
     tags = {key: "" for key in LICENSE_FIELDS}
     tags["year"] = ""
+    if path in PSEUDO_SONGS:
+        tags.update({k: v for k, v in PSEUDO_SONGS[path].items() if k in tags})
+        return tags
     if not (MUTAGEN_AVAILABLE and path and os.path.isfile(path)):
         return tags
     try:
@@ -8305,6 +9636,578 @@ class LibraryTagger(QObject):
         RUN_LOG.write("TAG", summary)
         self.running = False
         self.finished_scan.emit(summary)
+
+
+# ---------------------------------------------------------------------------
+# DJ-edit tag cleanup. A DJ edit with an 8 bar intro is often tagged "Song (8 Bar Intro)". This tool shows what
+# it would change, you approve, and it retags the file with the normal artist, title, album, label and year,
+# taken from your library copy of the same song and (only if you switch it on) from MusicBrainz.
+# Nothing is written until you approve. Every change is saved in a backup file so it can be undone.
+# The ISRC is your choice: left alone, copied from the original song, or one you type.
+# ---------------------------------------------------------------------------
+
+TAGCLEAN_FIELDS = ("artist", "title", "album", "label", "isrc", "year")
+ISRC_MODES = ("blank", "original", "own")
+ISRC_MODE_TEXT = {
+    "blank": "Leave the ISRC as it is in the file (recommended)",
+    "original": "Copy the original song's ISRC",
+    "own": "Use an ISRC I type in",
+}
+ISRC_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$")
+
+
+def tag_backups_folder():
+    return get_data_folder("Tag Backups")
+
+
+def normalize_isrc(text):
+    code = re.sub(r"[\s\-]", "", str(text or "")).upper()
+    return code if ISRC_PATTERN.match(code) else ""
+
+
+def title_from_filename(path):
+    """('Artist', 'Title') guessed from 'Artist - Title.mp3', or ('', file name)."""
+    stem = os.path.splitext(os.path.basename(path or ""))[0]
+    stem = re.sub(r"^\d{1,3}[\s._\-]+(?=\D)", "", stem)           # a leading track number
+    parts = re.split(r"\s+[-–—]\s+", stem, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return "", stem.strip()
+
+
+def set_tags(path, values):
+    """Sets the given fields exactly; an empty value removes that tag. Returns the fields changed."""
+    if not MUTAGEN_AVAILABLE or not values:
+        return []
+    ext = os.path.splitext(path)[1].lower()
+    changed = []
+    if ext == ".mp3":
+        from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TIT2, TALB, TPUB, TSRC, TDRC
+        try:
+            id3 = ID3(path)
+        except ID3NoHeaderError:
+            id3 = ID3()
+        frames = {"artist": (TPE1, ("TPE1",)), "title": (TIT2, ("TIT2",)), "album": (TALB, ("TALB",)),
+                  "label": (TPUB, ("TPUB",)), "isrc": (TSRC, ("TSRC",)), "year": (TDRC, ("TDRC", "TYER"))}
+        for key, (cls, names) in frames.items():
+            if key not in values:
+                continue
+            for name in names:
+                id3.delall(name)
+            if values[key]:
+                id3.add(cls(encoding=3, text=[values[key]]))
+            changed.append(key)
+        if changed:
+            id3.save(path, v2_version=3)
+    elif ext in (".flac", ".ogg", ".opus"):
+        audio = mutagen.File(path)
+        if audio is None:
+            return []
+        names = {"artist": "artist", "title": "title", "album": "album", "label": "label", "isrc": "isrc", "year": "date"}
+        for key, name in names.items():
+            if key not in values:
+                continue
+            if values[key]:
+                audio[name] = [values[key]]
+            elif name in audio:
+                del audio[name]
+            changed.append(key)
+        if changed:
+            audio.save()
+    elif ext in (".m4a", ".mp4", ".aac"):
+        from mutagen.mp4 import MP4 as _MP4, MP4FreeForm
+        mp4 = _MP4(path)
+        if mp4.tags is None:
+            mp4.add_tags()
+        atoms = {"artist": "\xa9ART", "title": "\xa9nam", "album": "\xa9alb", "year": "\xa9day",
+                 "label": "----:com.apple.iTunes:LABEL", "isrc": "----:com.apple.iTunes:ISRC"}
+        for key, atom in atoms.items():
+            if key not in values:
+                continue
+            if values[key]:
+                if key in ("label", "isrc"):
+                    mp4.tags[atom] = [MP4FreeForm(values[key].encode("utf-8"))]
+                else:
+                    mp4.tags[atom] = [values[key]]
+            elif atom in mp4.tags:
+                del mp4.tags[atom]
+            changed.append(key)
+        if changed:
+            mp4.save()
+    return changed
+
+
+class LibraryTagIndex:
+    """Your library's songs by artist and title, so a DJ edit can borrow the album, label and year of the
+    normal copy. Songs that themselves have intro words in the title are left out. Tags are cached by file date."""
+
+    def __init__(self, reader=None, words=None):
+        self.reader = reader or read_licensing_tags
+        self.words = words
+        self.items = {}
+        self.cache = {}
+
+    @staticmethod
+    def key(artist, title, words=None):
+        return _normal(artist) + "|" + _normal(clean_title(title, words))
+
+    def cache_path(self):
+        return os.path.join(tag_backups_folder(), "library_tag_index.json")
+
+    def _load_cache(self):
+        try:
+            with open(self.cache_path(), "r", encoding="utf-8") as handle:
+                self.cache = json.load(handle)
+        except Exception:
+            self.cache = {}
+
+    def _save_cache(self):
+        try:
+            with open(self.cache_path(), "w", encoding="utf-8") as handle:
+                json.dump(self.cache, handle)
+        except Exception:
+            pass
+
+    def build(self, folder, should_stop=None, progress=None):
+        self._load_cache()
+        self.items = {}
+        count = 0
+        for root, _dirs, names in os.walk(folder):
+            for name in names:
+                if should_stop is not None and should_stop():
+                    self._save_cache()
+                    return count
+                if not name.lower().endswith(SUPPORTED_AUDIO):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                entry = self.cache.get(path)
+                if entry and entry[0] == mtime:
+                    tags = entry[1]
+                else:
+                    tags = self.reader(path)
+                    self.cache[path] = [mtime, tags]
+                self.add(path, tags)
+                count += 1
+                if progress is not None and count % 200 == 0:
+                    progress(count)
+        self._save_cache()
+        return count
+
+    def add(self, path, tags):
+        artist, title = tags.get("artist", ""), tags.get("title", "")
+        if not (artist and title):
+            return
+        if clean_title(title, self.words) != title or has_intro_words(title, self.words):
+            return                                     # a DJ edit is not the normal copy
+        self.items.setdefault(self.key(artist, title, self.words), []).append((path, tags))
+
+    def find(self, artist, title, exclude=None):
+        """The best matching normal copy: the one with the most licensing tags filled in. (path, tags) or None."""
+        matches = [(p, t) for p, t in self.items.get(self.key(artist, title, self.words), [])
+                   if not exclude or os.path.normcase(p) != os.path.normcase(exclude)]
+        if not matches:
+            return None
+        return max(matches, key=lambda pt: sum(1 for k in ("album", "label", "isrc", "year") if pt[1].get(k)))
+
+
+def plan_cleanup(paths, index=None, words=None, isrc_mode="blank", own_isrc="", use_musicbrainz=False,
+                 lookup=None, reader=None, should_stop=None, progress=None, only_with_intro_words=False):
+    """One entry per file: what is in it now, what it would become, and why. Reads only; changes nothing."""
+    reader = reader or read_licensing_tags
+    lookup = lookup or lookup_musicbrainz
+    own = normalize_isrc(own_isrc)
+    plan = []
+    network_errors = 0
+    for number, path in enumerate(paths, 1):
+        if should_stop is not None and should_stop():
+            break
+        current = {k: "" for k in TAGCLEAN_FIELDS}
+        current.update({k: v for k, v in reader(path).items() if k in current})
+        guess_artist, guess_title = title_from_filename(path)
+        title_source = current["title"] or guess_title
+        if only_with_intro_words and not (has_intro_words(title_source, words) or has_intro_words(os.path.basename(path), words)):
+            continue
+        new = dict(current)
+        notes = []
+        if not new["artist"] and guess_artist:
+            new["artist"] = clean_title(guess_artist, words)
+            notes.append("artist taken from the file name")
+        wanted_title = clean_title(title_source, words)
+        if not current["title"]:
+            notes.append("title taken from the file name")
+        if wanted_title != current["title"] and current["title"]:
+            notes.append("intro words removed from the title")
+        new["title"] = wanted_title
+        source = ""
+        hit = index.find(new["artist"], new["title"], exclude=path) if (index is not None and new["artist"]) else None
+        if hit is not None:
+            source = os.path.basename(hit[0])
+            copy = hit[1]
+            filled = []
+            for key in ("album", "label", "year"):
+                if copy.get(key) and (not new[key] or (key == "album" and has_intro_words(new[key], words))):
+                    new[key] = copy[key]
+                    filled.append(key)
+            if isrc_mode == "original" and copy.get("isrc"):
+                new["isrc"] = copy["isrc"]
+                filled.append("isrc")
+            if copy.get("artist") and _normal(copy["artist"]) == _normal(new["artist"]) and copy["artist"] != new["artist"]:
+                new["artist"] = copy["artist"]          # the library's spelling and capitals
+            if filled:
+                notes.append(f"{', '.join(filled)} from your library copy ({source})")
+        missing = [k for k in ("album", "label", "year") if not new[k]]
+        if isrc_mode == "original" and not new["isrc"]:
+            missing.append("isrc")
+        if use_musicbrainz and missing and new["artist"] and new["title"] and network_errors < 3:
+            try:
+                found = lookup(new["artist"], new["title"], "")
+            except Exception:
+                found = None
+                network_errors += 1
+            if found:
+                filled = []
+                for key in ("album", "label", "year"):
+                    if found.get(key) and not new[key]:
+                        new[key] = found[key]
+                        filled.append(key)
+                if isrc_mode == "original" and found.get("isrc") and not new["isrc"]:
+                    new["isrc"] = found["isrc"]
+                    filled.append("isrc")
+                if filled:
+                    notes.append(f"{', '.join(filled)} from MusicBrainz")
+        if isrc_mode == "own":
+            if own:
+                new["isrc"] = own
+                notes.append("ISRC typed by you")
+            elif own_isrc:
+                notes.append("the ISRC you typed is not a valid code, so the ISRC is unchanged")
+        changes = {k: (current[k], new[k]) for k in TAGCLEAN_FIELDS if current[k] != new[k]}
+        plan.append({"path": path, "current": current, "new": new, "changes": changes, "notes": notes,
+                     "approved": bool(changes), "library_copy": source})
+        if progress is not None and number % 25 == 0:
+            progress(number)
+    return plan
+
+
+def describe_plan_item(item):
+    name = os.path.basename(item["path"])
+    if not item["changes"]:
+        return f"{name}: nothing to change."
+    parts = []
+    for key in TAGCLEAN_FIELDS:
+        if key in item["changes"]:
+            before, after = item["changes"][key]
+            parts.append(f"{key} {('from ' + before + ' ') if before else ''}to {after if after else 'blank'}")
+    return f"{name}: " + "; ".join(parts) + ("." if not item["notes"] else ". " + "; ".join(item["notes"]) + ".")
+
+
+def apply_cleanup(items, busy=None, writer=None, backup_dir=None):
+    """Writes the approved items. The old tags are saved first. Returns (written, skipped, backup file)."""
+    writer = writer or set_tags
+    busy_paths = {os.path.normcase(p) for p in (busy() if callable(busy) else (busy or []))}
+    chosen = [i for i in items if i.get("approved") and i.get("changes")]
+    if not chosen:
+        return 0, [], ""
+    folder = backup_dir or tag_backups_folder()
+    os.makedirs(folder, exist_ok=True)
+    backup_path = os.path.join(folder, time.strftime("cleanup_%Y-%m-%d_%H%M%S.json"))
+    record = {"created": datetime.now().isoformat(timespec="seconds"), "files": []}
+    for item in chosen:
+        record["files"].append({"path": item["path"], "before": {k: v[0] for k, v in item["changes"].items()},
+                                "after": {k: v[1] for k, v in item["changes"].items()}})
+    with open(backup_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=1)
+    written = 0
+    skipped = []
+    done_paths = set()
+    for item in chosen:
+        if os.path.normcase(item["path"]) in busy_paths:
+            skipped.append((item["path"], "it is loaded on a deck"))
+            continue
+        try:
+            writer(item["path"], {k: v[1] for k, v in item["changes"].items()})
+            written += 1
+            done_paths.add(item["path"])
+            RUN_LOG.write("TAGCLEAN", f"{os.path.basename(item['path'])}: " + describe_plan_item(item).split(': ', 1)[-1])
+        except Exception as e:
+            skipped.append((item["path"], str(e) or type(e).__name__))
+    if len(done_paths) != len(record["files"]):
+        record["files"] = [f for f in record["files"] if f["path"] in done_paths]       # the backup lists only what was changed
+        with open(backup_path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=1)
+    return written, skipped, backup_path
+
+
+def list_backups(folder=None):
+    folder = folder or tag_backups_folder()
+    try:
+        names = sorted((n for n in os.listdir(folder) if n.startswith("cleanup_") and n.endswith(".json")), reverse=True)
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names]
+
+
+def restore_backup(backup_path, busy=None, writer=None):
+    """Puts the old tags back. Returns (restored, skipped)."""
+    writer = writer or set_tags
+    busy_paths = {os.path.normcase(p) for p in (busy() if callable(busy) else (busy or []))}
+    with open(backup_path, "r", encoding="utf-8") as handle:
+        record = json.load(handle)
+    restored = 0
+    skipped = []
+    for entry in record.get("files", []):
+        path = entry["path"]
+        if not os.path.isfile(path):
+            skipped.append((path, "the file is no longer there"))
+            continue
+        if os.path.normcase(path) in busy_paths:
+            skipped.append((path, "it is loaded on a deck"))
+            continue
+        try:
+            writer(path, dict(entry["before"]))
+            restored += 1
+            RUN_LOG.write("TAGCLEAN", f"{os.path.basename(path)}: tags restored from {os.path.basename(backup_path)}")
+        except Exception as e:
+            skipped.append((path, str(e) or type(e).__name__))
+    return restored, skipped
+
+
+class TagCleanWorker(QThread):
+    """Builds the plan on a background thread (reading many files can take a while)."""
+    progress = pyqtSignal(str)
+    done = pyqtSignal(object)
+
+    def __init__(self, paths, library_folder, options):
+        super().__init__()
+        self.paths = list(paths)
+        self.library_folder = library_folder
+        self.options = dict(options)
+        self.stop_flag = False
+
+    def cancel(self):
+        self.stop_flag = True
+
+    def run(self):
+        plan = []
+        try:
+            words = self.options.get("words")
+            index = None
+            if self.options.get("use_library") and self.library_folder and os.path.isdir(self.library_folder):
+                index = LibraryTagIndex(words=words)
+                self.progress.emit("Reading your library's tags (the first time can take a few minutes)...")
+                index.build(self.library_folder, should_stop=lambda: self.stop_flag,
+                            progress=lambda n: self.progress.emit(f"Read {n} library songs..."))
+            self.progress.emit("Working out the changes...")
+            plan = plan_cleanup(self.paths, index, words, self.options.get("isrc_mode", "blank"),
+                                self.options.get("own_isrc", ""), self.options.get("use_musicbrainz", False),
+                                should_stop=lambda: self.stop_flag,
+                                progress=lambda n: self.progress.emit(f"Checked {n} of {len(self.paths)} files..."),
+                                only_with_intro_words=self.options.get("only_intro", False))
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.done.emit(plan)
+
+
+class TagCleanDialog(QDialog):
+    """Preview of the changes, with a check box for each file. Nothing is written until Apply is pressed."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.settings = app.settings
+        self.plan = []
+        self.worker = None
+        self.setWindowTitle("Clean Up DJ Edit Tags")
+        self.resize(900, 650)
+        layout = QVBoxLayout()
+        intro = QLabel("Choose the DJ edit files (or a folder of them). The program shows what it would change. "
+                       "Check the files you approve, then press Apply. The old tags are saved so you can undo.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.words_edit = QLineEdit(", ".join(tagclean_words(self.settings)))
+        self.words_edit.setAccessibleName("Intro words to take out of titles, separated by commas")
+        form.addRow("Words to remove from titles (commas between):", self.words_edit)
+        self.library_check = QCheckBox("Take album, label and year from the normal copy in my music library")
+        self.library_check.setChecked(str(self.settings.value("tagclean_use_library", "true")).lower() == "true")
+        form.addRow(self.library_check)
+        self.mb_check = QCheckBox("Also look up what is still missing in MusicBrainz (needs the internet)")
+        self.mb_check.setChecked(str(self.settings.value("tagclean_use_musicbrainz", "false")).lower() == "true")
+        form.addRow(self.mb_check)
+        self.isrc_combo = QComboBox()
+        self.isrc_combo.setAccessibleName("What to do with the ISRC")
+        for mode in ISRC_MODES:
+            self.isrc_combo.addItem(ISRC_MODE_TEXT[mode], mode)
+        self.isrc_combo.setCurrentIndex(max(0, ISRC_MODES.index(str(self.settings.value("tagclean_isrc_mode", "blank")))
+                                            if str(self.settings.value("tagclean_isrc_mode", "blank")) in ISRC_MODES else 0))
+        form.addRow("ISRC:", self.isrc_combo)
+        self.isrc_edit = QLineEdit(str(self.settings.value("tagclean_own_isrc", "")))
+        self.isrc_edit.setAccessibleName("Your own ISRC, used only when 'Use an ISRC I type in' is chosen")
+        form.addRow("Your ISRC (for the choice above):", self.isrc_edit)
+        self.display_check = QCheckBox("Also hide intro words when showing titles, on screen and to listeners (the files are not changed)")
+        self.display_check.setChecked(str(self.settings.value("tagclean_display", "false")).lower() == "true")
+        form.addRow(self.display_check)
+        layout.addLayout(form)
+        note = QLabel("A DJ edit can be a different recording from the original, and who may assign it an ISRC is not "
+                      "something this program can check. That is why copying the original's ISRC is a choice, not the default.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        row = QHBoxLayout()
+        for text, slot in (("Choose Files...", self.choose_files), ("Choose Folder...", self.choose_folder),
+                           ("Scan Music Library for Intro Files", self.scan_library)):
+            button = QPushButton(text)
+            button.clicked.connect(lambda _c=False, f=slot: f())
+            row.addWidget(button)
+        layout.addLayout(row)
+        self.status = QLabel("Nothing scanned yet.")
+        self.status.setAccessibleName("Cleanup status")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Approve", "File", "Now", "Would become"])
+        self.table.setAccessibleName("Changes. Space checks or unchecks a file.")
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.itemChanged.connect(self.on_item_changed)
+        self.table.currentCellChanged.connect(lambda *_a: self.read_current())
+        layout.addWidget(self.table, 1)
+        self.detail = QLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setAccessibleName("Details of the selected file")
+        layout.addWidget(self.detail)
+        buttons = QHBoxLayout()
+        self.apply_button = QPushButton("Apply Checked Changes")
+        self.apply_button.clicked.connect(self.apply_clicked)
+        self.apply_button.setEnabled(False)
+        buttons.addWidget(self.apply_button)
+        undo = QPushButton("Undo the Last Cleanup")
+        undo.clicked.connect(self.undo_clicked)
+        buttons.addWidget(undo)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def options(self):
+        words = parse_word_list(self.words_edit.text()) or list(DEFAULT_INTRO_WORDS)
+        self.settings.setValue("tagclean_words", "\n".join(words))
+        self.settings.setValue("tagclean_use_library", "true" if self.library_check.isChecked() else "false")
+        self.settings.setValue("tagclean_use_musicbrainz", "true" if self.mb_check.isChecked() else "false")
+        self.settings.setValue("tagclean_isrc_mode", self.isrc_combo.currentData())
+        self.settings.setValue("tagclean_own_isrc", self.isrc_edit.text().strip())
+        self.settings.setValue("tagclean_display", "true" if self.display_check.isChecked() else "false")
+        set_display_clean(self.display_check.isChecked(), words)
+        return {"words": words, "use_library": self.library_check.isChecked(), "use_musicbrainz": self.mb_check.isChecked(),
+                "isrc_mode": self.isrc_combo.currentData() or "blank", "own_isrc": self.isrc_edit.text().strip()}
+
+    def choose_files(self):
+        start = self.settings.value("music_library_folder", "")
+        files, _ = QFileDialog.getOpenFileNames(self, "Choose DJ edit files", start,
+                                                "Audio (" + " ".join("*" + e for e in SUPPORTED_AUDIO) + ")")
+        if files:
+            self.start_scan(files)
+
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder of DJ edits", self.settings.value("music_library_folder", ""))
+        if folder:
+            self.start_scan(scan_audio_files(folder), only_intro=False)
+
+    def scan_library(self):
+        folder = self.settings.value("music_library_folder", "")
+        if not folder or not os.path.isdir(folder):
+            self.status.setText("Choose the music library folder in Settings, Folders, first.")
+            return
+        self.start_scan(scan_audio_files(folder), only_intro=True)
+
+    def start_scan(self, paths, only_intro=False):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        options = self.options()
+        options["only_intro"] = only_intro
+        busy = self.app.busy_track_paths() if hasattr(self.app, "busy_track_paths") else set()
+        paths = [p for p in paths if os.path.normcase(p) not in {os.path.normcase(b) for b in busy}]
+        self.status.setText(f"Looking at {len(paths)} files...")
+        self.worker = TagCleanWorker(paths, self.settings.value("music_library_folder", ""), options)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.done.connect(self.show_plan)
+        self.worker.start()
+
+    def show_plan(self, plan):
+        self.plan = [p for p in plan if p["changes"]]
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.plan))
+        for row, item in enumerate(self.plan):
+            check = QTableWidgetItem("")
+            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            check.setCheckState(Qt.CheckState.Checked if item["approved"] else Qt.CheckState.Unchecked)
+            check.setData(Qt.ItemDataRole.AccessibleTextRole, f"Approve {os.path.basename(item['path'])}")
+            self.table.setItem(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem(os.path.basename(item["path"])))
+            cur, new = item["current"], item["new"]
+            self.table.setItem(row, 2, QTableWidgetItem(f"{cur['artist']} - {cur['title']}"))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{new['artist']} - {new['title']}"
+                                                         + (f" ({new['album']})" if new['album'] else "")))
+        self.table.blockSignals(False)
+        self.apply_button.setEnabled(bool(self.plan))
+        skipped = len(plan) - len(self.plan)
+        self.status.setText(f"{len(self.plan)} file(s) would change" + (f", {skipped} need nothing." if skipped else "."))
+        if self.plan:
+            self.table.setCurrentCell(0, 1)
+            self.table.setFocus()
+        self.read_current()
+
+    def on_item_changed(self, item):
+        if item.column() == 0 and 0 <= item.row() < len(self.plan):
+            self.plan[item.row()]["approved"] = item.checkState() == Qt.CheckState.Checked
+
+    def read_current(self):
+        row = self.table.currentRow()
+        if 0 <= row < len(self.plan):
+            text = describe_plan_item(self.plan[row])
+            self.detail.setText(text)
+            self.detail.setAccessibleName(text)
+
+    def apply_clicked(self):
+        chosen = [i for i in self.plan if i["approved"]]
+        if not chosen:
+            self.status.setText("No files are checked.")
+            return
+        busy = self.app.busy_track_paths() if hasattr(self.app, "busy_track_paths") else set()
+        written, skipped, backup = apply_cleanup(chosen, busy)
+        text = f"Retagged {written} file(s). The old tags are saved in {os.path.basename(backup)}."
+        if skipped:
+            text += f" {len(skipped)} skipped: " + "; ".join(f"{os.path.basename(p)} ({why})" for p, why in skipped[:5])
+        self.status.setText(text)
+        self.app.announce(text)
+        self.apply_button.setEnabled(False)
+
+    def undo_clicked(self):
+        backups = list_backups()
+        if not backups:
+            self.status.setText("There is no cleanup to undo.")
+            return
+        latest = backups[0]
+        answer = QMessageBox.question(self, "Undo the last cleanup", f"Put back the tags saved in {os.path.basename(latest)}?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        busy = self.app.busy_track_paths() if hasattr(self.app, "busy_track_paths") else set()
+        restored, skipped = restore_backup(latest, busy)
+        try:
+            os.replace(latest, latest + ".undone")
+        except OSError:
+            pass
+        text = f"Restored the old tags of {restored} file(s)." + (f" {len(skipped)} skipped." if skipped else "")
+        self.status.setText(text)
+        self.app.announce(text)
+
+
+def tagclean_words(settings):
+    saved = parse_word_list(settings.value("tagclean_words", ""))
+    return saved or list(DEFAULT_INTRO_WORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -11019,7 +12922,7 @@ class VTAccounts:
                 return item
         return None
 
-    def add(self, user, password, allowed_ip="", enabled=True, keep_password=False, live=None):
+    def add(self, user, password, allowed_ip="", enabled=True, keep_password=False, live=None, shows=None):
         user = (user or "").strip()
         if not user or any(c in user for c in "|\n\r\t"):
             return "Type a user name without spaces at the ends or the | character."
@@ -11029,6 +12932,8 @@ class VTAccounts:
             existing["enabled"] = bool(enabled)
             if live is not None:
                 existing["live"] = bool(live)
+            if shows is not None:
+                existing["shows"] = bool(shows)
             self.save()
             return ""
         if len(password or "") < 8:
@@ -11036,7 +12941,8 @@ class VTAccounts:
         salt = secrets.token_hex(16)
         entry = {"user": user, "salt": salt, "rounds": VT_PBKDF2_ROUNDS, "key": vt_derive_key(password, salt),
                  "ip": (allowed_ip or "").strip(), "enabled": bool(enabled),
-                 "live": bool(live) if live is not None else bool(existing.get("live")) if existing else False}
+                 "live": bool(live) if live is not None else bool(existing.get("live")) if existing else False,
+                 "shows": bool(shows) if shows is not None else bool(existing.get("shows")) if existing else False}
         if existing is not None:
             self.items[self.items.index(existing)] = entry
         else:
@@ -11490,6 +13396,18 @@ class VTServer:
                 self.log(f"Voice tracker {user} removed a clip from {day} hour {hour}, position {index}.")
                 self.activity(f"{user} removed a clip from {day} {hour:02d}:00")
                 return {"ok": True, **result}, b""
+            if cmd.startswith("show_"):
+                account = self.accounts.find(user)
+                shows = getattr(service, "shows", None)
+                if shows is None or not (account and account.get("shows")):
+                    return {"ok": False, "error": "This account may not send mix shows to the station."}, b""
+                if cmd in ("show_begin", "show_put", "show_commit") and not self.uploads.acquire(blocking=False):
+                    return {"ok": False, "error": "The station is receiving other files. Try again in a moment."}, b""
+                try:
+                    return shows.command(user, cmd, header, body)
+                finally:
+                    if cmd in ("show_begin", "show_put", "show_commit"):
+                        self.uploads.release()
             return {"ok": False, "error": "Unknown command."}, b""
         except (ValueError, KeyError) as e:
             return {"ok": False, "error": str(e) or "Bad request."}, b""
@@ -11520,7 +13438,9 @@ class VTClient:
         vt_send(self.sock, header, body)
         reply, out = vt_recv(self.sock, VT_MAX_CLIP_BYTES)
         if not reply.get("ok"):
-            raise RuntimeError(reply.get("error", "The station refused that."))
+            error = RuntimeError(reply.get("error", "The station refused that."))
+            error.reply = reply
+            raise error
         return reply
 
     def status(self):
@@ -11559,6 +13479,527 @@ class VTClient:
             self.sock.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Finished mix shows: sent from the home PC to the station and aired there.
+#
+# The home PC builds each hour's mix as a few audio parts that end exactly on the station's break marks, plus a
+# manifest listing every song. It sends them over the same private connection remote voice tracking uses (user name
+# and password, normally over Tailscale). The upload is in small pieces, so a dropped connection carries on where it
+# stopped, and the station checks every file against a checksum before it will use the show. A show is aired only
+# when every part has arrived complete and verified; otherwise the station plays its normal rotation and says why.
+# The station chooses the file names and keeps only audio files.
+# ---------------------------------------------------------------------------
+
+SHOW_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
+SHOW_FILE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}\.(mp3|wav|flac|ogg|m4a|aac)$", re.IGNORECASE)
+SHOW_MAX_PARTS = 8
+SHOW_MAX_PART_BYTES = 400 * 1024 * 1024
+SHOW_MAX_SHOW_BYTES = 1024 * 1024 * 1024
+SHOW_CHUNK_BYTES = 1024 * 1024
+SHOW_MANIFEST_VERSION = 1
+SHOW_FILE_PREFIX = "voicetrack_mix_"          # keeps a part from being taken for a song by the rest of the program
+
+
+def file_sha256(path, block=1 << 20):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(block)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def station_part_name(show_id, index, client_name):
+    """The station names every file itself; the sender's name only says which part it is."""
+    return f"{SHOW_FILE_PREFIX}{show_id}_p{index + 1}{os.path.splitext(client_name)[1].lower()}"
+
+
+def clean_show_id(text):
+    return re.sub(r"[^A-Za-z0-9_\-]+", "_", str(text or "")).strip("_")[:80]
+
+
+def validate_manifest(manifest):
+    """Returns '' when the manifest is safe to accept, otherwise the reason it is not."""
+    if not isinstance(manifest, dict) or manifest.get("version") != SHOW_MANIFEST_VERSION:
+        return "This is not a mix show this version understands."
+    try:
+        datetime.strptime(str(manifest.get("day", "")), "%Y-%m-%d")
+        hour = int(manifest.get("hour"))
+    except Exception:
+        return "The show does not say which day and hour it is for."
+    if not (0 <= hour <= 23):
+        return "The hour is not valid."
+    parts = manifest.get("parts")
+    if not isinstance(parts, list) or not parts or len(parts) > SHOW_MAX_PARTS:
+        return "The show has no parts, or too many."
+    total = 0
+    names = set()
+    for part in parts:
+        if not isinstance(part, dict):
+            return "A part is not described properly."
+        name = str(part.get("file", ""))
+        if not SHOW_FILE_RE.match(name) or name in names:
+            return f"'{name}' is not an allowed audio file name."
+        names.add(name)
+        try:
+            size = int(part["bytes"])
+            start = float(part["start_offset"])
+            seconds = float(part["seconds"])
+        except Exception:
+            return f"Part {name} is missing its size or timing."
+        if not (0 < size <= SHOW_MAX_PART_BYTES) or not (0 <= start < 3600) or not (1 <= seconds <= 3600):
+            return f"Part {name} has a size or time that is not allowed."
+        if not re.match(r"^[0-9a-f]{64}$", str(part.get("sha256", ""))):
+            return f"Part {name} has no checksum."
+        total += size
+    if total > SHOW_MAX_SHOW_BYTES:
+        return "The show is bigger than the station accepts."
+    return ""
+
+
+class ShowStore:
+    """The station's folder of received shows: <Shows>/<person>/<show id>/ holding manifest.json, state.json and the parts."""
+
+    def __init__(self, root=None, free_bytes=None, reserve_bytes=2 * 1024 ** 3):
+        self.root = root or get_data_folder("Shows")
+        self.free_bytes = free_bytes or (lambda folder: shutil.disk_usage(folder).free)
+        self.reserve_bytes = reserve_bytes
+        self.lock = threading.RLock()
+
+    # --- paths and small files
+    def folder(self, user, show_id):
+        who = "u" + user.strip().lower().encode("utf-8").hex()
+        return os.path.join(self.root, who, show_id)
+
+    def _read(self, path, default):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return default
+
+    def _write(self, path, data):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=1)
+        os.replace(tmp, path)
+
+    def target(self, user, show_id, manifest, part):
+        """Where a part is stored on the station."""
+        return os.path.join(self.folder(user, show_id), station_part_name(show_id, manifest["parts"].index(part), part["file"]))
+
+    def manifest(self, user, show_id):
+        return self._read(os.path.join(self.folder(user, show_id), "manifest.json"), None)
+
+    def state(self, user, show_id):
+        return self._read(os.path.join(self.folder(user, show_id), "state.json"), None)
+
+    def _save_state(self, user, show_id, state):
+        self._write(os.path.join(self.folder(user, show_id), "state.json"), state)
+
+    # --- receiving
+    def begin(self, user, show_id, manifest):
+        """Starts (or resumes) receiving a show. Returns {'have': {file: bytes already here}}."""
+        if not SHOW_ID_RE.match(show_id or ""):
+            raise ValueError("The show name is not allowed.")
+        problem = validate_manifest(manifest)
+        if problem:
+            raise ValueError(problem)
+        with self.lock:
+            folder = self.folder(user, show_id)
+            old = self.manifest(user, show_id)
+            state = self.state(user, show_id)
+            if old is not None and state and state.get("status") == "aired":
+                raise ValueError("That show has already aired. Use a new name to send it again.")
+            same = old is not None and [(p["file"], p["sha256"]) for p in old["parts"]] == [(p["file"], p["sha256"]) for p in manifest["parts"]]
+            if old is not None and not same:
+                shutil.rmtree(folder, ignore_errors=True)              # a changed show starts over
+                old = None
+            os.makedirs(folder, exist_ok=True)
+            have = {}
+            for part in manifest["parts"]:
+                path = self.target(user, show_id, manifest, part)
+                have[part["file"]] = os.path.getsize(path) if os.path.isfile(path) else 0
+            need = sum(max(0, int(p["bytes"]) - have[p["file"]]) for p in manifest["parts"])
+            if need and self.free_bytes(self.root) < need * 1.2 + self.reserve_bytes:
+                raise ValueError("The station does not have enough free disk space for this show.")
+            self._write(os.path.join(folder, "manifest.json"), manifest)
+            state = state if (same and state) else {}
+            state.update({"status": "receiving" if state.get("status") != "verified" else "verified",
+                          "user": user, "show_id": show_id, "day": manifest["day"], "hour": int(manifest["hour"]),
+                          "created": state.get("created") or datetime.now().isoformat(timespec="seconds"),
+                          "problems": state.get("problems", [])})
+            self._save_state(user, show_id, state)
+            return {"have": have}
+
+    def put(self, user, show_id, file, offset, data):
+        if not SHOW_ID_RE.match(show_id or "") or not SHOW_FILE_RE.match(file or ""):
+            raise ValueError("That file name is not allowed.")
+        with self.lock:
+            manifest = self.manifest(user, show_id)
+            if manifest is None:
+                raise ValueError("Start the show first.")
+            part = next((p for p in manifest["parts"] if p["file"] == file), None)
+            if part is None:
+                raise ValueError("That file is not part of the show.")
+            path = self.target(user, show_id, manifest, part)
+            size = os.path.getsize(path) if os.path.isfile(path) else 0
+            if int(offset) != size:
+                raise ValueError(f"RESUME {size}")
+            if size + len(data) > int(part["bytes"]):
+                raise ValueError("That file is bigger than the show said.")
+            with open(path, "ab") as handle:
+                handle.write(data)
+            return size + len(data)
+
+    def commit(self, user, show_id):
+        """Checks every file against its size and checksum. The show becomes 'verified' only if all are right."""
+        with self.lock:
+            manifest = self.manifest(user, show_id)
+            if manifest is None:
+                raise ValueError("That show is not on the station.")
+            folder = self.folder(user, show_id)
+            problems = []
+            for part in manifest["parts"]:
+                path = self.target(user, show_id, manifest, part)
+                if not os.path.isfile(path):
+                    problems.append(f"{part['file']} has not arrived.")
+                elif os.path.getsize(path) != int(part["bytes"]):
+                    problems.append(f"{part['file']} is incomplete ({os.path.getsize(path)} of {part['bytes']} bytes).")
+                elif file_sha256(path) != part["sha256"]:
+                    problems.append(f"{part['file']} did not match its checksum and was thrown away.")
+                    os.remove(path)
+            state = self.state(user, show_id) or {}
+            state["problems"] = problems
+            state["status"] = "verified" if not problems else "receiving"
+            if not problems:
+                state["verified_at"] = datetime.now().isoformat(timespec="seconds")
+            self._save_state(user, show_id, state)
+            return state
+
+    # --- looking at what is there
+    def list_shows(self, user=None):
+        out = []
+        with self.lock:
+            try:
+                people = sorted(os.listdir(self.root))
+            except OSError:
+                return out
+            for who in people:
+                base = os.path.join(self.root, who)
+                if not os.path.isdir(base):
+                    continue
+                if user is not None and who != "u" + user.strip().lower().encode("utf-8").hex():
+                    continue
+                for show_id in sorted(os.listdir(base)):
+                    state = self._read(os.path.join(base, show_id, "state.json"), None)
+                    manifest = self._read(os.path.join(base, show_id, "manifest.json"), None)
+                    if not state or not manifest:
+                        continue
+                    have = sum(1 for i, p in enumerate(manifest["parts"])
+                               if os.path.isfile(os.path.join(base, show_id, station_part_name(show_id, i, p["file"])))
+                               and os.path.getsize(os.path.join(base, show_id, station_part_name(show_id, i, p["file"]))) == int(p["bytes"]))
+                    out.append({"show_id": show_id, "user": state.get("user", ""), "day": manifest["day"], "hour": int(manifest["hour"]),
+                                "status": state.get("status", "receiving"), "parts": len(manifest["parts"]), "parts_here": have,
+                                "problems": list(state.get("problems", [])), "name": manifest.get("name", show_id),
+                                "commercial_free": bool(manifest.get("commercial_free")),
+                                "bytes": sum(int(p["bytes"]) for p in manifest["parts"]),
+                                "first_start": min(float(p["start_offset"]) for p in manifest["parts"]),
+                                "verified_at": state.get("verified_at", ""), "aired_at": state.get("aired_at", ""),
+                                "note": state.get("note", "")})
+        return out
+
+    def show_for_hour(self, day, hour):
+        """The verified show for that hour (newest first if several), as (user, show id, manifest, state), or None."""
+        candidates = [s for s in self.list_shows() if s["day"] == day.isoformat() and s["hour"] == int(hour) and s["status"] in ("verified", "aired")]
+        candidates.sort(key=lambda s: s.get("verified_at", ""), reverse=True)
+        for s in candidates:
+            manifest = self.manifest(s["user"], s["show_id"])
+            state = self.state(s["user"], s["show_id"])
+            if manifest and state:
+                return s["user"], s["show_id"], manifest, state
+        return None
+
+    def part_paths(self, user, show_id, manifest):
+        return [self.target(user, show_id, manifest, p) for p in manifest["parts"]]
+
+    def parts_intact(self, user, show_id, manifest):
+        for path, part in zip(self.part_paths(user, show_id, manifest), manifest["parts"]):
+            if not (os.path.isfile(path) and os.path.getsize(path) == int(part["bytes"])):
+                return False
+        return True
+
+    def note(self, user, show_id, **fields):
+        with self.lock:
+            state = self.state(user, show_id)
+            if state is None:
+                return
+            state.update(fields)
+            self._save_state(user, show_id, state)
+
+    def delete(self, user, show_id):
+        if not SHOW_ID_RE.match(show_id or ""):
+            raise ValueError("The show name is not allowed.")
+        with self.lock:
+            shutil.rmtree(self.folder(user, show_id), ignore_errors=True)
+
+    def clean_old(self, keep_days=0, now=None):
+        """Removes shows that have aired (keep_days after airing; 0 means as soon as they are over) and shows that never
+        arrived complete (two days after their day)."""
+        now = now or datetime.now()
+        removed = 0
+        for s in self.list_shows():
+            try:
+                day = datetime.strptime(s["day"], "%Y-%m-%d")
+            except Exception:
+                continue
+            drop = False
+            if s["status"] == "aired" and s["aired_at"]:
+                aired = datetime.fromisoformat(s["aired_at"])
+                drop = now - aired > timedelta(hours=2, days=max(0, keep_days))
+            elif now - (day + timedelta(hours=s["hour"] + 2)) > timedelta(days=2 + max(0, keep_days)):
+                drop = True
+            if drop:
+                self.delete(s["user"], s["show_id"])
+                removed += 1
+        return removed
+
+    def kept_bytes(self):
+        return sum(s["bytes"] for s in self.list_shows())
+
+
+def show_status_sentence(entry, now=None, warn_minutes=120):
+    """One plain sentence about a show on the station, with a warning when it is late."""
+    now = now or datetime.now()
+    day = datetime.strptime(entry["day"], "%Y-%m-%d").date()
+    when = f"{day.strftime('%A %B')} {day.day} at {int(entry['hour']) % 24:02d}00"
+    due = datetime(day.year, day.month, day.day, int(entry["hour"])) + timedelta(seconds=entry.get("first_start", 0))
+    minutes = (due - now).total_seconds() / 60.0
+    status = entry["status"]
+    if status == "aired":
+        return f"{entry['name']} ({when}): aired."
+    if status == "verified":
+        if minutes < -1:
+            return f"{entry['name']} ({when}): verified at the station, but its time has already passed."
+        return f"{entry['name']} ({when}): received and verified, scheduled to air at {due.strftime('%I:%M %p').lstrip('0')}."
+    text = f"{entry['name']} ({when}): still arriving, {entry['parts_here']} of {entry['parts']} files are complete."
+    if entry["problems"]:
+        text += " " + " ".join(entry["problems"][:2])
+    if minutes < 0:
+        text += " It is too late: the station played its normal rotation."
+    elif minutes < warn_minutes:
+        text += f" WARNING: it is due in {int(minutes)} minutes and is not complete. If it is not complete in time, the station plays normal rotation."
+    return text
+
+
+# --- the station's side of the connection ------------------------------------------------------------------
+class ShowService:
+    """What a connected person may do with shows. Runs on the connection's own thread (it only handles files); the
+    screen is told through `on_verified` on the screen's thread."""
+
+    def __init__(self, store, on_verified=None, run_on_gui=None, log=None):
+        self.store = store
+        self.on_verified = on_verified
+        self.run_on_gui = run_on_gui
+        self.log = log or (lambda text: None)
+
+    def command(self, user, cmd, header, body):
+        sid = str(header.get("show_id", ""))
+        if cmd == "show_begin":
+            try:
+                manifest = json.loads(body.decode("utf-8")) if body else header.get("manifest")
+            except Exception:
+                raise ValueError("The show description could not be read.")
+            reply = self.store.begin(user, sid, manifest)
+            self.log(f"{user} is sending the show {sid} ({len(manifest['parts'])} parts).")
+            return {"ok": True, **reply}, b""
+        if cmd == "show_put":
+            try:
+                size = self.store.put(user, sid, str(header.get("file", "")), int(header.get("offset", 0)), body)
+            except ValueError as e:
+                text = str(e)
+                if text.startswith("RESUME "):
+                    return {"ok": False, "resume": int(text.split()[1]), "error": "Resume from the offset given."}, b""
+                raise
+            return {"ok": True, "received": size}, b""
+        if cmd == "show_commit":
+            state = self.store.commit(user, sid)
+            if state["status"] == "verified":
+                self.log(f"The show {sid} from {user} arrived complete and was verified.")
+                if self.on_verified is not None:
+                    manifest = self.store.manifest(user, sid)
+                    day = datetime.strptime(manifest["day"], "%Y-%m-%d").date()
+                    hour = int(manifest["hour"])
+                    try:
+                        if self.run_on_gui is not None:
+                            self.run_on_gui(lambda: self.on_verified(user, sid, day, hour))
+                        else:
+                            self.on_verified(user, sid, day, hour)
+                    except Exception as e:
+                        self.log(f"After verifying {sid}: {e}")
+            else:
+                self.log(f"The show {sid} from {user} is not complete: " + " ".join(state["problems"][:2]))
+            return {"ok": True, "status": state["status"], "problems": state["problems"]}, b""
+        if cmd == "show_status":
+            return {"ok": True, "shows": self.store.list_shows(user)}, b""
+        if cmd == "show_delete":
+            self.store.delete(user, sid)
+            self.log(f"{user} removed the show {sid}.")
+            return {"ok": True}, b""
+        raise ValueError("Unknown command.")
+
+
+# --- the home PC's side ------------------------------------------------------------------------------------
+def upload_show(connect, package_dir, manifest, show_id, progress=None, should_stop=None, attempts=4, chunk=SHOW_CHUNK_BYTES, sleep=time.sleep):
+    """Sends a built show. `connect()` returns a connected VTClient. A dropped connection is retried and carries on
+    from what the station already has. Returns the station's final answer ('verified' or what is wrong)."""
+    body = json.dumps(manifest).encode("utf-8")
+    total = sum(int(p["bytes"]) for p in manifest["parts"])
+    last_error = None
+    for attempt in range(attempts):
+        client = None
+        try:
+            client = connect()
+            reply = client.ask({"cmd": "show_begin", "show_id": show_id}, body)
+            have = dict(reply.get("have", {}))
+            sent = sum(have.values())
+            for part in manifest["parts"]:
+                path = os.path.join(package_dir, part["file"])
+                offset = int(have.get(part["file"], 0))
+                with open(path, "rb") as handle:
+                    handle.seek(offset)
+                    while offset < int(part["bytes"]):
+                        if should_stop is not None and should_stop():
+                            raise InterruptedError("Stopped.")
+                        data = handle.read(chunk)
+                        if not data:
+                            break
+                        try:
+                            answer = client.ask({"cmd": "show_put", "show_id": show_id, "file": part["file"], "offset": offset}, data)
+                        except RuntimeError as e:
+                            where = getattr(e, "reply", {}).get("resume")
+                            if where is None:
+                                raise
+                            offset = int(where)                 # the station is somewhere else than we thought: carry on from there
+                            handle.seek(offset)
+                            continue
+                        offset = int(answer["received"])
+                        sent += len(data)
+                        if progress is not None:
+                            progress(min(sent, total), total)
+            result = client.ask({"cmd": "show_commit", "show_id": show_id})
+            return result
+        except InterruptedError:
+            raise
+        except (OSError, ConnectionError, ValueError, struct.error, json.JSONDecodeError) as e:
+            last_error = e
+            sleep(min(30, 2 ** attempt))
+        finally:
+            if client is not None:
+                client.close()
+    raise ConnectionError("The show could not be sent: " + (str(last_error) or "the connection kept dropping") + ". Press Send again to carry on.")
+
+
+# --- how a verified show is put into an hour -------------------------------------------------------------
+def entry_start_offsets(entries, break_estimate=90.0, duration=None):
+    """When each entry of an hour playlist would start, in seconds from the top of the hour, counting a break
+    after each quarter-hour mark the way the engine estimates them. Markers have no length."""
+    duration = duration or get_track_duration
+    clock = 0.0
+    next_mark = 900.0
+    starts = []
+    for entry in entries:
+        if is_hour_marker(entry):
+            starts.append(clock)
+            continue
+        starts.append(clock)
+        clock += duration(entry)
+        while clock >= next_mark:
+            clock += break_estimate
+            next_mark += 900.0
+    return starts
+
+
+def apply_show_to_entries(entries, manifest, part_paths, break_estimate=90.0, duration=None, leeway=20.0):
+    """Puts the show's parts into an hour playlist. Songs that would start before the first part stay; the show's
+    parts follow; songs that would start after the show's planned end stay after them. Returns the new list."""
+    if not part_paths:
+        return list(entries)
+    starts = entry_start_offsets(entries, break_estimate, duration)
+    first = min(float(p["start_offset"]) for p in manifest["parts"])
+    last_end = max(float(p["start_offset"]) + float(p["seconds"]) for p in manifest["parts"])
+    head, tail = [], []
+    for entry, start in zip(entries, starts):
+        if is_hour_marker(entry) and not is_voice_marker(entry):
+            if not head:
+                head.append(entry)
+            continue
+        if is_voice_marker(entry):
+            continue
+        if start + leeway < first:
+            head.append(entry)
+        elif start >= last_end - leeway:
+            tail.append(entry)
+    return head + list(part_paths) + tail
+
+
+def mix_song_path(show_id, number):
+    return f"mixsong:{show_id}:{number}"
+
+
+def manifest_song_list(manifest):
+    """Every song of the show in air order: [(part index, part file, song dict)]."""
+    out = []
+    for index, part in enumerate(manifest["parts"]):
+        for song in part.get("songs", []):
+            out.append((index, part["file"], song))
+    return out
+
+
+def check_show_against_rules(manifest, show_id, rules, history, now=None):
+    """The programming rules (Live365's limits) are never relaxed for a mix: every song is checked in order,
+    against what has played and against the earlier songs of the show. Returns '' or the first problem found."""
+    if rules is None or not rules.enabled:
+        return ""
+    planned = []
+    for number, (_i, _f, song) in enumerate(manifest_song_list(manifest), 1):
+        path = mix_song_path(show_id, number)
+        register_pseudo_song(path, song)
+        problem = rules.check(path, history, planned)
+        if problem:
+            return f"'{song.get('title', 'a song')}' by {song.get('artist', 'unknown')}: {problem}"
+        planned.append(path)
+    return ""
+
+
+class ShowAirTracker:
+    """Watches the part on air and tells the station each song as it comes in, so each song is logged on its own."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.current_file = None
+        self.logged = set()
+
+    def songs_due(self, part_file, elapsed, songs):
+        """The (number, song) pairs of this part that have come in by `elapsed` seconds and were not announced yet."""
+        if part_file != self.current_file:
+            self.current_file = part_file
+            self.logged = set()
+        due = []
+        for number, song in enumerate(songs):
+            if number in self.logged:
+                continue
+            if elapsed + 0.3 >= float(song.get("start", 0.0)):
+                self.logged.add(number)
+                due.append((number, song))
+        # only the newest matters if several came due at once (a seek), but all are logged
+        return due
 
 
 
@@ -13153,6 +15594,989 @@ class StationLauncher(QWidget):
             event.accept()
 
 
+# ---------------------------------------------------------------------------
+# Mix Blocks screen: pick the songs for an hour's mix, record the talk breaks, see the plan, build it, send it to the
+# station. Everything here is off until "Use mix blocks" is switched on in Settings, Mix Blocks.
+# ---------------------------------------------------------------------------
+
+MIX_NORMAL_BREAK_SECONDS = 90
+MIX_IDS_BREAK_SECONDS = 25
+
+
+def mixes_folder():
+    return get_data_folder("Mixes")
+
+
+def new_project(day=None, hour=5, name="", mode="each"):
+    day = day or (datetime.now().date() + timedelta(days=1))
+    project = {"version": 1, "name": name or f"{hour:02d}00 mix", "day": day.isoformat(), "hour": int(hour), "mode": mode,
+               "start_minute": 20, "marks": [30, 45], "end_minute": 47, "latest_minute": 50,
+               "break_seconds": MIX_NORMAL_BREAK_SECONDS, "ids_break_seconds": MIX_IDS_BREAK_SECONDS, "items": []}
+    return project
+
+
+def project_id(project):
+    return f"{project['day'].replace('-', '')}_{int(project['hour']):02d}_{clean_show_id(project['name']) or 'mix'}"[:70]
+
+
+def project_folder(project):
+    folder = os.path.join(mixes_folder(), project_id(project))
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def save_project(project):
+    path = os.path.join(project_folder(project), "project.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(project, handle, indent=1)
+    return path
+
+
+def list_projects():
+    out = []
+    try:
+        for name in sorted(os.listdir(mixes_folder()), reverse=True):
+            path = os.path.join(mixes_folder(), name, "project.json")
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        out.append((path, json.load(handle)))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def project_parts(project):
+    """The parts a mix is cut into: [{'name','start_clock' (seconds into the hour),'target','latest'}]. Each part ends on a
+    break mark; the break that follows is counted at its usual length (a commercial-free hour's is short)."""
+    full = project.get("mode") == "full"
+    start = 0 if full else int(project.get("start_minute", 20))
+    marks = [15, 30, 45] if full else sorted(int(m) for m in project.get("marks", [30, 45]))
+    end = 60 if full else int(project.get("end_minute", 47))
+    latest = 60 if full else int(project.get("latest_minute", 50))
+    brk = float(project.get("ids_break_seconds", MIX_IDS_BREAK_SECONDS) if full else project.get("break_seconds", MIX_NORMAL_BREAK_SECONDS))
+    parts = []
+    t = start * 60.0
+    for mark in marks:
+        if mark * 60 <= t + 30 or mark >= end:
+            continue
+        parts.append({"name": f"Part {len(parts) + 1}", "start_clock": t, "target": mark * 60.0 - t, "latest": mark * 60.0 - t})
+        t = mark * 60.0 + brk
+    if end * 60.0 - t >= 45:
+        parts.append({"name": f"Part {len(parts) + 1}", "start_clock": t, "target": end * 60.0 - t, "latest": max(end, latest) * 60.0 - t})
+    elif not parts:
+        parts.append({"name": "Part 1", "start_clock": t, "target": max(60.0, end * 60.0 - t), "latest": max(end, latest) * 60.0 - t})
+    return parts
+
+
+def mix_clock_text(seconds_into_hour, hour):
+    total = int(round(seconds_into_hour))
+    h = (hour + total // 3600) % 24
+    m, s = divmod(total % 3600, 60)
+    suffix = "AM" if h < 12 else "PM"
+    return f"{(h % 12) or 12}:{m:02d}:{s:02d} {suffix}"
+
+
+def project_plan_items(project, song_for):
+    """Turns the project's list into what plan_block wants. song_for(path) returns make_song(...)."""
+    items = []
+    for entry in project.get("items", []):
+        song = song_for(entry["path"])
+        item = {"song": song, "talk": None, "exit": entry.get("exit"), "transition": entry.get("transition", "auto"),
+                "loop_bars": entry.get("loop_bars"), "start_bar": entry.get("start_bar", 0)}
+        talk = entry.get("talk")
+        if talk and os.path.isfile(talk.get("path", "")):
+            item["talk"] = {"seconds": float(talk["seconds"]), "path": talk["path"]}
+        items.append(item)
+    return items
+
+
+def rules_problems(project, rules, history=None):
+    """Checks the songs of the mix, in order, against the programming rules. Returns [(song number, text)]."""
+    if rules is None or not rules.enabled:
+        return []
+
+    class H:
+        last_played_track = {}
+    problems = []
+    planned = []
+    for number, entry in enumerate(project.get("items", []), 1):
+        reason = rules.check(entry["path"], history or H(), planned)
+        if reason:
+            problems.append((number, reason))
+        planned.append(entry["path"])
+    return problems
+
+
+def build_package(project, plan, opts, song_for, progress=None, should_stop=None, decode=None):
+    """Renders every part to an audio file in the project's package folder and writes the manifest. Returns the manifest."""
+    folder = os.path.join(project_folder(project), "package")
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder, exist_ok=True)
+    show_id = project_id(project)
+    voice_cache = {}
+
+    def voice_loader(path):
+        if path not in voice_cache:
+            voice_cache[path] = _voice_prepare(path, opts)
+        return voice_cache[path]
+
+    manifest = {"version": SHOW_MANIFEST_VERSION, "name": project["name"], "day": project["day"], "hour": int(project["hour"]),
+                "mode": project.get("mode", "each"), "commercial_free": project.get("mode") == "full", "parts": [],
+                "built": datetime.now().isoformat(timespec="seconds"), "notes": []}
+    specs = project_parts(project)
+    for number, part in enumerate(plan["parts"]):
+        if should_stop is not None and should_stop():
+            raise InterruptedError("Stopped.")
+        if not part["songs"]:
+            continue
+        spec = specs[number] if number < len(specs) else {"start_clock": 0.0}
+        name = f"{show_id}_p{number + 1}.mp3"
+        path = os.path.join(folder, name)
+        base = number
+
+        def part_progress(i, n, title, base=base):
+            if progress is not None:
+                progress(f"Part {base + 1}: mixing song {i + 1} of {n}: {title}")
+        kwargs = {"decode": decode} if decode is not None else {}
+        audio, notes = render_part(part, opts, voice_loader=voice_loader, progress=part_progress, **kwargs)
+        if progress is not None:
+            progress(f"Part {number + 1}: saving the audio file...")
+        if not write_audio_file(path, audio):
+            # MP3 encoding is not available here: keep the part uncompressed instead (bigger, but nothing is lost).
+            name = f"{show_id}_p{number + 1}.wav"
+            path = os.path.join(folder, name)
+            if not write_audio_file(path, audio):
+                raise RuntimeError(f"Part {number + 1} could not be saved.")
+            manifest["notes"].append(f"Part {number + 1} was saved uncompressed because MP3 encoding was not available.")
+        songs = []
+        for rec in part["songs"]:
+            s = rec["song"]
+            songs.append({"artist": s["artist"], "title": s["title"], "album": s["album"], "isrc": s["isrc"], "label": s["label"],
+                          "start": round(rec["t_start"], 2), "end": round(rec["t_end"], 2)})
+        manifest["parts"].append({"file": name, "bytes": os.path.getsize(path), "sha256": file_sha256(path),
+                                  "seconds": round(len(audio) / float(MIX_SR), 2), "start_offset": float(spec["start_clock"]),
+                                  "target": round(part["target"], 2), "off": round(part["off"], 2), "songs": songs, "notes": notes})
+        manifest["notes"].extend(notes)
+    with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=1)
+    return manifest
+
+
+# --- Auto Mix: for a show with no DJ -----------------------------------------------------------------------
+def auto_mix_pick(candidates, parts, opts, rules=None, rng=None, history=None, max_songs=40):
+    """Chooses and orders songs from `candidates` (a list of make_song() dictionaries) so the parts fill, with no talk
+    breaks: each next song is close in speed to the one before, from a different artist, and passes the programming
+    rules. Returns the chosen list of song dictionaries."""
+    rng = rng or random.Random()
+    pool = [c for c in candidates if song_is_beatmatchable(c, opts) and c["duration"] > 60]
+    rng.shuffle(pool)
+    if not pool:
+        return []
+
+    class H:
+        last_played_track = {}
+    chosen = []
+    for _ in range(max_songs):
+        last = chosen[-1] if chosen else None
+        options = []
+        for c in pool:
+            if c in chosen:
+                continue
+            if rules is not None and rules.enabled and rules.check(c["path"], history or H(), [x["path"] for x in chosen]):
+                continue
+            if last is not None:
+                if _normal(c["artist"]) and _normal(c["artist"]) == _normal(last["artist"]):
+                    continue
+                target = min([c["bpm"], c["bpm"] * 2, c["bpm"] / 2], key=lambda b: abs(b / last["bpm"] - 1.0))
+                change = abs(target / last["bpm"] - 1.0)
+                if change > opts["max_tempo_change"] / 100.0 + 1e-9:
+                    continue
+            else:
+                change = 0.0
+            hook_bonus = 0.0 if c["hooks"] else 0.01
+            options.append((change + hook_bonus + rng.random() * 0.004, c))
+        if not options:
+            break
+        options.sort(key=lambda x: x[0])
+        chosen.append(options[0][1])
+        trial = plan_block([{"song": s} for s in chosen], parts, opts)
+        done = trial["parts"] and all(p["songs"] for p in trial["parts"]) and not trial["left_over"]
+        last_part = trial["parts"][-1] if trial["parts"] else None
+        if done and last_part and last_part["songs"] and abs(last_part["off"]) <= opts["early_tolerance"] + opts["late_tolerance"]:
+            break
+    return chosen
+
+
+# --- the talk break recorder ----------------------------------------------------------------------------
+def talk_beep_paths():
+    return (get_or_create_beep("talk_warn_v1.wav", [(660.0, 0.12, 0.0)]),
+            get_or_create_beep("talk_target_v1.wav", [(880.0, 0.10, 0.10), (880.0, 0.10, 0.0)]),
+            get_or_create_beep("talk_max_v1.wav", [(392.0, 0.55, 0.0)]))
+
+
+class TalkBreakDialog(VoiceTrackDialog):
+    """Records a talk break and beeps in your headphones as you near the length you want: a soft beep a little before,
+    a double beep at the target and a low long tone at the longest allowed, where the recording stops by itself."""
+
+    def __init__(self, parent, recorder, description, settings):
+        super().__init__(parent, recorder, description, settings, 0)
+        self.setWindowTitle("Talk break")
+        self.underlay_spin.setValue(0)
+        self.underlay_spin.hide()
+        self.warn_s = self._num("mix_talk_warn_seconds", 25)
+        self.target_s = self._num("mix_talk_target_seconds", 30)
+        self.max_s = self._num("mix_talk_max_seconds", 60)
+        self.beeps_on = str(settings.value("mix_talk_beeps", "true")).lower() == "true"
+        self.recorder.MAX_SECONDS = self.max_s
+        self.fired = set()
+        self.beeps = None
+        if self.beeps_on:
+            try:
+                device = get_selected_output_device(settings)
+                warn, target, longest = talk_beep_paths()
+                self.beeps = {"warn": HostBeep(warn, device, 0.35), "target": HostBeep(target, device, 0.6), "max": HostBeep(longest, device, 0.7)}
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+        self.beep_timer = QTimer(self)
+        self.beep_timer.setInterval(100)
+        self.beep_timer.timeout.connect(self.check_beeps)
+        self.beep_timer.start()
+
+    def _num(self, key, default):
+        try:
+            return max(1, int(float(self.settings.value(key, default))))
+        except Exception:
+            return default
+
+    def show_state(self):
+        super().show_state()
+        if self.state == "recording" and hasattr(self, "warn_s"):
+            text = (f"Recording a talk break {self.description}. Speak now. Beeps in your headphones: a soft one at {self.warn_s} "
+                    f"seconds, two at {self.target_s} seconds and a low long tone at {self.max_s} seconds, where it stops. "
+                    "Press Enter when you are finished." if self.beeps_on else
+                    f"Recording a talk break {self.description}. Speak now. Press Enter when you are finished.")
+            self.info.setText(text)
+            self.info.setAccessibleName(text)
+
+    def check_beeps(self):
+        if self.state != "recording":
+            return
+        seconds = self.recorder.seconds()
+        for key, at in (("warn", self.warn_s), ("target", self.target_s), ("max", self.max_s)):
+            if seconds >= at and key not in self.fired:
+                self.fired.add(key)
+                if self.beeps is not None:
+                    self.beeps[key].play()
+                if key == "max":
+                    QTimer.singleShot(650, self.finish_recording)
+
+    def finish_recording(self):
+        if self.state != "recording":
+            return
+        self.beep_timer.stop()
+        super().finish_recording()
+
+    def done(self, result):
+        self.beep_timer.stop()
+        super().done(result)
+
+    def record_again(self):
+        super().record_again()
+        self.fired = set()
+        if self.state == "recording":
+            self.beep_timer.start()
+
+
+class MixAnalysisWorker(QThread):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(object)
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = list(paths)
+        self.stop_flag = False
+
+    def cancel(self):
+        self.stop_flag = True
+
+    def run(self):
+        found = []
+        try:
+            for number, path in enumerate(self.paths, 1):
+                if self.stop_flag:
+                    break
+                self.progress.emit(f"Studying song {number} of {len(self.paths)}: {os.path.basename(path)}")
+                found.append((path, get_analysis(path)))
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.done.emit(found)
+
+
+class MixBuildWorker(QThread):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(object, str)
+
+    def __init__(self, project, plan, opts, song_for):
+        super().__init__()
+        self.project, self.plan, self.opts, self.song_for = project, plan, opts, song_for
+        self.stop_flag = False
+
+    def cancel(self):
+        self.stop_flag = True
+
+    def run(self):
+        try:
+            manifest = build_package(self.project, self.plan, self.opts, self.song_for, progress=self.progress.emit,
+                                     should_stop=lambda: self.stop_flag)
+            self.done.emit(manifest, "")
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            self.done.emit(None, str(e) or type(e).__name__)
+
+
+class MixSendWorker(QThread):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(object, str)
+
+    def __init__(self, connect, folder, manifest, show_id):
+        super().__init__()
+        self.connect_fn, self.folder, self.manifest, self.show_id = connect, folder, manifest, show_id
+        self.stop_flag = False
+
+    def cancel(self):
+        self.stop_flag = True
+
+    def run(self):
+        try:
+            last = [0]
+
+            def progress(sent, total):
+                percent = int(100 * sent / max(1, total))
+                if percent != last[0]:
+                    last[0] = percent
+                    self.progress.emit(f"Sending to the station: {percent} percent.")
+            result = upload_show(self.connect_fn, self.folder, self.manifest, self.show_id, progress=progress,
+                                 should_stop=lambda: self.stop_flag)
+            self.done.emit(result, "")
+        except Exception as e:
+            self.done.emit(None, str(e) or type(e).__name__)
+
+
+class SongSettingsDialog(QDialog):
+    """Per-song choices for the mix, and hand-set tempo and hook marks when the program's reading is wrong."""
+
+    def __init__(self, parent, entry, song):
+        super().__init__(parent)
+        self.entry = entry
+        self.song = song
+        self.setWindowTitle(f"Mix settings for {song['title']}")
+        layout = QFormLayout()
+        info = QLabel(f"Found: {song['bpm']:.1f} BPM ({int(song['confidence'] * 100)}% sure)" if song["bpm"] else
+                      "No steady tempo was found, so this song can only be mixed with an echo-out or a cut.")
+        info.setWordWrap(True)
+        layout.addRow(info)
+        self.exit_combo = QComboBox()
+        self.exit_combo.setAccessibleName("Where this song ends")
+        for key, text in ((None, "As set in Settings (usually the end of the second hook)"), ("hook1", "End of the first hook"),
+                          ("hook2", "End of the second hook"), ("end", "Play to the natural end")):
+            self.exit_combo.addItem(text, key)
+        self.exit_combo.setCurrentIndex(max(0, self.exit_combo.findData(entry.get("exit"))))
+        layout.addRow("Song ends:", self.exit_combo)
+        self.trans_combo = QComboBox()
+        self.trans_combo.setAccessibleName("How the song before it changes into this one")
+        for key, text in (("auto", "Blend if the speeds allow, otherwise echo-out"), ("blend", "Blend"), ("delay", "Echo-out"), ("cut", "Cut")):
+            self.trans_combo.addItem(text, key)
+        self.trans_combo.setCurrentIndex(max(0, self.trans_combo.findData(entry.get("transition", "auto"))))
+        layout.addRow("Coming in from the song before:", self.trans_combo)
+        self.loop_combo = QComboBox()
+        self.loop_combo.setAccessibleName("Bars of intro that loop under a talk break")
+        for value, text in ((0, "As set in Settings"), (2, "2 bars"), (4, "4 bars"), (3, "3 bars")):
+            self.loop_combo.addItem(text, value)
+        wanted = int(entry.get("loop_bars") or 0)
+        self.loop_combo.setCurrentIndex(max(0, self.loop_combo.findData(wanted)))
+        layout.addRow("Talk break loop:", self.loop_combo)
+        self.bar_spin = QSpinBox()
+        self.bar_spin.setRange(0, 64)
+        self.bar_spin.setValue(int(entry.get("start_bar") or 0))
+        self.bar_spin.setAccessibleName("Start the song this many bars after its first bar")
+        layout.addRow("Start this many bars in:", self.bar_spin)
+        self.bpm_edit = QLineEdit(f"{song['bpm']:.2f}" if song["bpm"] else "")
+        self.bpm_edit.setAccessibleName("Tempo in beats per minute, set by hand")
+        layout.addRow("Tempo (BPM), type to correct:", self.bpm_edit)
+        self.first_edit = QLineEdit(f"{song['downbeat']:.3f}" if song["bpm"] else "")
+        self.first_edit.setAccessibleName("Seconds into the song where the first bar begins, set by hand")
+        layout.addRow("First bar begins at (seconds):", self.first_edit)
+        hooks = ", ".join(f"{h['start']:.1f}-{h['end']:.1f}" for h in song["hooks"])
+        self.hook_edit = QLineEdit(hooks)
+        self.hook_edit.setAccessibleName("Hooks as start-end seconds separated by commas, set by hand")
+        layout.addRow("Hooks (start-end seconds, commas):", self.hook_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+        self.setLayout(layout)
+
+    def apply(self):
+        self.entry["exit"] = self.exit_combo.currentData()
+        self.entry["transition"] = self.trans_combo.currentData()
+        self.entry["loop_bars"] = self.loop_combo.currentData() or None
+        self.entry["start_bar"] = self.bar_spin.value()
+        marks = {}
+        try:
+            bpm = float(self.bpm_edit.text())
+            if bpm > 0 and abs(bpm - self.song["bpm"]) > 0.005:
+                marks["bpm"] = bpm
+            first = float(self.first_edit.text())
+            if abs(first - self.song["downbeat"]) > 0.0005:
+                marks["downbeat"] = first
+        except ValueError:
+            pass
+        hooks = []
+        for chunk in self.hook_edit.text().split(","):
+            m = re.match(r"^\s*([\d.]+)\s*-\s*([\d.]+)\s*$", chunk)
+            if m and float(m.group(2)) > float(m.group(1)):
+                hooks.append({"start": float(m.group(1)), "end": float(m.group(2))})
+        if hooks != self.song["hooks"] and (hooks or self.song["hooks"]):
+            marks["hooks"] = hooks or None
+        if marks:
+            set_manual_mark(self.entry["path"], **marks)
+        return bool(marks)
+
+
+class MixBuilderDialog(QDialog):
+    def __init__(self, app, project=None):
+        super().__init__(app)
+        self.app = app
+        self.settings = app.settings
+        self.project = project or new_project(hour=5)
+        self.manifest = None
+        self.workers = []
+        self.player = None
+        self.songs_cache = {}
+        self.plan = None
+        self.setWindowTitle("Mix Blocks")
+        self.resize(1000, 800)
+        layout = QVBoxLayout()
+        intro = QLabel("Choose the songs in the order you want them. The program beat-matches them, shows the plan and how it fits the "
+                       "station's break marks, and builds the audio. Record a talk break before a song and the end of that song's "
+                       "intro loops under your voice. Nothing is sent to the station until you press Send.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(self.project["name"])
+        self.name_edit.setAccessibleName("Name of this mix")
+        form.addRow("Name:", self.name_edit)
+        self.day_edit = QLineEdit(self.project["day"])
+        self.day_edit.setAccessibleName("Day this mix airs, year-month-day")
+        form.addRow("Day (YYYY-MM-DD):", self.day_edit)
+        self.hour_spin = QSpinBox()
+        self.hour_spin.setRange(0, 23)
+        self.hour_spin.setValue(int(self.project["hour"]))
+        self.hour_spin.setAccessibleName("Hour this mix airs, 0 to 23")
+        form.addRow("Hour (0-23):", self.hour_spin)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setAccessibleName("Kind of mix for this hour")
+        self.mode_combo.addItem("Mix block inside the hour, with the start and end below", "each")
+        self.mode_combo.addItem("Full hour, commercial-free (station IDs only at the breaks)", "full")
+        self.mode_combo.setCurrentIndex(0 if self.project.get("mode", "each") == "each" else 1)
+        form.addRow("This hour:", self.mode_combo)
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(0, 59)
+        self.start_spin.setValue(int(self.project.get("start_minute", 20)))
+        self.start_spin.setAccessibleName("Minute the mix starts")
+        form.addRow("Mix starts at minute:", self.start_spin)
+        self.marks_edit = QLineEdit(", ".join(str(m) for m in self.project.get("marks", [30, 45])))
+        self.marks_edit.setAccessibleName("Break marks the mix is cut at, minutes separated by commas")
+        form.addRow("Break marks (minutes):", self.marks_edit)
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(1, 60)
+        self.end_spin.setValue(int(self.project.get("end_minute", 47)))
+        self.end_spin.setAccessibleName("Minute the mix is planned to end")
+        form.addRow("Planned end, minute:", self.end_spin)
+        self.latest_spin = QSpinBox()
+        self.latest_spin.setRange(1, 60)
+        self.latest_spin.setValue(int(self.project.get("latest_minute", 50)))
+        self.latest_spin.setAccessibleName("Latest minute the mix may end")
+        form.addRow("Latest end, minute:", self.latest_spin)
+        self.break_spin = QSpinBox()
+        self.break_spin.setRange(5, 600)
+        self.break_spin.setValue(int(self.project.get("break_seconds", MIX_NORMAL_BREAK_SECONDS)))
+        self.break_spin.setAccessibleName("Usual length of a break with commercials, in seconds")
+        form.addRow("A break with commercials lasts (seconds):", self.break_spin)
+        layout.addLayout(form)
+        for widget in (self.name_edit, self.day_edit, self.marks_edit):
+            widget.editingFinished.connect(self.refresh_plan)
+        for widget in (self.hour_spin, self.start_spin, self.end_spin, self.latest_spin, self.break_spin):
+            widget.valueChanged.connect(lambda _v: self.refresh_plan())
+        self.mode_combo.currentIndexChanged.connect(lambda _i: self.refresh_plan())
+        layout.addWidget(QLabel("Songs in the mix, in order:"))
+        body = QHBoxLayout()
+        self.list = QListWidget()
+        self.list.setAccessibleName("Songs in the mix")
+        self.list.currentRowChanged.connect(lambda _r: self.read_current())
+        body.addWidget(self.list, 1)
+        col = QVBoxLayout()
+        for text, slot in (("Add Songs...", self.add_songs), ("Remove Selected Song", self.remove_song),
+                           ("Move Up (Alt+Up)", lambda: self.move(-1)), ("Move Down (Alt+Down)", lambda: self.move(1)),
+                           ("Record Talk Break Before Selected Song...", self.record_talk), ("Remove Its Talk Break", self.remove_talk),
+                           ("Song Settings...", self.song_settings), ("Auto Mix...", self.auto_mix)):
+            button = QPushButton(text)
+            button.clicked.connect(lambda _c=False, f=slot: f())
+            col.addWidget(button)
+        col.addStretch(1)
+        body.addLayout(col)
+        layout.addLayout(body, 2)
+        QShortcut(QKeySequence("Alt+Up"), self).activated.connect(lambda: self.move(-1))
+        QShortcut(QKeySequence("Alt+Down"), self).activated.connect(lambda: self.move(1))
+        self.detail = QLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setAccessibleName("About the selected song")
+        layout.addWidget(self.detail)
+        layout.addWidget(QLabel("Plan:"))
+        self.plan_box = QPlainTextEdit()
+        self.plan_box.setReadOnly(True)
+        self.plan_box.setAccessibleName("Plan")
+        layout.addWidget(self.plan_box, 2)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setAccessibleName("Mix status")
+        layout.addWidget(self.status)
+        row = QHBoxLayout()
+        for text, slot in (("Build The Audio", self.build), ("Hear A Part...", self.hear_part), ("Send To The Station", self.send),
+                           ("Station Status", self.station_status), ("Save", self.save), ("Close", self.accept)):
+            button = QPushButton(text)
+            button.clicked.connect(lambda _c=False, f=slot: f())
+            row.addWidget(button)
+        layout.addLayout(row)
+        self.setLayout(layout)
+        self.fill_list()
+        self.refresh_plan()
+
+    # --- helpers
+    def say(self, text):
+        self.status.setText(text)
+        self.app.announce(text)
+
+    def options(self):
+        return mix_options(self.settings)
+
+    def read_project(self):
+        p = self.project
+        p["name"] = self.name_edit.text().strip() or p["name"]
+        day = self.day_edit.text().strip()
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+            p["day"] = day
+        except ValueError:
+            pass
+        p["hour"] = self.hour_spin.value()
+        p["mode"] = self.mode_combo.currentData()
+        p["start_minute"] = self.start_spin.value()
+        marks = []
+        for chunk in re.split(r"[,\s]+", self.marks_edit.text()):
+            if chunk.isdigit() and 0 < int(chunk) <= 60:
+                marks.append(int(chunk))
+        p["marks"] = sorted(set(marks)) or [30, 45]
+        p["end_minute"] = self.end_spin.value()
+        p["latest_minute"] = max(self.latest_spin.value(), self.end_spin.value())
+        p["break_seconds"] = self.break_spin.value()
+        return p
+
+    def song_for(self, path):
+        if path not in self.songs_cache:
+            tags = read_licensing_tags(path)
+            meta = get_track_metadata(path)
+            data = get_analysis(path)
+            self.songs_cache[path] = make_song(path, data, {"artist": meta["artist"], "title": meta["title"], "album": meta["album"],
+                                                            "isrc": tags.get("isrc", ""), "label": tags.get("label", "")})
+        return self.songs_cache[path]
+
+    def forget_song(self, path):
+        self.songs_cache.pop(path, None)
+
+    def row_text(self, number, entry):
+        song = self.song_for(entry["path"])
+        name = f"{song['artist']} - {song['title']}" if song["artist"] else song["title"]
+        bits = [f"{song['bpm']:.0f} BPM" if song["bpm"] else "speed not read"]
+        if song["hooks"]:
+            bits.append(f"hook at {fmt_clock(song['hooks'][0]['start'])}")
+        if entry.get("talk"):
+            bits.append(f"talk break of {int(round(entry['talk']['seconds']))} seconds before it")
+        if entry.get("exit"):
+            bits.append("ends at " + {"hook1": "the first hook", "hook2": "the second hook", "end": "its end"}[entry["exit"]])
+        if entry.get("transition", "auto") != "auto":
+            bits.append({"blend": "blend", "delay": "echo-out", "cut": "cut"}[entry["transition"]] + " in")
+        return f"{number}. {name} ({'; '.join(bits)})"
+
+    def fill_list(self, select=None):
+        current = self.list.currentRow() if select is None else select
+        self.list.clear()
+        for number, entry in enumerate(self.project["items"], 1):
+            self.list.addItem(self.row_text(number, entry))
+        if self.project["items"]:
+            self.list.setCurrentRow(max(0, min(current, len(self.project["items"]) - 1)))
+
+    def read_current(self):
+        row = self.list.currentRow()
+        if not (0 <= row < len(self.project["items"])):
+            self.detail.setText("")
+            return
+        text = self.list.item(row).text()
+        self.detail.setText(text)
+        self.detail.setAccessibleName(text)
+
+    # --- editing the list
+    def add_songs(self):
+        start = self.settings.value("music_library_folder", "")
+        files, _ = QFileDialog.getOpenFileNames(self, "Add songs to the mix", start,
+                                                "Audio (" + " ".join("*" + e for e in SUPPORTED_AUDIO) + ")")
+        if not files:
+            return
+        self.say(f"Studying {len(files)} song(s) for their tempo and hooks...")
+        worker = MixAnalysisWorker(files)
+        worker.progress.connect(self.status.setText)
+        worker.done.connect(lambda found, f=files: self.songs_studied(f, found))
+        self.workers.append(worker)
+        worker.start()
+
+    def songs_studied(self, files, found):
+        for path in files:
+            self.forget_song(path)
+            self.project["items"].append({"path": path, "talk": None, "exit": None, "transition": "auto", "loop_bars": None, "start_bar": 0})
+        self.fill_list(len(self.project["items"]) - 1)
+        self.say(f"Added {len(files)} song(s).")
+        self.refresh_plan()
+        self.list.setFocus()
+
+    def remove_song(self):
+        row = self.list.currentRow()
+        if 0 <= row < len(self.project["items"]):
+            removed = self.project["items"].pop(row)
+            self.fill_list(row)
+            self.say(f"Removed {os.path.basename(removed['path'])}.")
+            self.refresh_plan()
+            self.list.setFocus()
+
+    def move(self, delta):
+        row = self.list.currentRow()
+        items = self.project["items"]
+        new = row + delta
+        if 0 <= row < len(items) and 0 <= new < len(items):
+            items[row], items[new] = items[new], items[row]
+            self.fill_list(new)
+            self.refresh_plan()
+            self.list.setFocus()
+
+    def song_settings(self):
+        row = self.list.currentRow()
+        if not (0 <= row < len(self.project["items"])):
+            return
+        entry = self.project["items"][row]
+        dialog = SongSettingsDialog(self, entry, self.song_for(entry["path"]))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            if dialog.apply():
+                self.forget_song(entry["path"])
+            self.fill_list(row)
+            self.refresh_plan()
+
+    def record_talk(self):
+        row = self.list.currentRow()
+        if not (0 <= row < len(self.project["items"])):
+            self.say("Select the song the talk break goes in front of first.")
+            return
+        entry = self.project["items"][row]
+        song = self.song_for(entry["path"])
+        folder = project_folder(self.read_project())
+        draft = os.path.join(folder, f"talk_{row + 1}_{secrets.token_hex(3)}.wav")
+        recorder = VoiceRecorder(self.settings, self.app.update_status)
+        if not recorder.start(draft):
+            self.say("The talk break could not start. Check the microphone in Settings, Audio Devices.")
+            return
+        where = f"before {song['title']}"
+        dialog = TalkBreakDialog(self, recorder, where, self.settings)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        seconds = dialog.recorded_seconds
+        if not accepted or seconds < 0.5:
+            recorder.cancel()
+            try:
+                os.remove(draft)
+            except OSError:
+                pass
+            self.say("Talk break discarded.")
+            return
+        entry["talk"] = {"path": draft, "seconds": round(float(seconds), 2)}
+        self.fill_list(row)
+        self.say(f"Talk break of {int(round(seconds))} seconds saved before {song['title']}.")
+        self.refresh_plan()
+
+    def remove_talk(self):
+        row = self.list.currentRow()
+        if 0 <= row < len(self.project["items"]) and self.project["items"][row].get("talk"):
+            self.project["items"][row]["talk"] = None
+            self.fill_list(row)
+            self.say("Talk break removed.")
+            self.refresh_plan()
+
+    # --- Auto Mix
+    def auto_mix(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose the folder to pick songs from",
+                                                  self.settings.value("music_library_folder", ""))
+        if not folder:
+            return
+        paths = scan_audio_files(folder)
+        if not paths:
+            self.say("That folder has no songs.")
+            return
+        random.shuffle(paths)
+        paths = paths[:80]
+        self.say(f"Studying {len(paths)} songs to pick a mix from. This takes a few minutes the first time.")
+        worker = MixAnalysisWorker(paths)
+        worker.progress.connect(self.status.setText)
+        worker.done.connect(self.auto_mix_studied)
+        self.workers.append(worker)
+        worker.start()
+
+    def auto_mix_studied(self, found):
+        candidates = []
+        for path, data in found:
+            if data:
+                candidates.append(self.song_for(path))
+        opts = self.options()
+        project = self.read_project()
+        rules = getattr(self.app.rotation, "rules", None)
+        chosen = auto_mix_pick(candidates, project_parts(project), opts, rules)
+        if not chosen:
+            self.say("No songs with a steady tempo that go together were found in that folder.")
+            return
+        project["items"] = [{"path": s["path"], "talk": None, "exit": None, "transition": "auto", "loop_bars": None, "start_bar": 0}
+                            for s in chosen]
+        self.fill_list(0)
+        self.say(f"Auto Mix picked {len(chosen)} songs with no talk breaks. You can change anything in the list.")
+        self.refresh_plan()
+
+    # --- the plan
+    def current_plan(self):
+        project = self.read_project()
+        opts = self.options()
+        items = project_plan_items(project, self.song_for)
+        parts = project_parts(project)
+        return project, opts, items, parts, plan_block(items, parts, opts)
+
+    def refresh_plan(self):
+        if not hasattr(self, "plan_box"):
+            return
+        try:
+            project, opts, items, parts, plan = self.current_plan()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            self.plan_box.setPlainText("The plan could not be worked out: " + (str(e) or type(e).__name__))
+            return
+        self.plan = plan
+        lines = []
+        hour = project["hour"]
+        if not items:
+            lines.append("Add songs to see the plan.")
+        for number, part in enumerate(plan["parts"], 1):
+            spec = parts[number - 1] if number - 1 < len(parts) else None
+            if spec is not None:
+                lines.append(f"{spec['name']}: from {mix_clock_text(spec['start_clock'], hour)} to the mark at "
+                             f"{mix_clock_text(spec['start_clock'] + spec['target'], hour)}.")
+            lines.extend(describe_part(part, number))
+            if part["songs"] and abs(part["off"]) > 1.0:
+                fixes = suggest_fixes(items, parts, opts, number - 1, plan)
+                if fixes:
+                    lines.append("  What would help:")
+                    lines.extend("    " + f for f in fixes)
+                elif part["off"] > 0:
+                    lines.append("  What would help: take a song out, or choose shorter songs.")
+                else:
+                    lines.append("  What would help: add another song, or let the last song play to its end.")
+            lines.append("")
+        if plan["left_over"]:
+            lines.append(f"{len(plan['left_over'])} song(s) at the end are not needed to fill the parts and will not be used.")
+        if project.get("mode") == "each" and plan["parts"] and plan["parts"][-1]["songs"]:
+            end_clock = parts[len(plan["parts"]) - 1]["start_clock"] + plan["parts"][-1]["length"]
+            lines.append(f"The mix finishes at {mix_clock_text(end_clock, hour)}. Planned end {project['end_minute']}, latest {project['latest_minute']} "
+                         "minutes past; the station returns to its normal rotation after the last break.")
+        rules = getattr(self.app.rotation, "rules", None)
+        problems = rules_problems(project, rules)
+        if problems:
+            lines.append("")
+            lines.append("The programming rules would be broken, so this mix cannot be built until it is changed:")
+            for number, text in problems:
+                lines.append(f"  Song {number}: {text}.")
+        self.plan_box.setPlainText("\n".join(lines))
+
+    # --- saving, building, sending
+    def save(self):
+        self.read_project()
+        path = save_project(self.project)
+        self.say(f"Saved to {path}.")
+
+    def build(self):
+        project, opts, items, parts, plan = self.current_plan()
+        if not items:
+            self.say("Add songs first.")
+            return
+        rules = getattr(self.app.rotation, "rules", None)
+        problems = rules_problems(project, rules)
+        if problems:
+            self.say(f"The programming rules would be broken at song {problems[0][0]}: {problems[0][1]}. Change the mix first.")
+            return
+        late = [(n, p) for n, p in enumerate(plan["parts"], 1) if p["songs"] and p["off"] > 1.0]
+        if late:
+            answer = QMessageBox.question(self, "Part runs past its mark",
+                                          f"Part {late[0][0]} ends {int(late[0][1]['off'])} seconds after its mark. The end will be faded out on the mark. Build anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        save_project(project)
+        self.say("Building the audio. This can take a few minutes; the plan above is what is being made.")
+        worker = MixBuildWorker(project, plan, opts, self.song_for)
+        worker.progress.connect(self.status.setText)
+        worker.done.connect(self.build_done)
+        self.workers.append(worker)
+        worker.start()
+
+    def build_done(self, manifest, error):
+        if manifest is None:
+            self.say("The mix could not be built: " + error)
+            return
+        self.manifest = manifest
+        text = f"Built {len(manifest['parts'])} part(s), {sum(len(p['songs']) for p in manifest['parts'])} songs. Use Hear A Part to listen, then Send To The Station."
+        if manifest["notes"]:
+            text += " " + " ".join(manifest["notes"])
+        self.say(text)
+        self.project["built"] = {"show_id": project_id(self.project)}
+        save_project(self.project)
+
+    def package_folder(self):
+        return os.path.join(project_folder(self.read_project()), "package")
+
+    def load_manifest(self):
+        if self.manifest is not None:
+            return self.manifest
+        try:
+            with open(os.path.join(self.package_folder(), "manifest.json"), "r", encoding="utf-8") as handle:
+                self.manifest = json.load(handle)
+        except Exception:
+            self.manifest = None
+        return self.manifest
+
+    def hear_part(self):
+        manifest = self.load_manifest()
+        if not manifest:
+            self.say("Build the audio first.")
+            return
+        number, ok = QInputDialog.getInt(self, "Hear a part", f"Which part (1 to {len(manifest['parts'])})?", 1, 1, len(manifest["parts"]))
+        if not ok:
+            return
+        path = os.path.join(self.package_folder(), manifest["parts"][number - 1]["file"])
+        try:
+            if self.player is not None:
+                self.player.stop()
+            self.player = QMediaPlayer()
+            output = QAudioOutput()
+            device = get_selected_output_device(self.settings)
+            if device is not None:
+                output.setDevice(device)
+            output.setVolume(1.0)
+            self.player.setAudioOutput(output)
+            self._player_output = output
+            self.player.setSource(QUrl.fromLocalFile(path))
+            self.player.play()
+            self.say(f"Playing part {number}. Use Hear A Part again to start another.")
+        except Exception as e:
+            self.say("Could not play it: " + str(e))
+
+    def client_connection(self):
+        s = self.settings
+        host, port = str(s.value("vt_client_host", "")), int(float(s.value("vt_client_port", VT_DEFAULT_PORT)))
+        user = str(s.value("vt_client_user", ""))
+        password = unprotect_text(str(s.value("vt_client_pass", "")))
+        if not (host and user):
+            return None
+        if not password:
+            password, ok = QInputDialog.getText(self, "Station password", f"Password for {user} on the station:", QLineEdit.EchoMode.Password)
+            if not ok or not password:
+                return None
+        return host, port, user, password
+
+    def send(self):
+        manifest = self.load_manifest()
+        if not manifest:
+            self.say("Build the audio first.")
+            return
+        conn = self.client_connection()
+        if conn is None:
+            self.say("Enter the station address and your user name on the Voice Tracker screen first (Connect once there), then try again.")
+            return
+        host, port, user, password = conn
+        folder = self.package_folder()
+        show_id = project_id(self.read_project())
+        worker = MixSendWorker(lambda: VTClient(host, port, user, password), folder, manifest, show_id)
+        worker.progress.connect(self.status.setText)
+        worker.done.connect(self.send_done)
+        self.workers.append(worker)
+        self.say("Sending to the station...")
+        worker.start()
+
+    def send_done(self, result, error):
+        if result is None:
+            self.say(error)
+        elif result.get("status") == "verified":
+            self.say("The station received the whole mix and verified it. It will air at the planned time.")
+        else:
+            self.say("The station has not verified the mix yet: " + " ".join(result.get("problems", [])) + " Press Send again to carry on.")
+
+    def station_status(self):
+        conn = self.client_connection()
+        if conn is None:
+            self.say("Enter the station address and your user name on the Voice Tracker screen first.")
+            return
+        host, port, user, password = conn
+
+        def work():
+            client = VTClient(host, port, user, password)
+            try:
+                return client.ask({"cmd": "show_status"})["shows"]
+            finally:
+                client.close()
+        holder = {}
+
+        def run():
+            try:
+                holder["shows"] = work()
+            except Exception as e:
+                holder["error"] = str(e) or type(e).__name__
+            QTimer.singleShot(0, show)
+
+        def show():
+            if "error" in holder:
+                self.say("Could not ask the station: " + holder["error"])
+                return
+            warn = int(float(self.settings.value("shows_warn_minutes", 120)))
+            lines = [show_status_sentence(s, warn_minutes=warn) for s in holder["shows"]] or ["The station has no mix shows from you."]
+            self.plan_box.setPlainText("\n".join(lines))
+            self.say(" ".join(lines[:3]))
+        threading.Thread(target=run, daemon=True).start()
+        self.say("Asking the station...")
+
+    def done(self, result=0):
+        keep = list(getattr(self.app, "_mix_workers", []))
+        for worker in self.workers:
+            try:
+                worker.cancel()
+                if worker.isRunning():
+                    keep.append(worker)      # the program holds on to it until it has finished
+            except Exception:
+                pass
+        self.app._mix_workers = keep
+        super().done(result)
+
+
 
 # ---------------------------------------------------------------------------
 # Main application window
@@ -13323,6 +16747,13 @@ class BroadcastingApp(QWidget):
         self.vt_accounts = VTAccounts(self.settings)
         self.gui_caller = GuiCaller()
         self.vt_service = VTService(self)
+        self.show_store = ShowStore()
+        self.mix_parts = {}                    # part file on the station -> (person, show id, manifest, part number)
+        self.show_tracker = ShowAirTracker()
+        self.show_notes = {}                   # (day, hour) -> why a received show was or was not used
+        self.show_service = ShowService(self.show_store, on_verified=self.on_show_verified, run_on_gui=self.gui_caller.call,
+                                        log=lambda text: RUN_LOG.write("SHOWS", text))
+        self.vt_service.shows = self.show_service
         self.voice_only = str(self.settings.value("voice_only_mode", "false")).lower() == "true"
         self.live_shows = LiveShows(self.settings)
         self.live_station = LiveStation(self)
@@ -13332,6 +16763,10 @@ class BroadcastingApp(QWidget):
         self.live_timer.setInterval(1000)
         self.live_timer.timeout.connect(self.on_live_tick)
         self.live_timer.start()
+        self.show_timer = QTimer()
+        self.show_timer.setInterval(1000)
+        self.show_timer.timeout.connect(self.on_show_tick)
+        self.show_timer.start()
         self.vt_server = VTServer(self.vt_accounts, lambda: self.vt_service, self.gui_caller.call,
                                   lambda text: RUN_LOG.write("VTREMOTE", text),
                                   lambda text: self.vt_activity.append(time.strftime("%I:%M:%S %p ").lstrip("0") + text))
@@ -13363,6 +16798,15 @@ class BroadcastingApp(QWidget):
         QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
         QTimer.singleShot(3000, self.apply_remote_vt)
+        try:
+            set_display_clean(str(self.settings.value("tagclean_display", "false")).lower() == "true", tagclean_words(self.settings))
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        QTimer.singleShot(60000, self.clean_old_shows)
+        self.shows_clean_timer = QTimer()
+        self.shows_clean_timer.setInterval(30 * 60 * 1000)
+        self.shows_clean_timer.timeout.connect(self.clean_old_shows)
+        self.shows_clean_timer.start()
         self.conference_timer = QTimer()
         self.conference_timer.setInterval(1000)
         self.conference_timer.timeout.connect(self.on_conference_tick)
@@ -13963,8 +17407,20 @@ class BroadcastingApp(QWidget):
         self.tag_status_label.setAccessibleName("Tagging status")
         self.tag_status_label.setWordWrap(True)
         layout.addRow(self.tag_status_label)
+        clean_intro = QLabel("DJ edits often carry words like 'Intro', 'Clean' or '8 bar intro' in the title. Clean Up DJ Edit Tags "
+                             "shows what it would change first, changes nothing until you approve, and keeps an undo copy.")
+        clean_intro.setWordWrap(True)
+        layout.addRow(clean_intro)
+        clean_btn = QPushButton("Clean Up DJ Edit Tags...")
+        clean_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        clean_btn.clicked.connect(lambda _checked=False: self.open_tag_cleanup())
+        layout.addRow(clean_btn)
         page.setLayout(layout)
         return page
+
+    def open_tag_cleanup(self):
+        dialog = TagCleanDialog(self)
+        dialog.exec()
 
     def on_tag_new_toggled(self, checked):
         self.settings.setValue("tag_new_songs", "true" if checked else "false")
@@ -14607,6 +18063,7 @@ class BroadcastingApp(QWidget):
                 self.update_status("Could not build this hour's playlist: no rotation is scheduled for it.")
                 return False
             entries, _missing = read_m3u(path)
+            entries = self.apply_show_to_hour(now.date(), now.hour, entries)
             count, passed = self.rotation.join_hour(entries, now, locked=is_hour_locked(self.settings, now.date(), now.hour))
             self.rotation.playlist_driven = count > 0
             self.update_status(f"This hour's playlist is ready: {count} entries"
@@ -14629,6 +18086,7 @@ class BroadcastingApp(QWidget):
         if not path:
             return
         entries, _missing = read_m3u(path)
+        entries = self.apply_show_to_hour(day, hour, entries)
         count = self.rotation.load_queue_entries(entries, replace=False,
                                                  locked=is_hour_locked(self.settings, day, hour))
         self.rotation.playlist_driven = True
@@ -14658,6 +18116,7 @@ class BroadcastingApp(QWidget):
             return
         entries, _missing = read_m3u(path)
         now = datetime.now()
+        entries = self.apply_show_to_hour(now.date(), now.hour, entries)
         count, passed = self.rotation.join_hour(entries, now, locked=is_hour_locked(self.settings, now.date(), now.hour))
         self.announce(f"Loaded this hour's playlist: {count} entries"
                       + (f"; {passed} song(s) the clock has passed are unchecked." if passed else "."))
@@ -15970,6 +19429,8 @@ class BroadcastingApp(QWidget):
         account_form.addRow(self.vt_user_enabled)
         self.vt_user_live = QCheckBox("This person may go live (take over the air for their scheduled shows)")
         account_form.addRow(self.vt_user_live)
+        self.vt_user_shows = QCheckBox("This person may send finished mix shows to this station")
+        account_form.addRow(self.vt_user_shows)
         layout.addLayout(account_form)
         for text, handler in (("Add Or Update Person", self.add_vt_account), ("Remove Selected Person", self.remove_vt_account)):
             btn = QPushButton(text)
@@ -16015,12 +19476,13 @@ class BroadcastingApp(QWidget):
             self.vt_ip_edit.setText(item.get("ip", ""))
             self.vt_user_enabled.setChecked(bool(item.get("enabled", True)))
             self.vt_user_live.setChecked(bool(item.get("live", False)))
+            self.vt_user_shows.setChecked(bool(item.get("shows", False)))
 
     def add_vt_account(self):
         user = self.vt_user_edit.text().strip()
         problem = self.vt_accounts.add(user, self.vt_password_edit.text(), self.vt_ip_edit.text(),
                                        self.vt_user_enabled.isChecked(), keep_password=True,
-                                       live=self.vt_user_live.isChecked())
+                                       live=self.vt_user_live.isChecked(), shows=self.vt_user_shows.isChecked())
         if problem:
             self.announce(problem)
             return
@@ -16863,6 +20325,7 @@ class BroadcastingApp(QWidget):
         self.live_tab = self.build_live_tab()
         self.stations_tab = self.build_stations_tab()
         self.conference_tab = self.build_conference_tab()
+        self.mix_tab = self.build_mix_tab()
         self.vt_page = VoiceTrackerPage(self)
         sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
                     ("Startup and Tray", self.settings_pages["startup"]), ("Playlists", self.settings_pages["playlists"]),
@@ -16872,7 +20335,7 @@ class BroadcastingApp(QWidget):
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
@@ -16918,6 +20381,13 @@ class BroadcastingApp(QWidget):
         self.update_status(message)
 
     def on_now_playing(self, track_path):
+        if os.path.basename(track_path or "").startswith(SHOW_FILE_PREFIX):
+            RUN_LOG.write("SHOWS", f"Mix show part on air: {os.path.basename(track_path)}")
+            self.show_tracker.reset()
+            self.refresh_queue_list()
+            self.refresh_played_list()
+            self.on_show_tick()
+            return
         RUN_LOG.write("PLAY", f"{self._track_text(track_path)} | {track_path}")
         try:
             self.recorder.note_track(get_track_metadata(track_path), track_path)
@@ -17147,6 +20617,316 @@ class BroadcastingApp(QWidget):
                 "takeover_state": self.live_station.state, "takeover_user": self.live_station.user,
                 "memory_mb": process_memory_mb(), "cpu_percent": self.cpu_meter.percent()}
 
+    # --- mix shows from the home PC ---
+    def mix_enabled(self):
+        return str(self.settings.value("mix_enabled", "false")).lower() == "true"
+
+    def busy_track_paths(self):
+        paths = set()
+        try:
+            for deck in (self.rotation.deck_a, self.rotation.deck_b):
+                if deck.current_track_path:
+                    paths.add(deck.current_track_path)
+        except Exception:
+            pass
+        return paths
+
+    def apply_show_to_hour(self, day, hour, entries):
+        """If a complete, verified mix show is waiting for this hour (and the rules allow it), its parts take the
+        place of the rotation songs in that stretch. Otherwise the hour is left alone: normal rotation."""
+        if not self.mix_enabled():
+            return entries
+        key = (day, hour)
+        try:
+            found = self.show_store.show_for_hour(day, hour)
+            if found is None:
+                self.show_notes.pop(key, None)
+                return entries
+            user, show_id, manifest, state = found
+            hour_start = datetime(day.year, day.month, day.day, hour)
+            first = min(float(p["start_offset"]) for p in manifest["parts"])
+            problem = ""
+            if not self.show_store.parts_intact(user, show_id, manifest):
+                problem = "a part of the show is missing or incomplete at the station"
+            elif datetime.now() > hour_start + timedelta(seconds=first - 30):
+                problem = "the show's start time had already passed when it was loaded"
+            else:
+                problem = check_show_against_rules(manifest, show_id, self.rotation.rules, self.rotation.play_history)
+                if problem:
+                    problem = "the programming rules would be broken by " + problem
+            if problem:
+                text = f"The mix show for {hour_label(hour)} was not used: {problem}. Normal rotation plays instead."
+                self.show_notes[key] = text
+                self.show_store.note(user, show_id, note=problem)
+                RUN_LOG.write("SHOWS", text)
+                self.announce(text)
+                return entries
+            paths = self.show_store.part_paths(user, show_id, manifest)
+            try:
+                estimate = float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))
+            except Exception:
+                estimate = float(DEFAULT_BREAK_ESTIMATE_SECONDS)
+            new_entries = apply_show_to_entries(entries, manifest, paths, estimate)
+            for number, path in enumerate(paths):
+                self.mix_parts[path] = (user, show_id, manifest, number)
+            mark = hour_start + timedelta(seconds=first)
+            self.rotation.show_marks = [t for t in self.rotation.show_marks if t != mark] + [mark]
+            text = (f"The mix show '{manifest.get('name', show_id)}' will air in the {hour_label(hour)} hour, starting at "
+                    f"{mark.strftime('%I:%M %p').lstrip('0')}.")
+            self.show_notes[key] = text
+            RUN_LOG.write("SHOWS", text + (" Commercial-free: breaks play station IDs only." if manifest.get("commercial_free") else ""))
+            return new_entries
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+            return entries
+
+    def on_show_verified(self, user, show_id, day, hour):
+        """A show finished arriving. If its hour is already in the queue and has not started, it is put in now."""
+        if not self.mix_enabled():
+            return
+        now = datetime.now()
+        hour_start = datetime(day.year, day.month, day.day, hour)
+        tag = marker_for(day, hour)[len(HOUR_MARKER_TOKEN):]
+        if hour_start <= now or not self.rotation.queue_has_tag(tag):
+            return
+        path = self.playlist_generator.current_hour_playlist(day, hour)
+        if not path:
+            return
+        entries, _missing = read_m3u(path)
+        new_entries = self.apply_show_to_hour(day, hour, entries)
+        if self.rotation.replace_hour_entries(tag, new_entries):
+            self.announce(f"The mix show for {hour_label(hour)} arrived and was put into that hour.")
+
+    def commercial_free_now(self):
+        """True only during an hour whose verified mix show was built as a commercial-free hour."""
+        if not self.mix_enabled():
+            return False
+        now = datetime.now()
+        seen = set()
+        for user, show_id, manifest, _number in list(self.mix_parts.values()):
+            if (user, show_id) in seen or not manifest.get("commercial_free"):
+                continue
+            seen.add((user, show_id))
+            try:
+                day = datetime.strptime(manifest["day"], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if (day, int(manifest["hour"])) == (now.date(), now.hour) and self.show_store.parts_intact(user, show_id, manifest):
+                return True
+        return False
+
+    def on_show_tick(self):
+        """While a mix part is on air, each song of it is announced the moment it comes in: logged, shown, sent to the stream."""
+        try:
+            deck = self.rotation.get_live_deck()
+            path = deck.current_track_path
+            if not path:
+                self.show_tracker.reset()
+                return
+            if not os.path.basename(path).startswith(SHOW_FILE_PREFIX):
+                return
+            info = self.mix_parts.get(path)
+            if info is None:
+                return
+            user, show_id, manifest, number = info
+            elapsed = deck.player.position() / 1000.0
+            part = manifest["parts"][number]
+            songs = part.get("songs", [])
+            before = sum(len(p.get("songs", [])) for p in manifest["parts"][:number])
+            for n, song in self.show_tracker.songs_due(path, elapsed, songs):
+                self.on_mix_song(show_id, before + n + 1, song, number == 0 and n == 0, user)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def on_mix_song(self, show_id, global_number, song, first_of_show, user):
+        pseudo = mix_song_path(show_id, global_number)
+        register_pseudo_song(pseudo, song)
+        meta = get_track_metadata(pseudo)
+        RUN_LOG.write("PLAY", f"{self._track_text(pseudo)} | mix show {show_id}")
+        try:
+            self.rotation.play_history.record_play(pseudo)
+            self.rotation.note_played(pseudo)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        try:
+            self.recorder.note_track(meta, pseudo)
+        except Exception:
+            pass
+        name = f"{meta['artist']} - {meta['title']}" if meta["artist"] else meta["title"]
+        self.now_playing_label.setText(f"Now Playing: {name}")
+        self.onair_status_label.setText("On Air: mix show playing.")
+        self.up_next_label.setText("Up Next: the mix show continues")
+        self.encoder_bank.push_metadata(meta)
+        self.refresh_played_list()
+        if first_of_show:
+            self.show_store.note(user, show_id, status="aired", aired_at=datetime.now().isoformat(timespec="seconds"))
+
+    def mix_bool(self, key, default="false"):
+        return str(self.settings.value(key, default)).lower() == "true"
+
+    def mix_setting_check(self, text, key, default="false"):
+        box = QCheckBox(text)
+        box.setChecked(self.mix_bool(key, default))
+        box.toggled.connect(lambda on, k=key: self.settings.setValue(k, "true" if on else "false"))
+        return box
+
+    def mix_setting_spin(self, key, low, high, default, name, suffix="", decimals=0):
+        if decimals:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(decimals)
+            spin.setSingleStep(0.5)
+        else:
+            spin = QSpinBox()
+        spin.setRange(low, high)
+        if suffix:
+            spin.setSuffix(suffix)
+        try:
+            value = float(self.settings.value(key, default))
+        except Exception:
+            value = float(default)
+        spin.setValue(value if decimals else int(round(value)))
+        spin.setAccessibleName(name)
+        spin.valueChanged.connect(lambda v, k=key: self.settings.setValue(k, v))
+        return spin
+
+    def mix_setting_combo(self, key, choices, default, name):
+        combo = QComboBox()
+        combo.setAccessibleName(name)
+        for value, text in choices:
+            combo.addItem(text, value)
+        current = str(self.settings.value(key, default))
+        for i, (value, _text) in enumerate(choices):
+            if str(value) == current:
+                combo.setCurrentIndex(i)
+        combo.currentIndexChanged.connect(lambda _i, k=key, c=combo: self.settings.setValue(k, c.currentData()))
+        return combo
+
+    def build_mix_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("Mix Blocks lets a DJ build part of an hour at home: songs beat-matched into each other, talk breaks recorded "
+                       "over a looping intro, cut so each part ends exactly on the station's break marks. The finished audio is sent "
+                       "to the station, which checks it, plays it at the planned time and logs every song. All of this is off until "
+                       "you switch it on. On the station computer, switch it on to let it play mixes it receives.")
+        intro.setWordWrap(True)
+        intro.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.mix_enable_check = self.mix_setting_check("Use mix blocks (builder here, and playing received mixes on the station)", "mix_enabled")
+        form.addRow(self.mix_enable_check)
+        form.addRow("Does this show use mix blocks?", self.mix_setting_combo(
+            "mix_show_mode", (("none", "None"), ("each", "Each hour, with a start and end I set"), ("full", "Full hour, commercial-free"),
+                              ("hour", "Decide hour by hour")), "none", "Does this show use mix blocks"))
+        form.addRow("Blend length:", self.mix_setting_combo("mix_blend_bars", ((4, "4 bars"), (8, "8 bars"), (16, "16 bars")), 8,
+                                                             "Bars the two songs play together"))
+        form.addRow("Most a song's speed may change (percent, 0 never changes it):",
+                    self.mix_setting_spin("mix_max_tempo_change", 0.0, 12.0, 3.0, "Most a song's speed may change, percent", " %", 1))
+        form.addRow("Speed change spread over this many bars before the blend:",
+                    self.mix_setting_spin("mix_ramp_bars", 0, 32, 8, "Bars before the blend over which the outgoing song changes speed"))
+        form.addRow("Songs end at:", self.mix_setting_combo("mix_exit", (("hook1", "End of the first hook"), ("hook2", "End of the second hook"),
+                                                                       ("end", "Natural end")), "hook2", "Where songs end"))
+        form.addRow("When songs cannot be beat-matched:", self.mix_setting_combo(
+            "mix_fallback", (("delay", "Echo-out into the next song"), ("cut", "Cut")), "delay", "When songs cannot be beat-matched"))
+        form.addRow("Intro loop under a talk break:", self.mix_setting_combo("mix_loop_bars", ((2, "2 bars"), (4, "4 bars")), 4,
+                                                                            "Bars of intro that loop under a talk break"))
+        form.addRow("Music goes down while you talk by (dB):", self.mix_setting_spin("mix_duck_db", -30, 0, -12, "Music level while talking, decibels", " dB"))
+        form.addRow("A part may end up to this many seconds early:", self.mix_setting_spin("mix_early_tolerance", 0, 120, 35, "Seconds a part may end early", " s"))
+        form.addRow("or this many seconds late:", self.mix_setting_spin("mix_late_tolerance", 0, 60, 8, "Seconds a part may end late", " s"))
+        form.addRow(self.mix_setting_check("Beep in my headphones while I record a talk break", "mix_talk_beeps", "true"))
+        form.addRow("Soft beep at (seconds):", self.mix_setting_spin("mix_talk_warn_seconds", 1, 300, 25, "Soft beep at this many seconds", " s"))
+        form.addRow("Double beep at (seconds):", self.mix_setting_spin("mix_talk_target_seconds", 1, 300, 30, "Double beep at this many seconds", " s"))
+        form.addRow("Low tone and stop at (seconds):", self.mix_setting_spin("mix_talk_max_seconds", 1, 300, 60, "Low tone and stop at this many seconds", " s"))
+        form.addRow("Station: keep played mixes for (days, 0 removes them after airing):",
+                    self.mix_setting_spin("shows_keep_days", 0, 60, 0, "Days to keep played mixes on the station"))
+        form.addRow("Warn on the home PC when a mix is not complete this many minutes before it airs:",
+                    self.mix_setting_spin("shows_warn_minutes", 10, 1440, 120, "Minutes before air time to warn of an incomplete mix"))
+        layout.addLayout(form)
+        for text, slot in (("Open The Mix Builder...", self.open_mix_builder), ("Open A Saved Mix...", self.open_saved_mix),
+                           ("Study A Folder Of Songs (tempo and hook report)...", self.study_song_folder)):
+            button = QPushButton(text)
+            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            button.clicked.connect(lambda _checked=False, f=slot: f())
+            layout.addWidget(button)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return page
+
+    def open_mix_builder(self, project=None):
+        if not self.mix_bool("mix_enabled"):
+            self.announce("Mix blocks are off. Tick Use mix blocks in Settings, Mix Blocks first.")
+            return
+        if project is None:
+            mode = str(self.settings.value("mix_show_mode", "none"))
+            project = new_project(hour=5, mode="full" if mode == "full" else "each")
+        self.mix_dialog = MixBuilderDialog(self, project)
+        self.mix_dialog.exec()
+
+    def open_saved_mix(self):
+        found = list_projects()
+        if not found:
+            self.announce("There are no saved mixes yet.")
+            return
+        names = [f"{p['name']} ({p['day']}, hour {int(p['hour']):02d})" for _path, p in found]
+        choice, ok = QInputDialog.getItem(self, "Open a saved mix", "Mix:", names, 0, False)
+        if ok:
+            self.open_mix_builder(found[names.index(choice)][1])
+
+    def study_song_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose the folder of songs to study", self.settings.value("music_library_folder", ""))
+        if not folder:
+            return
+        paths = scan_audio_files(folder)
+        if not paths:
+            self.announce("That folder has no songs.")
+            return
+        self.announce(f"Studying {len(paths)} songs. This takes a while the first time; results are saved.")
+        worker = MixAnalysisWorker(paths)
+        worker.progress.connect(self.update_status)
+        worker.done.connect(self.song_study_done)
+        self._study_worker = worker
+        worker.start()
+
+    def song_study_done(self, found):
+        lines = [analysis_report_line(path, data) for path, data in found]
+        report = os.path.join(mixes_folder(), "song_report.txt")
+        try:
+            with open(report, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
+        except OSError:
+            pass
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Songs studied")
+        box = QVBoxLayout()
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setAccessibleName("Tempo and hook report")
+        text.setPlainText("\n".join(lines) or "Nothing was studied.")
+        box.addWidget(text)
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+        box.addWidget(close)
+        dialog.setLayout(box)
+        dialog.resize(800, 500)
+        self.announce(f"Studied {len(found)} songs. The report is also saved in {report}.")
+        dialog.exec()
+
+    def clean_old_shows(self):
+        try:
+            keep = int(float(self.settings.value("shows_keep_days", 0)))
+            removed = self.show_store.clean_old(keep)
+            cutoff = datetime.now() - timedelta(hours=3)
+            for path, info in list(self.mix_parts.items()):
+                try:
+                    day = datetime.strptime(info[2]["day"], "%Y-%m-%d")
+                    if day + timedelta(hours=int(info[2]["hour"]) + 2) < cutoff:
+                        del self.mix_parts[path]
+                except Exception:
+                    pass
+            if removed:
+                RUN_LOG.write("SHOWS", f"Removed {removed} old mix show(s) to free disk space.")
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
     # --- Scheduler / sequence callbacks ---
     def start_break(self, slot):
         """Fade the music out (without cutting a song) and run the scheduled sequence."""
@@ -17164,6 +20944,10 @@ class BroadcastingApp(QWidget):
         sequence = config["sequence"]
         if slot == ":00" and str(self.settings.value("top_hour_ads", "false")).lower() != "true":
             sequence = "simple"      # the top of the hour is just its own jingle; commercials stay at :15 and :45
+        if sequence != "simple" and self.commercial_free_now():
+            sequence = "ids"
+            RUN_LOG.write("BREAK", f"{slot} break: this hour is a commercial-free mix hour, so only the station IDs play "
+                                   f"(jingle, sweeper, jingle) and no commercials.")
         self.sequence_player.play_sequence(slot, sequence, jingle_folder)
 
     def on_break_upcoming(self, slot, target):
