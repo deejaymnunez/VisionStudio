@@ -514,6 +514,19 @@ def scan_audio_files(folder, recursive=True):
     return found
 
 
+CONTENT_FILTER = {"fn": None}       # set by the program: keeps explicit songs (or the unwanted copy of a pair) out of rotations
+
+
+def filter_playable(paths):
+    fn = CONTENT_FILTER["fn"]
+    if fn is None:
+        return paths
+    try:
+        return fn(paths)
+    except Exception:
+        return paths
+
+
 # --- loudness normalization -------------------------------------------------
 _FILE_LOCKS = {}
 _FILE_LOCKS_GUARD = threading.Lock()
@@ -1268,7 +1281,7 @@ class MusicRotation:
                              data.get("id"), bool(data.get("regular", True)), bool(data.get("mix", False)))
 
     def track_paths(self):
-        return scan_audio_files(self.folder, self.recursive)
+        return filter_playable(scan_audio_files(self.folder, self.recursive))
 
 
 class RotationLibrary:
@@ -2268,6 +2281,11 @@ DEFAULT_SHORTCUTS = [
     ("say_encoders", "Announce encoder status", "Ctrl+Alt+E", True),
     ("voice_track_before", "Voice track: record before the selected queue item", "V", True),
     ("voice_track_after", "Voice track: record after the selected queue item", "Shift+V", True),
+    ("live_assist_toggle", "Live Assist on / off: you start each song, the program keeps everything else running", "L", True),
+    ("assist_play_next", "Live Assist: play the next song now (with nothing playing, starts the first song)", "N", True),
+    ("assist_hold_toggle", "Live Assist: wait for me at the end of a song, or carry on by itself", "Shift+L", True),
+    ("say_next", "Announce the next song, its length and about how long its intro is", "Ctrl+Alt+N", True),
+    ("mic_toggle", "Microphone on / off (the music ducks while you talk)", "F10", True),
     ("queue_move_up", "Queue list: move the selected track up", "Ctrl+Up", False),
     ("queue_move_down", "Queue list: move the selected track down", "Ctrl+Down", False),
     ("queue_remove", "Queue list: remove the selected track", "Del", False),
@@ -3542,6 +3560,12 @@ class RotationEngine:
         self.pick_problem = ""
         self._borrow_cache = (0.0, [])
         self.show_marks = []              # clock times where a mix show part starts: the songs before are fitted to end there
+        self.live_assist = False          # Live Assist: the DJ starts each song; the queue, breaks and hour fit stay automatic
+        self.assist_hold = True           # in Live Assist, wait for the DJ at the end of a song (False: carry on by itself)
+        self.assist_guard_ms = 15000      # silence after a song before the program carries on by itself (0: never)
+        self.assist_waiting = False
+        self.assist_token = 0
+        self.on_assist = None             # optional callable(text): spoken/announced Live Assist messages
         self.passed = []                  # songs of this hour already aired or skipped: [(path, "played" or "skipped")]
         self.passed_hour = None
         self.replaceable = set()          # queued songs the end-of-hour fit may swap (playlist songs, not hand-placed ones)
@@ -3662,7 +3686,7 @@ class RotationEngine:
                     self.active_rotation_id = candidate.id
                     return files
         self.active_rotation_id = None
-        return scan_audio_files(self.get_library_folder())  # includes every subfolder
+        return filter_playable(scan_audio_files(self.get_library_folder()))  # includes every subfolder
 
     def active_rotation_name(self):
         if self.rotation_library is None:
@@ -3928,6 +3952,8 @@ class RotationEngine:
 
     def rule_problem(self, path, planned=()):
         try:
+            if CONTENT_FILTER["fn"] is not None and is_song_entry(path) and path not in PSEUDO_SONGS and not filter_playable([path]):
+                return "the clean/explicit setting does not allow this version"
             return self.rules.check(path, self.play_history, planned)
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
@@ -3953,7 +3979,7 @@ class RotationEngine:
                     pass
         if not found:
             try:
-                found = list(scan_audio_files(self.get_library_folder()))
+                found = list(filter_playable(scan_audio_files(self.get_library_folder())))
             except Exception:
                 found = []
         self._borrow_owner = owner
@@ -4424,6 +4450,56 @@ class RotationEngine:
         self._queue_changed()
         return chosen
 
+    # --- Live Assist -------------------------------------------------------------------------------
+    def assist_holding(self, path=None):
+        """True when the next song must wait for the DJ. Voice tracks, and anything that is not a song, still chain on."""
+        if not (self.live_assist and self.assist_hold):
+            return False
+        return path is None or is_song_entry(path)
+
+    def _assist_say(self, text):
+        try:
+            (self.on_assist or self.on_status)(text)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def assist_wait_for_dj(self):
+        """The song on air has finished in Live Assist: the next one is ready and waits for the DJ."""
+        if not self.next_track_cued:
+            self.cue_next_track_if_needed()
+        self.assist_waiting = True
+        self.assist_token += 1
+        token = self.assist_token
+        upcoming = self.get_upcoming_track_path()
+        name = format_track_display(upcoming) if upcoming else "nothing"
+        guard = int(self.assist_guard_ms)
+        tail = f" If you do nothing it carries on in {guard // 1000} seconds." if guard > 0 else ""
+        self._assist_say(f"Live Assist: the song finished. Next is {name}. Press N to play it.{tail}")
+        if guard > 0:
+            QTimer.singleShot(guard, lambda t=token: self._assist_guard(t))
+
+    def _assist_guard(self, token):
+        if token != self.assist_token or not self.assist_waiting:
+            return
+        if not (self.live_assist and self.is_running and self.automation_on):
+            return
+        self._assist_say("Live Assist: carrying on by itself so the air is not silent.")
+        self.assist_play_next()
+
+    def assist_play_next(self):
+        """The DJ's go: the next song comes in now with the usual crossfade. Returns True if a song was started."""
+        if not self.is_running or not self.automation_on or self.is_paused_for_sequence:
+            return False
+        if not self.next_track_cued:
+            self.cue_next_track_if_needed()
+        if not self.next_track_cued:
+            return False
+        self.assist_waiting = False
+        self.assist_token += 1
+        self.break_fading = False
+        self.crossfade_to_cued_deck()
+        return True
+
     def cue_next_track_if_needed(self):
         """Loads the next track, paused at its start, into the non-live deck."""
         if self.next_track_cued or not self.is_running or not self.automation_on or self.is_paused_for_sequence:
@@ -4444,6 +4520,8 @@ class RotationEngine:
         self.next_track_cued = True
         self._notify_deck_update(cued_deck.name, next_track)
         self.prefetch_upcoming()
+        if self.assist_holding() and not self.assist_waiting:
+            self._assist_say(f"Live Assist: ready to play {format_track_display(next_track)}. Press N to play it.")
 
     def _retire_deck(self, deck):
         """Called when a deck has faded out: stop it and tell the screen it's empty."""
@@ -4460,6 +4538,7 @@ class RotationEngine:
         cued_deck = self.get_cued_deck()
         if cued_deck.current_track_path is None:
             return
+        self.assist_waiting = False
 
         target_level = self._effective_level()
         cued_deck.play()
@@ -4533,6 +4612,8 @@ class RotationEngine:
             if underlay is None and not self.crossfade_enabled():
                 return          # no overlap: the next song starts when this one finishes (see on_media_status_changed)
             if self.next_track_cued and 0 < remaining_ms <= lead_ms:
+                if self.assist_holding(deck.current_track_path):
+                    return          # Live Assist: the DJ starts the next song (or it waits for the end of this one)
                 self.crossfade_to_cued_deck(underlay_ms=remaining_ms if underlay is not None else None)
 
     def begin_crossfade_out(self, on_complete, seconds=None):
@@ -4649,6 +4730,9 @@ class RotationEngine:
                 if (self.break_target is not None and not self.break_started
                         and (self.break_style() == "finish_song" or self._seconds_to_mark() <= self.QUICK_BREAK_FADE_SECONDS + 1)):
                     self._take_break()
+                    return
+                if self.assist_holding(deck.current_track_path):
+                    self.assist_wait_for_dj()
                     return
                 if not self.next_track_cued:
                     self.cue_next_track_if_needed()
@@ -10208,6 +10292,294 @@ class TagCleanDialog(QDialog):
 def tagclean_words(settings):
     saved = parse_word_list(settings.value("tagclean_words", ""))
     return saved or list(DEFAULT_INTRO_WORDS)
+
+
+# ---------------------------------------------------------------------------
+# Clean and explicit music: named folders marked clean or explicit, a station setting for what may air,
+# and a scan that reads the explicit flag already inside the song files.
+# ---------------------------------------------------------------------------
+
+CONTENT_MODES = (("off", "Do not check (every song plays, as before)"),
+                 ("clean", "Clean only: explicit songs never air"),
+                 ("explicit", "Explicit allowed"))
+CONTENT_KINDS = (("classics", "Classics"), ("newschool", "New school"), ("other", "Other"))
+EXPLICIT_TAG_NAMES = {"ITUNESADVISORY", "EXPLICIT", "ADVISORY", "PARENTAL ADVISORY", "PARENTALADVISORY"}
+_BRACKET_RE = re.compile(r"[\(\[][^\)\]]*[\)\]]")
+_EXPLICIT_MARK_RE = re.compile(r"\b(explicit|dirty|uncensored|uncut|unedited)\b", re.IGNORECASE)
+_CLEAN_MARK_RE = re.compile(r"\b(clean|censored|radio edit|radio version|edited)\b", re.IGNORECASE)
+_TRAILING_MARK_RE = re.compile(r"\s[-_]\s*(explicit|dirty|clean)\s*$", re.IGNORECASE)
+
+
+def norm_path(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def filename_content_mark(path):
+    """'explicit' or 'clean' when the file name says so in brackets (Song (Explicit), Song [Clean], Song [E]); else ''.
+    A word in the song's own title (Dirty Diana) is not a mark."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    for group in _BRACKET_RE.findall(stem):
+        inner = group[1:-1].strip()
+        if inner.lower() == "e":
+            return "explicit"
+        if _EXPLICIT_MARK_RE.search(inner):
+            return "explicit"
+        if _CLEAN_MARK_RE.search(inner):
+            return "clean"
+    m = _TRAILING_MARK_RE.search(stem)
+    if m:
+        return "clean" if m.group(1).lower() == "clean" else "explicit"
+    return ""
+
+
+def pair_key(path):
+    """Two files that are the clean and the explicit version of one song share this key."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = _BRACKET_RE.sub(lambda m: "" if (_EXPLICIT_MARK_RE.search(m.group(0)) or _CLEAN_MARK_RE.search(m.group(0))
+                                            or m.group(0)[1:-1].strip().lower() == "e") else m.group(0), stem)
+    stem = _TRAILING_MARK_RE.sub("", stem)
+    stem = re.sub(r"^\s*\d{1,3}\s*[-_. ]\s*", "", stem)
+    return re.sub(r"[^a-z0-9]+", "", stem.lower())
+
+
+def _interpret_advisory(value):
+    v = str(value).strip().lower()
+    if v in ("1", "4", "explicit", "e", "true", "yes", "y"):
+        return "explicit"
+    if v in ("2", "clean", "c", "cleaned", "false", "no"):
+        return "clean"
+    return ""
+
+
+def read_explicit_tag(path, opener=None):
+    """What the file itself says: 'explicit', 'clean' or '' (iTunes advisory, EXPLICIT tag, MP4 rtng)."""
+    try:
+        if opener is None:
+            import mutagen
+            opener = mutagen.File
+        audio = opener(path)
+    except Exception:
+        return ""
+    if audio is None:
+        return ""
+    tags = getattr(audio, "tags", None)
+    found = []
+    try:
+        if tags is not None and hasattr(tags, "getall"):
+            for frame in tags.getall("TXXX"):
+                if str(getattr(frame, "desc", "")).upper() in EXPLICIT_TAG_NAMES:
+                    found.extend(str(t) for t in getattr(frame, "text", []))
+        if tags is not None and hasattr(tags, "get") and not hasattr(tags, "getall"):
+            for key in ("rtng", "ITUNESADVISORY", "itunesadvisory", "EXPLICIT", "explicit", "ADVISORY", "advisory"):
+                values = tags.get(key)
+                if values is not None:
+                    found.extend(values if isinstance(values, (list, tuple)) else [values])
+        elif tags is None and hasattr(audio, "get"):
+            for key in ("itunesadvisory", "explicit", "advisory"):
+                values = audio.get(key)
+                if values is not None:
+                    found.extend(values if isinstance(values, (list, tuple)) else [values])
+    except Exception:
+        return ""
+    answers = [_interpret_advisory(v) for v in found]
+    if "explicit" in answers:
+        return "explicit"
+    if "clean" in answers:
+        return "clean"
+    return ""
+
+
+class ContentRules:
+    """Which songs may air. Mode off: everything. Clean only: songs marked explicit are left out of every rotation.
+    Explicit allowed: all play, except that when a song exists in a clean and an explicit version only the one you
+    prefer plays. A song's status is, in order: a mark from the tag scan, the folder it is in (marked Clean or
+    Explicit), a bracketed word in its file name, otherwise clean."""
+
+    def __init__(self, settings, marks_path=None):
+        self.settings = settings
+        self.marks_path = marks_path
+        self.lock = threading.RLock()
+        self._pairs = (0.0, {})
+        self.load()
+
+    # --- loading and saving
+    def load(self):
+        s = self.settings
+        mode = str(s.value("content_mode", "off"))
+        self.mode = mode if mode in ("off", "clean", "explicit") else "off"
+        self.prefer = "explicit" if str(s.value("content_prefer", "clean")) == "explicit" else "clean"
+        try:
+            sources = json.loads(s.value("content_sources_json", "[]"))
+        except Exception:
+            sources = []
+        self.sources = [x for x in sources if isinstance(x, dict) and x.get("folder")]
+        for x in self.sources:
+            x["_root"] = norm_path(x["folder"])
+        path = self.marks_path or os.path.join(get_data_folder("Content"), "marks.json")
+        self.marks_path = path
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                self.marks = {k: v for k, v in json.load(handle).items() if v in ("e", "c")}
+        except Exception:
+            self.marks = {}
+        self._pairs = (0.0, {})
+
+    def save_sources(self):
+        data = [{k: v for k, v in x.items() if not k.startswith("_")} for x in self.sources]
+        self.settings.setValue("content_sources_json", json.dumps(data))
+        self._pairs = (0.0, {})
+
+    def save_marks(self):
+        try:
+            os.makedirs(os.path.dirname(self.marks_path), exist_ok=True)
+            tmp = self.marks_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self.marks, handle)
+            os.replace(tmp, self.marks_path)
+        except OSError:
+            pass
+
+    # --- the sources (named folders)
+    def add_source(self, name, kind, folder, content):
+        norm = norm_path(folder)
+        for x in self.sources:
+            if x["_root"] == norm:
+                x.update({"name": name, "kind": kind, "content": content})
+                self.save_sources()
+                return x
+        item = {"id": uuid.uuid4().hex[:8], "name": name, "kind": kind, "folder": folder,
+                "content": "explicit" if content == "explicit" else "clean", "_root": norm}
+        self.sources.append(item)
+        self.save_sources()
+        return item
+
+    def find_source(self, source_id):
+        return next((x for x in self.sources if x.get("id") == source_id), None)
+
+    def remove_source(self, source_id):
+        item = self.find_source(source_id)
+        if item is None:
+            return False
+        self.sources.remove(item)
+        self.save_sources()
+        return True
+
+    def set_content(self, source_id, content):
+        item = self.find_source(source_id)
+        if item is None:
+            return False
+        item["content"] = "explicit" if content == "explicit" else "clean"
+        self.save_sources()
+        return True
+
+    # --- what a song is
+    def source_for(self, path):
+        norm = norm_path(path)
+        best = None
+        for x in self.sources:
+            root = x["_root"]
+            if norm == root or norm.startswith(root.rstrip(os.sep) + os.sep):
+                if best is None or len(root) > len(best["_root"]):
+                    best = x
+        return best
+
+    def status(self, path):
+        mark = self.marks.get(norm_path(path))
+        if mark:
+            return "explicit" if mark == "e" else "clean"
+        source = self.source_for(path)
+        if source is not None:
+            return source["content"]
+        return filename_content_mark(path) or "clean"
+
+    def add_marks(self, found):
+        """found: {path: 'explicit' or 'clean'} from a tag scan."""
+        with self.lock:
+            for path, value in found.items():
+                self.marks[norm_path(path)] = "e" if value == "explicit" else "c"
+            self.save_marks()
+
+    # --- the pairs
+    def pair_index(self, max_age=300.0):
+        now = time.time()
+        with self.lock:
+            if now - self._pairs[0] < max_age and self._pairs[1]:
+                return self._pairs[1]
+            index = {}
+            for x in self.sources:
+                for path in scan_audio_files(x["folder"]):
+                    index.setdefault(pair_key(path), set()).add(self.status(path))
+            self._pairs = (now, index)
+            return index
+
+    # --- the filter every rotation goes through
+    def filter(self, paths):
+        if self.mode == "off":
+            return paths
+        statuses = {p: self.status(p) for p in paths}
+        if self.mode == "clean":
+            return [p for p in paths if statuses[p] != "explicit"]
+        index = self.pair_index() if self.sources else {}
+        local = {}
+        for p in paths:
+            local.setdefault(pair_key(p), set()).add(statuses[p])
+        keep = []
+        for p in paths:
+            key = pair_key(p)
+            seen = local.get(key, set()) | index.get(key, set())
+            if len(seen) > 1 and statuses[p] != self.prefer:
+                continue
+            keep.append(p)
+        return keep
+
+    def describe(self, source):
+        count = len(scan_audio_files(source["folder"]))
+        kind = dict(CONTENT_KINDS).get(source.get("kind", "other"), "Other")
+        return f"{source['name']}: {kind}, {source['content'].title()}, {count} songs, {source['folder']}"
+
+
+class ExplicitScanWorker(QThread):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(object)
+
+    def __init__(self, paths, reader=None):
+        super().__init__()
+        self.paths = list(paths)
+        self.reader = reader or read_explicit_tag
+        self.stop_flag = False
+
+    def cancel(self):
+        self.stop_flag = True
+
+    def run(self):
+        found = {}
+        try:
+            for number, path in enumerate(self.paths, 1):
+                if self.stop_flag:
+                    break
+                if number % 25 == 1:
+                    self.progress.emit(f"Reading explicit flags: song {number} of {len(self.paths)}.")
+                value = self.reader(path)
+                if value:
+                    found[path] = value
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.done.emit(found)
+
+
+# --- Live Assist helpers ---------------------------------------------------------------------------
+def intro_estimate_seconds(analysis):
+    """About how many seconds of intro a song has before the full song starts, from the tempo analysis. None if unknown."""
+    if not analysis:
+        return None
+    try:
+        bpm = float(analysis.get("bpm") or 0.0)
+        drop = analysis.get("drop_bar")
+        if bpm <= 0 or drop is None:
+            return None
+        return float(analysis.get("downbeat") or 0.0) + int(drop) * 4 * 60.0 / bpm
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -16577,6 +16949,55 @@ class MixBuilderDialog(QDialog):
         super().done(result)
 
 
+# ---------------------------------------------------------------------------
+# DJ tab pieces: importing a named music folder as Clean or Explicit.
+# ---------------------------------------------------------------------------
+
+class ContentSourceDialog(QDialog):
+    """Asks what a folder is: its name, whether it is Classics / New school / Other, and whether it is Clean or Explicit."""
+
+    def __init__(self, parent, folder, kind="other", name=""):
+        super().__init__(parent)
+        self.setWindowTitle("Import a music folder")
+        layout = QFormLayout()
+        info = QLabel(f"Folder: {folder}")
+        info.setWordWrap(True)
+        info.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addRow(info)
+        label = dict(CONTENT_KINDS).get(kind, "Other")
+        guess = name or label
+        low = os.path.basename(os.path.normpath(folder)).lower()
+        self.name_edit = QLineEdit(guess)
+        self.name_edit.setAccessibleName("Name for this folder")
+        layout.addRow("Name:", self.name_edit)
+        self.kind_combo = QComboBox()
+        self.kind_combo.setAccessibleName("What kind of music this folder holds")
+        for key, text in CONTENT_KINDS:
+            self.kind_combo.addItem(text, key)
+        self.kind_combo.setCurrentIndex(max(0, self.kind_combo.findData(kind)))
+        layout.addRow("Kind of music:", self.kind_combo)
+        self.content_combo = QComboBox()
+        self.content_combo.setAccessibleName("Is this folder clean or explicit?")
+        self.content_combo.addItem("Clean", "clean")
+        self.content_combo.addItem("Explicit", "explicit")
+        if re.search(r"explicit|dirty|uncensored|uncut", low):
+            self.content_combo.setCurrentIndex(1)
+        layout.addRow("This folder is:", self.content_combo)
+        note = QLabel("If you have the same songs in two folders, one clean and one explicit, import both and mark each. "
+                      "Which version plays is set on the DJ tab.")
+        note.setWordWrap(True)
+        layout.addRow(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+        self.setLayout(layout)
+        self.name_edit.setFocus()
+
+    def values(self):
+        return (self.name_edit.text().strip() or "Music", self.kind_combo.currentData(), self.content_combo.currentData())
+
+
 
 # ---------------------------------------------------------------------------
 # Main application window
@@ -16747,6 +17168,8 @@ class BroadcastingApp(QWidget):
         self.vt_accounts = VTAccounts(self.settings)
         self.gui_caller = GuiCaller()
         self.vt_service = VTService(self)
+        self.content_rules = ContentRules(self.settings)
+        CONTENT_FILTER["fn"] = self.content_rules.filter
         self.show_store = ShowStore()
         self.mix_parts = {}                    # part file on the station -> (person, show id, manifest, part number)
         self.show_tracker = ShowAirTracker()
@@ -16798,6 +17221,8 @@ class BroadcastingApp(QWidget):
         QTimer.singleShot(2500, lambda: threading.Thread(target=self.rotation.warm_up, daemon=True).start())
         QTimer.singleShot(8000, self.resume_after_start)
         QTimer.singleShot(3000, self.apply_remote_vt)
+        self.apply_live_assist_settings()
+        self.rotation.on_assist = self.announce
         try:
             set_display_clean(str(self.settings.value("tagclean_display", "false")).lower() == "true", tagclean_words(self.settings))
         except Exception as e:
@@ -16930,6 +17355,11 @@ class BroadcastingApp(QWidget):
             "say_encoders": self.say_encoders,
             "voice_track_before": self.voice_track_before,
             "voice_track_after": self.voice_track_after,
+            "live_assist_toggle": self.live_assist_toggle,
+            "assist_play_next": self.assist_play_next,
+            "assist_hold_toggle": self.assist_hold_toggle,
+            "say_next": self.say_next,
+            "mic_toggle": self.mic_toggle,
         }
 
     def rebuild_shortcuts(self):
@@ -17586,6 +18016,8 @@ class BroadcastingApp(QWidget):
             text = "A scheduled break is on."
         elif playing:
             text = "Rotation is playing."
+        elif self.rotation.is_running and self.rotation.assist_waiting:
+            text = "Live Assist: waiting for you. Press N to play the next song."
         elif self.rotation.is_running:
             text = "Rotation is running but paused."
         else:
@@ -18196,7 +18628,9 @@ class BroadcastingApp(QWidget):
         file_menu.setAccessibleName("File menu")
         voice_menu = self.menu_bar.addMenu("&Voice Track")
         voice_menu.setAccessibleName("Voice Track menu")
-        self.menu_by_letter = {"F": file_menu, "V": voice_menu}
+        dj_menu = self.menu_bar.addMenu("&DJ")
+        dj_menu.setAccessibleName("DJ menu")
+        self.menu_by_letter = {"F": file_menu, "V": voice_menu, "D": dj_menu}
         self.menu_open_check_logged = False
 
         def add(menu, key, text, handler, checkable=False):
@@ -18223,6 +18657,14 @@ class BroadcastingApp(QWidget):
         file_menu.addSeparator()
         add(file_menu, "exit", "Exit Vision Studio", self.exit_program)
 
+        add(dj_menu, "live_assist_toggle", "Live Assist on or off", self.live_assist_toggle)
+        add(dj_menu, "assist_play_next", "Live Assist: play the next song now", self.assist_play_next)
+        add(dj_menu, "assist_hold_toggle", "Live Assist: wait for me, or carry on by itself", self.assist_hold_toggle)
+        add(dj_menu, "say_next", "Announce the next song and its intro", self.say_next)
+        add(dj_menu, "mic_toggle", "Microphone on or off", self.mic_toggle)
+        dj_menu.addSeparator()
+        add(dj_menu, "open_dj_settings", "Open the DJ settings", lambda: self.show_settings_section("DJ"))
+        add(dj_menu, "open_mix_builder", "Open the Mix Builder", self.open_mix_builder)
         add(voice_menu, "voice_track_before", "Record a voice track before the selected queue item", self.voice_track_before)
         add(voice_menu, "voice_track_after", "Record a voice track after the selected queue item", self.voice_track_after)
         voice_menu.addSeparator()
@@ -20326,6 +20768,7 @@ class BroadcastingApp(QWidget):
         self.stations_tab = self.build_stations_tab()
         self.conference_tab = self.build_conference_tab()
         self.mix_tab = self.build_mix_tab()
+        self.dj_tab = self.build_dj_tab()
         self.vt_page = VoiceTrackerPage(self)
         sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
                     ("Startup and Tray", self.settings_pages["startup"]), ("Playlists", self.settings_pages["playlists"]),
@@ -20335,7 +20778,7 @@ class BroadcastingApp(QWidget):
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("DJ", self.dj_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
@@ -20909,6 +21352,278 @@ class BroadcastingApp(QWidget):
         dialog.resize(800, 500)
         self.announce(f"Studied {len(found)} songs. The report is also saved in {report}.")
         dialog.exec()
+
+    # --- DJ tab: clean / explicit music folders ---------------------------------------------------
+    def build_dj_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        intro = QLabel("The DJ tab holds your named music folders (Classics, New school and so on), whether each is clean or explicit, "
+                       "and Live Assist. Everything here is off until you switch it on.")
+        intro.setWordWrap(True)
+        intro.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        mode_combo = self.mix_setting_combo("content_mode", CONTENT_MODES, "off", "Which songs may air")
+        prefer_combo = self.mix_setting_combo("content_prefer", (("clean", "Clean version"), ("explicit", "Explicit version")), "clean",
+                                              "Which version plays when a song is in both a clean and an explicit folder")
+        for combo in (mode_combo, prefer_combo):
+            combo.currentIndexChanged.connect(lambda _i: self.on_content_setting_changed())
+        form.addRow("Which songs may air:", mode_combo)
+        form.addRow("When a song is in a clean and an explicit folder, play the:", prefer_combo)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Music folders:"))
+        self.content_list = QListWidget()
+        self.content_list.setAccessibleName("Music folders and whether each is clean or explicit")
+        layout.addWidget(self.content_list, 1)
+        row = QHBoxLayout()
+        for text, kind in (("Import Classics Folder...", "classics"), ("Import New School Folder...", "newschool"),
+                           ("Import Another Folder...", "other")):
+            button = QPushButton(text)
+            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            button.clicked.connect(lambda _c=False, k=kind: self.import_content_folder(k))
+            row.addWidget(button)
+        layout.addLayout(row)
+        row2 = QHBoxLayout()
+        for text, slot in (("Change Selected Folder's Type...", self.change_content_type), ("Remove Selected Folder From This List", self.remove_content_folder),
+                           ("Read Explicit Flags From The Songs Now", self.scan_explicit_tags)):
+            button = QPushButton(text)
+            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            button.clicked.connect(lambda _c=False, f=slot: f())
+            row2.addWidget(button)
+        layout.addLayout(row2)
+        self.content_status = QLabel("")
+        self.content_status.setWordWrap(True)
+        self.content_status.setAccessibleName("Music folder status")
+        layout.addWidget(self.content_status)
+        assist = QFormLayout()
+        assist.addRow(QLabel("Live Assist: you start each song with N; the program keeps the queue, the breaks, the hour timing and the mixing running."))
+        self.assist_enable_check = self.mix_setting_check("Live Assist is on", "live_assist_enabled")
+        self.assist_enable_check.toggled.connect(lambda _on: self.apply_live_assist_settings(announce=True))
+        assist.addRow(self.assist_enable_check)
+        wait = self.mix_setting_combo("live_assist_wait", (("wait", "Wait for me (the next song is ready; press N)"), ("carry", "Carry on by itself as usual")),
+                                      "wait", "When a song ends and I have not started the next")
+        wait.currentIndexChanged.connect(lambda _i: self.apply_live_assist_settings())
+        assist.addRow("When a song ends and I have not started the next:", wait)
+        guard = self.mix_setting_spin("live_assist_guard_seconds", 0, 120, 15, "Carry on by itself after this many seconds of silence, 0 never", " s")
+        guard.valueChanged.connect(lambda _v: self.apply_live_assist_settings())
+        assist.addRow("Carry on by itself after this much silence (0 never):", guard)
+        layout.addLayout(assist)
+        page.setLayout(layout)
+        self.refresh_content_list()
+        return page
+
+    def on_content_setting_changed(self):
+        self.content_rules.load()
+        self.announce("Saved. Generate playlists now (Control Shift G) to apply it to hours already built; "
+                      "songs that are not allowed are skipped as they come up.")
+
+    def refresh_content_list(self):
+        self.content_list.clear()
+        for source in self.content_rules.sources:
+            item = QListWidgetItem(self.content_rules.describe(source))
+            item.setData(Qt.ItemDataRole.UserRole, source["id"])
+            self.content_list.addItem(item)
+        if self.content_list.count():
+            self.content_list.setCurrentRow(0)
+
+    def selected_content_source(self):
+        item = self.content_list.currentItem()
+        return self.content_rules.find_source(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
+
+    def import_content_folder(self, kind):
+        start = self.settings.value("music_library_folder", "")
+        folder = QFileDialog.getExistingDirectory(self, "Choose the music folder", start)
+        if not folder:
+            return
+        if not scan_audio_files(folder):
+            self.announce("That folder has no songs in it.")
+            return
+        dialog = ContentSourceDialog(self, folder, kind)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, picked_kind, content = dialog.values()
+        source = self.content_rules.add_source(name, picked_kind, folder, content)
+        added = self.ensure_rotation_for_folder(source)
+        self.content_rules.load()
+        self.refresh_content_list()
+        text = f"{name} added as {content}. "
+        text += (f"It is a new rotation named {added}; put it in the Schedule to use it. " if added else "")
+        self.content_status.setText(text)
+        self.announce(text)
+        self.scan_explicit_tags(only=folder)
+
+    def ensure_rotation_for_folder(self, source):
+        """A folder outside the music library becomes a rotation; one inside it already has one. Returns the new name or ''."""
+        norm = norm_path(source["folder"])
+        for rotation in self.rotation_library.rotations:
+            if rotation.folder and norm_path(rotation.folder) == norm:
+                return ""
+        root = self.settings.value("music_library_folder", "")
+        if root and (norm == norm_path(root) or norm.startswith(norm_path(root).rstrip(os.sep) + os.sep)):
+            return ""
+        rotation = self.rotation_library.add_rotation(source["name"], source["folder"], True, auto=False, regular=False)
+        return rotation.name
+
+    def change_content_type(self):
+        source = self.selected_content_source()
+        if source is None:
+            self.announce("Select a folder in the list first.")
+            return
+        choice, ok = QInputDialog.getItem(self, "Clean or explicit", f"{source['name']} is:", ["Clean", "Explicit"],
+                                          1 if source["content"] == "explicit" else 0, False)
+        if ok:
+            self.content_rules.set_content(source["id"], choice.lower())
+            self.content_rules.load()
+            row = self.content_list.currentRow()
+            self.refresh_content_list()
+            self.content_list.setCurrentRow(row)
+            self.announce(f"{source['name']} is now marked {choice.lower()}.")
+
+    def remove_content_folder(self):
+        source = self.selected_content_source()
+        if source is None:
+            self.announce("Select a folder in the list first.")
+            return
+        self.content_rules.remove_source(source["id"])
+        self.content_rules.load()
+        self.refresh_content_list()
+        self.announce(f"{source['name']} removed from this list. The folder and its songs are untouched.")
+
+    def scan_explicit_tags(self, only=None):
+        if isinstance(only, bool):
+            only = None
+        folders = [only] if only else [x["folder"] for x in self.content_rules.sources]
+        root = self.settings.value("music_library_folder", "")
+        if not only and root:
+            folders.append(root)
+        paths = []
+        for folder in dict.fromkeys(folders):
+            paths.extend(scan_audio_files(folder))
+        paths = list(dict.fromkeys(paths))
+        if not paths:
+            self.announce("There are no songs to read.")
+            return
+        self.content_status.setText(f"Reading the explicit flags of {len(paths)} songs...")
+        worker = ExplicitScanWorker(paths)
+        worker.progress.connect(self.content_status.setText)
+        worker.done.connect(self.explicit_scan_done)
+        self._explicit_worker = worker
+        worker.start()
+
+    def explicit_scan_done(self, found):
+        if found:
+            self.content_rules.add_marks(found)
+        explicit = sum(1 for v in found.values() if v == "explicit")
+        clean = len(found) - explicit
+        text = (f"Done. {explicit} song(s) carry an explicit flag and are marked explicit; {clean} carry a clean flag. "
+                "Songs with no flag take the type of their folder." if found else
+                "Done. No song carries an explicit or clean flag, so each takes the type of its folder.")
+        self.content_status.setText(text)
+        self.announce(text)
+
+    # --- Live Assist -------------------------------------------------------------------------------
+    def apply_live_assist_settings(self, announce=False):
+        on = self.mix_bool("live_assist_enabled")
+        engine = self.rotation
+        was = engine.live_assist
+        engine.live_assist = on
+        engine.assist_hold = str(self.settings.value("live_assist_wait", "wait")) != "carry"
+        try:
+            engine.assist_guard_ms = max(0, int(float(self.settings.value("live_assist_guard_seconds", 15)))) * 1000
+        except Exception:
+            engine.assist_guard_ms = 15000
+        if not on:
+            engine.assist_waiting = False
+            engine.assist_token += 1
+        if announce and on != was:
+            self.announce(self.live_assist_sentence())
+
+    def live_assist_sentence(self):
+        engine = self.rotation
+        if not engine.live_assist:
+            return "Live Assist is off. Songs follow each other automatically."
+        if engine.assist_hold:
+            tail = (f" If you do nothing, it carries on by itself after {engine.assist_guard_ms // 1000} seconds of silence."
+                    if engine.assist_guard_ms > 0 else "")
+            return "Live Assist is on. The next song waits for you: press N to play it." + tail
+        return "Live Assist is on, and songs carry on by themselves. Press N to bring the next song in early."
+
+    def typing_in_field(self):
+        try:
+            widget = QApplication.focusWidget()
+            return isinstance(widget, (QLineEdit, QPlainTextEdit, QAbstractSpinBox)) or (isinstance(widget, QComboBox) and widget.isEditable())
+        except Exception:
+            return False
+
+    def live_assist_toggle(self):
+        if self.typing_in_field():
+            return
+        new = not self.mix_bool("live_assist_enabled")
+        self.settings.setValue("live_assist_enabled", "true" if new else "false")
+        if hasattr(self, "assist_enable_check"):
+            self.assist_enable_check.blockSignals(True)
+            self.assist_enable_check.setChecked(new)
+            self.assist_enable_check.blockSignals(False)
+        self.apply_live_assist_settings()
+        self.announce(self.live_assist_sentence())
+
+    def assist_hold_toggle(self):
+        if self.typing_in_field():
+            return
+        if not self.rotation.live_assist:
+            self.announce("Live Assist is off. Press L to turn it on.")
+            return
+        carry = self.rotation.assist_hold            # currently waiting: switch to carrying on
+        self.settings.setValue("live_assist_wait", "carry" if carry else "wait")
+        self.apply_live_assist_settings()
+        self.announce(self.live_assist_sentence())
+
+    def assist_play_next(self):
+        """N: the next song comes in now. With nothing playing it starts the first song."""
+        if self.typing_in_field():
+            return
+        engine = self.rotation
+        if not engine.is_running or not engine.automation_on:
+            self.start_rotation()
+            self.refresh_queue_list()
+            return
+        if engine.assist_play_next():
+            self.announce(f"Playing {format_track_display(engine.current_track_path)}." if engine.current_track_path else "Playing the next song.")
+        else:
+            self.announce("There is no song ready to play yet." if not engine.is_paused_for_sequence else "A break is on.")
+        self.refresh_queue_list()
+
+    def say_next(self):
+        path = self.rotation.get_upcoming_track_path()
+        if not path:
+            self.announce("Nothing is queued next.")
+            return
+        text = f"Next: {format_track_display(path)}."
+        try:
+            intro = intro_estimate_seconds(load_analysis(path))
+            duration = get_track_duration(path)
+            if duration:
+                text += f" Length {speak_duration(duration)}."
+            if intro:
+                text += f" The full song starts about {int(round(intro))} seconds in."
+        except Exception:
+            pass
+        self.announce(text)
+
+    def mic_toggle(self):
+        if self.typing_in_field():
+            return
+        if self.microphone.is_live:
+            self.stop_microphone()
+        else:
+            self.start_microphone()
+
+    def show_settings_section(self, name):
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == name:
+                self.show_settings(index)
+                return
+        self.show_settings()
 
     def clean_old_shows(self):
         try:
