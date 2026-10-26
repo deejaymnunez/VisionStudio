@@ -16541,7 +16541,7 @@ class MixBuilderDialog(QDialog):
         self.status.setAccessibleName("Mix status")
         layout.addWidget(self.status)
         row = QHBoxLayout()
-        for text, slot in (("Build The Audio", self.build), ("Hear A Part...", self.hear_part), ("Send To The Station", self.send),
+        for text, slot in (("Build The Audio", self.build), ("Hear A Part...", self.hear_part), ("Put A Part In The Queue...", self.queue_part), ("Send To The Station", self.send),
                            ("Station Status", self.station_status), ("Save", self.save), ("Close", self.accept)):
             button = QPushButton(text)
             button.clicked.connect(lambda _c=False, f=slot: f())
@@ -16841,7 +16841,7 @@ class MixBuilderDialog(QDialog):
             self.say("The mix could not be built: " + error)
             return
         self.manifest = manifest
-        text = f"Built {len(manifest['parts'])} part(s), {sum(len(p['songs']) for p in manifest['parts'])} songs. Use Hear A Part to listen, then Send To The Station."
+        text = f"Built {len(manifest['parts'])} part(s), {sum(len(p['songs']) for p in manifest['parts'])} songs. Use Hear A Part to listen, Put A Part In The Queue to play it on your own stream, or Send To The Station. The files are in {self.package_folder()}."
         if manifest["notes"]:
             text += " " + " ".join(manifest["notes"])
         self.say(text)
@@ -16860,6 +16860,28 @@ class MixBuilderDialog(QDialog):
         except Exception:
             self.manifest = None
         return self.manifest
+
+    def queue_part(self):
+        """Puts a built part next in the on-air queue, so it plays like a song (on a test stream, for example)."""
+        manifest = self.load_manifest()
+        if not manifest:
+            self.say("Build the audio first.")
+            return
+        number = 1
+        if len(manifest["parts"]) > 1:
+            number, ok = QInputDialog.getInt(self, "Put a part in the queue", f"Which part (1 to {len(manifest['parts'])})?", 1, 1, len(manifest["parts"]))
+            if not ok:
+                return
+        path = os.path.join(self.package_folder(), manifest["parts"][number - 1]["file"])
+        if not os.path.isfile(path):
+            self.say("That part's file is missing. Build the audio again.")
+            return
+        self.app.rotation.insert_queue_item(path, 0)
+        try:
+            self.app.refresh_queue_list()
+        except Exception:
+            pass
+        self.say(f"Part {number} is next in the queue. It plays when the song on air finishes.")
 
     def hear_part(self):
         manifest = self.load_manifest()
