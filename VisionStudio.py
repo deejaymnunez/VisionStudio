@@ -13890,6 +13890,7 @@ class VTClient:
 
 SHOW_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
 SHOW_FILE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}\.(mp3|wav|flac|ogg|m4a|aac)$", re.IGNORECASE)
+AUTO_SHOW_USER = "~dj-auto"          # the name DJ mode files its own shows under
 SHOW_MAX_PARTS = 8
 SHOW_MAX_PART_BYTES = 400 * 1024 * 1024
 SHOW_MAX_SHOW_BYTES = 1024 * 1024 * 1024
@@ -14112,7 +14113,8 @@ class ShowStore:
     def show_for_hour(self, day, hour):
         """The verified show for that hour (newest first if several), as (user, show id, manifest, state), or None."""
         candidates = [s for s in self.list_shows() if s["day"] == day.isoformat() and s["hour"] == int(hour) and s["status"] in ("verified", "aired")]
-        candidates.sort(key=lambda s: s.get("verified_at", ""), reverse=True)
+        # a show somebody built and sent beats one the program built by itself (DJ mode); then the newest wins
+        candidates.sort(key=lambda s: (s["user"] != AUTO_SHOW_USER, s.get("verified_at", "")), reverse=True)
         for s in candidates:
             manifest = self.manifest(s["user"], s["show_id"])
             state = self.state(s["user"], s["show_id"])
@@ -16106,7 +16108,7 @@ def rules_problems(project, rules, history=None):
     return problems
 
 
-def build_package(project, plan, opts, song_for, progress=None, should_stop=None, decode=None):
+def build_package(project, plan, opts, song_for, progress=None, should_stop=None, decode=None, bitrate="256k"):
     """Renders every part to an audio file in the project's package folder and writes the manifest. Returns the manifest."""
     folder = os.path.join(project_folder(project), "package")
     shutil.rmtree(folder, ignore_errors=True)
@@ -16140,7 +16142,7 @@ def build_package(project, plan, opts, song_for, progress=None, should_stop=None
         audio, notes = render_part(part, opts, voice_loader=voice_loader, progress=part_progress, **kwargs)
         if progress is not None:
             progress(f"Part {number + 1}: saving the audio file...")
-        if not write_audio_file(path, audio):
+        if not write_audio_file(path, audio, bitrate=bitrate):
             # MP3 encoding is not available here: keep the part uncompressed instead (bigger, but nothing is lost).
             name = f"{show_id}_p{number + 1}.wav"
             path = os.path.join(folder, name)
@@ -16178,6 +16180,7 @@ def auto_mix_pick(candidates, parts, opts, rules=None, rng=None, history=None, m
     for _ in range(max_songs):
         last = chosen[-1] if chosen else None
         options = []
+        stretch = []
         for c in pool:
             if c in chosen:
                 continue
@@ -16189,11 +16192,14 @@ def auto_mix_pick(candidates, parts, opts, rules=None, rng=None, history=None, m
                 target = min([c["bpm"], c["bpm"] * 2, c["bpm"] / 2], key=lambda b: abs(b / last["bpm"] - 1.0))
                 change = abs(target / last["bpm"] - 1.0)
                 if change > opts["max_tempo_change"] / 100.0 + 1e-9:
+                    stretch.append((change + rng.random() * 0.004, c))      # only if nothing blends: it comes in with an echo-out
                     continue
             else:
                 change = 0.0
             hook_bonus = 0.0 if c["hooks"] else 0.01
             options.append((change + hook_bonus + rng.random() * 0.004, c))
+        if not options:
+            options = stretch
         if not options:
             break
         options.sort(key=lambda x: x[0])
@@ -16996,6 +17002,163 @@ class MixBuilderDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# DJ mode: the program builds the mix for each hour by itself, like automation, and files it as a show.
+# Shows built by hand in the Mix Builder (or sent from another PC) always win over these.
+# ---------------------------------------------------------------------------
+
+DJ_BITRATE = "192k"
+DJ_RETRY_SECONDS = 3600
+
+
+def parse_hours(text):
+    """'all' or '' -> every hour; '5-9, 14' -> {5,6,7,8,9,14}."""
+    text = str(text or "").strip().lower()
+    if text in ("", "all", "every hour", "every"):
+        return set(range(24))
+    out = set()
+    for chunk in re.split(r"[,\s]+", text):
+        m = re.match(r"^(\d{1,2})(?:\s*-\s*(\d{1,2}))?$", chunk)
+        if not m:
+            continue
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) is not None else a
+        if a > b:
+            a, b = b, a
+        out.update(h for h in range(a, b + 1) if 0 <= h <= 23)
+    return out or set(range(24))
+
+
+def dj_settings(settings):
+    def number(key, default, low, high):
+        try:
+            return max(low, min(high, int(float(settings.value(key, default)))))
+        except Exception:
+            return default
+    start = number("dj_start_minute", 20, 0, 55)
+    end = number("dj_end_minute", 47, start + 3, 60)
+    latest = number("dj_latest_minute", 50, end, 60)
+    return {"start": start, "end": end, "latest": latest, "hours": parse_hours(settings.value("dj_hours", "all"))}
+
+
+def dj_project(day, hour, cfg):
+    project = new_project(day=day, hour=hour, name="Auto Mix", mode="each")
+    project.update({"start_minute": cfg["start"], "end_minute": cfg["end"], "latest_minute": cfg["latest"], "marks": [15, 30, 45]})
+    return project
+
+
+def plan_is_good(plan, opts):
+    if not plan["parts"]:
+        return False
+    for part in plan["parts"]:
+        if not part["songs"] or part["off"] < -opts["early_tolerance"] or part["off"] > opts["late_tolerance"]:
+            return False
+    return True
+
+
+def choose_auto_songs(project, candidates, opts, rules=None, history=None, rng=None, attempts=4):
+    """Picks and orders songs so every part of the project lands near its mark. Returns (chosen, plan) or ([], None)."""
+    rng = rng or random.Random()
+    parts = project_parts(project)
+    for _ in range(attempts):
+        chosen = auto_mix_pick(candidates, parts, opts, rules=rules, rng=rng, history=history)
+        if not chosen:
+            continue
+        plan = plan_block([{"song": s} for s in chosen], parts, opts)
+        if plan_is_good(plan, opts):
+            return chosen, plan
+    return [], None
+
+
+def install_local_show(store, user, show_id, manifest, package_dir):
+    """Hands a built package to the show store the way an arriving show is stored, then verifies it."""
+    store.begin(user, show_id, manifest)
+    for part in manifest["parts"]:
+        target = store.target(user, show_id, manifest, part)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.move(os.path.join(package_dir, part["file"]), target)
+    return store.commit(user, show_id)
+
+
+def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None, rng=None, analyze=None, meta_for=None,
+                    decode=None, progress=None, should_stop=None, sample=60):
+    """Builds one hour's mix by itself and files it in the show store. Returns (show id, '') or ('', reason)."""
+    rng = rng or random.Random()
+    analyze = analyze or get_analysis
+    pool = [p for p in pool if is_song_entry(p)]
+    if len(pool) < 6:
+        return "", "the hour's rotation has too few songs"
+    rng.shuffle(pool)
+    candidates = []
+    for number, path in enumerate(pool[:sample], 1):
+        if should_stop is not None and should_stop():
+            return "", "stopped"
+        if progress is not None:
+            progress(f"Studying songs for {hour:02d}00: {number} of {min(sample, len(pool))}")
+        try:
+            data = analyze(path)
+        except Exception:
+            data = None
+        if not data:
+            continue
+        meta = meta_for(path) if meta_for else {}
+        candidates.append(make_song(path, data, meta))
+    project = dj_project(day, hour, cfg)
+    chosen, plan = choose_auto_songs(project, candidates, opts, rules, history, rng)
+    if not chosen:
+        return "", "not enough songs with a steady beat that go together and fill the block"
+    project["items"] = [{"path": s["path"], "talk": None, "exit": None, "transition": "auto", "loop_bars": None, "start_bar": 0} for s in chosen]
+    by_path = {s["path"]: s for s in candidates}
+    kwargs = {"decode": decode} if decode is not None else {}
+    manifest = build_package(project, plan, opts, lambda p: by_path[p], progress=progress, should_stop=should_stop,
+                             bitrate=DJ_BITRATE, **kwargs)
+    show_id = project_id(project)
+    folder = os.path.join(project_folder(project), "package")
+    state = install_local_show(store, AUTO_SHOW_USER, show_id, manifest, folder)
+    shutil.rmtree(project_folder(project), ignore_errors=True)
+    if state.get("status") != "verified":
+        return "", "the built show did not verify: " + " ".join(state.get("problems", [])[:1])
+    return show_id, ""
+
+
+class DjModeWorker(QThread):
+    progress = pyqtSignal(str)
+    built = pyqtSignal(str, int, str)          # day, hour, show id
+    failed = pyqtSignal(str, int, str)         # day, hour, reason
+    finished_all = pyqtSignal()
+
+    def __init__(self, tasks, opts, cfg, store, rules, history):
+        super().__init__()
+        self.tasks, self.opts, self.cfg, self.store, self.rules, self.history = tasks, opts, cfg, store, rules, history
+        self.stop_flag = False
+
+    def cancel(self):
+        self.stop_flag = True
+
+    def run(self):
+        try:
+            self.setPriority(QThread.Priority.LowestPriority)
+        except Exception:
+            pass
+        for day, hour, pool in self.tasks:
+            if self.stop_flag:
+                break
+            try:
+                show_id, reason = build_auto_show(
+                    day, hour, pool, self.opts, self.cfg, self.store, self.rules, self.history,
+                    meta_for=lambda p: {**{k: v for k, v in get_track_metadata(p).items() if k in ("artist", "title", "album")},
+                                        **{k: v for k, v in read_licensing_tags(p).items() if k in ("isrc", "label")}},
+                    progress=self.progress.emit, should_stop=lambda: self.stop_flag)
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+                show_id, reason = "", str(e) or type(e).__name__
+            if show_id:
+                self.built.emit(day.isoformat(), hour, show_id)
+            elif not self.stop_flag:
+                self.failed.emit(day.isoformat(), hour, reason)
+        self.finished_all.emit()
+
+
+# ---------------------------------------------------------------------------
 # DJ tab pieces: importing a named music folder as Clean or Explicit.
 # ---------------------------------------------------------------------------
 
@@ -17272,6 +17435,13 @@ class BroadcastingApp(QWidget):
         QTimer.singleShot(3000, self.apply_remote_vt)
         self.apply_live_assist_settings()
         self.rotation.on_assist = self.announce
+        self.dj_worker = None
+        self.dj_failed = {}
+        self.dj_timer = QTimer()
+        self.dj_timer.setInterval(20 * 60 * 1000)
+        self.dj_timer.timeout.connect(self.dj_mode_tick)
+        self.dj_timer.start()
+        QTimer.singleShot(90000, self.dj_mode_tick)
         try:
             set_display_clean(str(self.settings.value("tagclean_display", "false")).lower() == "true", tagclean_words(self.settings))
         except Exception as e:
@@ -21439,6 +21609,45 @@ class BroadcastingApp(QWidget):
         go_folders.setStyleSheet(BUTTON_STYLE_CONSOLE)
         go_folders.clicked.connect(lambda _c=False: self.show_settings_section("Folders"))
         layout.addWidget(go_folders)
+        dj_note = QLabel("DJ mode: the program builds the mix for each hour by itself, like automation, and puts it in that hour's playlist. "
+                         "Tick the box and press Save. Hours you voice tracked, and mixes you built or sent yourself, are never replaced. "
+                         "Switch it off and Save to go back to the playlists as they were. Building takes a few minutes per hour, in the background.")
+        dj_note.setWordWrap(True)
+        dj_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(dj_note)
+        dj_form = QFormLayout()
+        self.dj_mode_check = QCheckBox("DJ mode: build the mix for every hour automatically")
+        self.dj_mode_check.setChecked(self.mix_bool("dj_mode_enabled"))
+        dj_form.addRow(self.dj_mode_check)
+        cfg = dj_settings(self.settings)
+        self.dj_start_spin = QSpinBox()
+        self.dj_start_spin.setRange(0, 55)
+        self.dj_start_spin.setValue(cfg["start"])
+        self.dj_start_spin.setAccessibleName("Minute each hour's mix starts")
+        dj_form.addRow("The mix starts at minute:", self.dj_start_spin)
+        self.dj_end_spin = QSpinBox()
+        self.dj_end_spin.setRange(5, 60)
+        self.dj_end_spin.setValue(cfg["end"])
+        self.dj_end_spin.setAccessibleName("Minute each hour's mix is planned to end")
+        dj_form.addRow("It is planned to end at minute:", self.dj_end_spin)
+        self.dj_latest_spin = QSpinBox()
+        self.dj_latest_spin.setRange(5, 60)
+        self.dj_latest_spin.setValue(cfg["latest"])
+        self.dj_latest_spin.setAccessibleName("Latest minute each hour's mix may end")
+        dj_form.addRow("It may end as late as minute:", self.dj_latest_spin)
+        self.dj_hours_edit = QLineEdit(str(self.settings.value("dj_hours", "all")))
+        self.dj_hours_edit.setAccessibleName("Hours to build, all or for example 5-9, 14")
+        dj_form.addRow("Hours to build (all, or for example 5-9, 14):", self.dj_hours_edit)
+        save_dj = QPushButton("Save DJ Mode")
+        save_dj.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save_dj.clicked.connect(lambda _c=False: self.dj_mode_save())
+        dj_form.addRow(save_dj)
+        self.dj_status = QLabel("DJ mode is off." if not self.dj_mode_check.isChecked() else "DJ mode is on.")
+        self.dj_status.setWordWrap(True)
+        self.dj_status.setAccessibleName("DJ mode status")
+        self.dj_status.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        dj_form.addRow(self.dj_status)
+        layout.addLayout(dj_form)
         practice_note = QLabel("Practice mode lets you try Live Assist and your mixes before a real show. While it is on, nothing is sent to "
                                "the stream or the recording, nothing is written to the as-run log, and the plays are forgotten afterwards. "
                                "It always starts off. Stop your encoders and recording first.")
@@ -21648,6 +21857,118 @@ class BroadcastingApp(QWidget):
                     if engine.assist_guard_ms > 0 else "")
             return "Live Assist is on. The next song waits for you: press N to play it." + tail
         return "Live Assist is on, and songs carry on by themselves. Press N to bring the next song in early."
+
+    # --- DJ mode -------------------------------------------------------------------------------
+    def dj_say(self, text):
+        self.dj_status.setText(text)
+        self.announce(text)
+
+    def dj_remove_auto_shows(self):
+        removed = 0
+        for show in self.show_store.list_shows(AUTO_SHOW_USER):
+            if show["status"] != "aired":
+                self.show_store.delete(AUTO_SHOW_USER, show["show_id"])
+                removed += 1
+        for path, info in list(self.mix_parts.items()):
+            if info[0] == AUTO_SHOW_USER and not os.path.isfile(path):
+                del self.mix_parts[path]
+        return removed
+
+    def dj_mode_save(self):
+        """The Save button: switching DJ mode on or off (or changing its times) rebuilds today's playlists to match."""
+        on = self.dj_mode_check.isChecked()
+        was = self.mix_bool("dj_mode_enabled")
+        self.settings.setValue("dj_start_minute", self.dj_start_spin.value())
+        self.settings.setValue("dj_end_minute", max(self.dj_end_spin.value(), self.dj_start_spin.value() + 3))
+        self.settings.setValue("dj_latest_minute", max(self.dj_latest_spin.value(), self.dj_end_spin.value()))
+        self.settings.setValue("dj_hours", self.dj_hours_edit.text().strip() or "all")
+        if self.dj_worker is not None:
+            self.dj_worker.cancel()
+        self.dj_failed = {}
+        if on:
+            if not was:
+                self.settings.setValue("dj_prev_mix_enabled", "true" if self.mix_bool("mix_enabled") else "false")
+                self.settings.setValue("mix_enabled", "true")
+                if hasattr(self, "mix_enable_check"):
+                    self.mix_enable_check.blockSignals(True)
+                    self.mix_enable_check.setChecked(True)
+                    self.mix_enable_check.blockSignals(False)
+            self.settings.setValue("dj_mode_enabled", "true")
+            self.dj_remove_auto_shows()                  # rebuilt with the times just saved
+            self.ensure_hour_playlists(force=True)       # today's playlists are rebuilt right away
+            self.dj_say("DJ mode is on. Today's playlist was rebuilt. The mix for each hour is being built in the background and goes into "
+                        "its hour as soon as it is ready; until then the hour plays its normal rotation.")
+            QTimer.singleShot(1500, self.dj_mode_tick)
+        elif was:
+            self.settings.setValue("dj_mode_enabled", "false")
+            removed = self.dj_remove_auto_shows()
+            if str(self.settings.value("dj_prev_mix_enabled", "false")) != "true":
+                self.settings.setValue("mix_enabled", "false")
+                if hasattr(self, "mix_enable_check"):
+                    self.mix_enable_check.blockSignals(True)
+                    self.mix_enable_check.setChecked(False)
+                    self.mix_enable_check.blockSignals(False)
+            self.ensure_hour_playlists(force=True)
+            self.dj_say(f"DJ mode is off. {removed} automatic mix(es) that had not played were removed, and today's playlist was rebuilt "
+                        "the way it was before.")
+        else:
+            self.dj_say("Saved. DJ mode stays off.")
+
+    def dj_pending_hours(self):
+        cfg = dj_settings(self.settings)
+        now = datetime.now()
+        top = now.replace(minute=0, second=0, microsecond=0)
+        tasks = []
+        for offset in range(0, 49):
+            t = top + timedelta(hours=offset)
+            day, hour = t.date(), t.hour
+            if day > now.date() + timedelta(days=1) or hour not in cfg["hours"]:
+                continue
+            if t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
+                continue
+            if is_hour_locked(self.settings, day, hour) or self.show_store.show_for_hour(day, hour) is not None:
+                continue
+            if time.time() - self.dj_failed.get((day, hour), 0) < DJ_RETRY_SECONDS:
+                continue
+            rotation = self.rotation_library.find(self.rotation_schedule.rotation_id_for(day, hour))
+            if rotation is None:
+                continue
+            tasks.append((day, hour, rotation.track_paths()))
+        return tasks
+
+    def dj_mode_tick(self):
+        """Every 20 minutes (and after Save): build whichever of the next hours have no mix yet."""
+        try:
+            if not self.mix_bool("dj_mode_enabled") or not self.mix_enabled() or PRACTICE["on"]:
+                return
+            if self.dj_worker is not None and self.dj_worker.isRunning():
+                return
+            tasks = self.dj_pending_hours()
+            if not tasks:
+                return
+            worker = DjModeWorker(tasks, mix_options(self.settings), dj_settings(self.settings), self.show_store,
+                                  self.rotation.rules, self.rotation.play_history)
+            worker.progress.connect(lambda t: self.dj_status.setText("DJ mode: " + t))
+            worker.built.connect(self.dj_hour_built)
+            worker.failed.connect(self.dj_hour_failed)
+            worker.finished_all.connect(lambda: self.dj_status.setText("DJ mode is on. Every hour in the next day has its mix or its reason."))
+            self.dj_worker = worker
+            worker.start()
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+
+    def dj_hour_built(self, day_text, hour, show_id):
+        day = datetime.strptime(day_text, "%Y-%m-%d").date()
+        RUN_LOG.write("SHOWS", f"DJ mode built the mix for {day_text} hour {hour:02d} ({show_id}).")
+        self.dj_status.setText(f"DJ mode: the mix for {hour_label(hour)} on {day_text} is ready.")
+        self.on_show_verified(AUTO_SHOW_USER, show_id, day, hour)
+
+    def dj_hour_failed(self, day_text, hour, reason):
+        day = datetime.strptime(day_text, "%Y-%m-%d").date()
+        self.dj_failed[(day, hour)] = time.time()
+        text = f"DJ mode could not build the mix for {hour_label(hour)} on {day_text}: {reason}. That hour plays its normal rotation."
+        RUN_LOG.write("SHOWS", text)
+        self.dj_status.setText(text)
 
     # --- Practice mode -------------------------------------------------------------------------
     def practice_blockers(self):
