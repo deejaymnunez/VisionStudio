@@ -16355,6 +16355,11 @@ def project_parts(project):
     by_mark = project.get("break_by_mark") or {}      # the real length of each break, where the station has measured it
     parts = []
     t = start * 60.0
+    if not full:
+        try:
+            t = max(t, float(project.get("top_break_seconds", 0.0) or 0.0))      # the top-of-hour jingle plays before a mix that starts at :00
+        except Exception:
+            pass
     for mark in marks:
         if mark >= end:
             continue
@@ -17315,6 +17320,9 @@ class MixBuilderDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 DJ_BITRATE = "192k"
+DJ_DEFAULT_TIMES = (0, 58, 60)         # start, planned end, latest end: the mix starts right after the top-of-hour jingle and runs to the end of the hour
+DJ_OLD_DEFAULT_TIMES = (20, 47, 50)    # what earlier versions used
+DJ_TOP_BREAK_SECONDS = 20.0            # the top-of-hour jingle, until the station has measured its own
 MIX_STYLE_VERSION = 2          # 1: beat-matched blends only. 2: loop-and-echo-out changes. A built mix with an older number is rebuilt.
 DJ_RETRY_SECONDS = 3600
 
@@ -17427,12 +17435,12 @@ def load_break_lengths(settings):
 
 
 def real_break_seconds(settings):
-    """{15: seconds, 30: seconds, 45: seconds}: the longest of the last few breaks at each mark, plus a few seconds,
+    """{0: seconds, 15: seconds, 30: seconds, 45: seconds}: the longest of the last few breaks at each mark, plus a few seconds,
     because a break that runs longer than planned cuts into the next part. Marks never seen are left out."""
     out = {}
     seen = load_break_lengths(settings)
-    for mark in (15, 30, 45):
-        runs = seen.get(f":{mark}") or []
+    for mark in (0, 15, 30, 45):
+        runs = seen.get(f":{mark:02d}") or []
         if runs:
             out[mark] = round(max(runs) + 5.0, 1)
     return out
@@ -17444,9 +17452,9 @@ def dj_settings(settings):
             return max(low, min(high, int(float(settings.value(key, default)))))
         except Exception:
             return default
-    start = number("dj_start_minute", 20, 0, 55)
-    end = number("dj_end_minute", 47, start + 3, 60)
-    latest = number("dj_latest_minute", 50, end, 60)
+    start = number("dj_start_minute", DJ_DEFAULT_TIMES[0], 0, 55)
+    end = number("dj_end_minute", DJ_DEFAULT_TIMES[1], start + 3, 60)
+    latest = number("dj_latest_minute", DJ_DEFAULT_TIMES[2], end, 60)
     mode, crates = crate_settings(settings)
     return {"start": start, "end": end, "latest": latest, "hours": parse_hours(settings.value("dj_hours", "all")),
             "breaks": real_break_seconds(settings), "crate_mode": mode, "crates": crates}
@@ -17484,7 +17492,8 @@ def load_schedule_rows(settings):
             if days not in DJ_DAY_TEXT:
                 continue
             action = "off" if str(item.get("action", "mix")) == "off" else "mix"
-            start, end, latest = clean_times(item.get("start", 20), item.get("end", 47), item.get("latest", 50))
+            start, end, latest = clean_times(item.get("start", DJ_DEFAULT_TIMES[0]), item.get("end", DJ_DEFAULT_TIMES[1]),
+                                             item.get("latest", DJ_DEFAULT_TIMES[2]))
             mode, crates = clean_crate_choice(str(item.get("crate_mode", "everyday")), item.get("crates"))
             rows.append({"days": days, "from_hour": max(0, min(23, int(item.get("from_hour", 0)))),
                          "to_hour": max(0, min(23, int(item.get("to_hour", 23)))), "action": action,
@@ -17492,6 +17501,34 @@ def load_schedule_rows(settings):
         except Exception:
             continue
     return rows
+
+
+def migrate_dj_defaults(settings):
+    """Once: times that are exactly the old defaults (20, 47, 50) become the new ones (0, 58, 60), in the default and in every extra row.
+    Anything you set to other numbers is left alone. Returns True when something changed."""
+    if str(settings.value("dj_top_start_v2", "")) == "done":
+        return False
+    settings.setValue("dj_top_start_v2", "done")
+    changed = False
+    keys = ("dj_start_minute", "dj_end_minute", "dj_latest_minute")
+    try:
+        have = tuple(int(float(settings.value(k, d))) for k, d in zip(keys, DJ_OLD_DEFAULT_TIMES))
+    except Exception:
+        have = None
+    if have == DJ_OLD_DEFAULT_TIMES:
+        for k, v in zip(keys, DJ_DEFAULT_TIMES):
+            settings.setValue(k, v)
+        changed = True
+    rows = load_schedule_rows(settings)
+    moved = False
+    for row in rows:
+        if (row["start"], row["end"], row["latest"]) == DJ_OLD_DEFAULT_TIMES:
+            row["start"], row["end"], row["latest"] = DJ_DEFAULT_TIMES
+            moved = True
+    if moved:
+        save_schedule_rows(settings, rows)
+        changed = True
+    return changed
 
 
 def save_schedule_rows(settings, rows):
@@ -17559,8 +17596,10 @@ def describe_schedule(settings):
 
 def dj_project(day, hour, cfg):
     project = new_project(day=day, hour=hour, name="Auto Mix", mode="each")
+    breaks = cfg.get("breaks") or {}
     project.update({"start_minute": cfg.get("begin", cfg["start"]), "end_minute": cfg["end"], "latest_minute": cfg["latest"], "marks": [15, 30, 45],
-                    "break_by_mark": {str(k): v for k, v in (cfg.get("breaks") or {}).items()}})
+                    "break_by_mark": {str(k): v for k, v in breaks.items() if k != 0},
+                    "top_break_seconds": float(breaks.get(0, DJ_TOP_BREAK_SECONDS))})
     return project
 
 
@@ -17812,7 +17851,8 @@ class DjRowDialog(QDialog):
     def __init__(self, parent, row=None, crate_names=()):
         super().__init__(parent)
         self.setWindowTitle("DJ schedule row")
-        row = row or {"days": "all", "from_hour": 0, "to_hour": 23, "action": "mix", "start": 20, "end": 47, "latest": 50}
+        row = row or {"days": "all", "from_hour": 0, "to_hour": 23, "action": "mix", "start": DJ_DEFAULT_TIMES[0],
+                     "end": DJ_DEFAULT_TIMES[1], "latest": DJ_DEFAULT_TIMES[2]}
         form = QFormLayout()
         self.days_combo = QComboBox()
         self.days_combo.setAccessibleName("Days this row applies to")
@@ -18142,6 +18182,7 @@ class BroadcastingApp(QWidget):
         self.vt_accounts = VTAccounts(self.settings)
         self.gui_caller = GuiCaller()
         self.vt_service = VTService(self)
+        self._dj_times_moved = migrate_dj_defaults(self.settings)
         self.content_rules = ContentRules(self.settings)
         CONTENT_FILTER["fn"] = self.content_rules.filter
         self.show_store = ShowStore()
@@ -18212,6 +18253,10 @@ class BroadcastingApp(QWidget):
         self.dj_timer.timeout.connect(self.dj_mode_tick)
         self.dj_timer.start()
         QTimer.singleShot(90000, self.dj_mode_tick)
+        if self._dj_times_moved:
+            RUN_LOG.write("SHOWS", "DJ schedule: the old default times (start 20, end 47, latest end 50) were changed once to the new defaults "
+                                   "(start 0, end 58, latest end 60), so the mix starts right after the top-of-hour jingle. Times you set to other "
+                                   "numbers were left alone.")
         try:
             set_display_clean(str(self.settings.value("tagclean_display", "false")).lower() == "true", tagclean_words(self.settings))
         except Exception as e:
