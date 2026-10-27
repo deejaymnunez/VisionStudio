@@ -1,6 +1,11 @@
 import sys
 import os
 import json
+
+# The math library numpy uses can start one worker per processor core, and those workers compete with the live stream.
+# Two are plenty for audio work. This must be set before numpy is first imported.
+for _threads_name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_threads_name, "2")
 import re
 import random
 import subprocess
@@ -11,6 +16,7 @@ import wave
 import struct
 import time
 import threading
+_BACKGROUND_WORK = threading.local()
 import queue
 import traceback
 import hashlib
@@ -77,6 +83,20 @@ except Exception:
 # On Windows a windowed (no console) program would flash a console window for
 # every ffmpeg call unless this flag is passed.
 SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+
+
+def background_priority(on=True):
+    """Marks the calling thread as background work (DJ mode building a mix): the audio tools it starts run at a lower
+    priority, so the live stream is served first."""
+    _BACKGROUND_WORK.on = bool(on)
+
+
+def quiet_flags():
+    """Process flags for an ffmpeg started from here: no console window, and lower priority when the thread is background work."""
+    flags = SUBPROCESS_FLAGS
+    if sys.platform == "win32" and getattr(_BACKGROUND_WORK, "on", False):
+        flags |= getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -2031,13 +2051,9 @@ class PlaylistGenerator:
         if event is not None and event.get("voice"):
             voice = True
             signoff = self.events.is_last_hour_of_show(event, day, hour)
-        try:
-            estimate = int(float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS)))
-        except Exception:
-            estimate = DEFAULT_BREAK_ESTIMATE_SECONDS
-        slots = BreakMarks.SLOTS
-        count = sum(1 for sl in slots if (self.marks.enabled(day, hour, sl) if self.marks is not None else True))
-        return voice, signoff, count * estimate
+        plan = break_plan(self.settings)["slots"]
+        total = sum(plan[sl] for sl in BreakMarks.SLOTS if (self.marks.enabled(day, hour, sl) if self.marks is not None else True))
+        return voice, signoff, int(round(total))
 
     def voice_slot_seconds(self):
         try:
@@ -2426,6 +2442,34 @@ VOICE_MARKER_EVERY = 3
 DEFAULT_VOICE_SLOT_SECONDS = 15
 DEFAULT_SIGNOFF_SECONDS = 180
 DEFAULT_BREAK_ESTIMATE_SECONDS = 90
+
+
+def break_plan(settings):
+    """How long each break is assumed to take when an hour is built, joined partway or fitted with a mix:
+    {'start': seconds before the first song, 'marks': {900.0: :15 break, 1800.0: :30 break, 2700.0: :45 break},
+    'slots': {':00': s, ':15': s, ':30': s, ':45': s}}. By default each slot is the average of the last few breaks that really
+    played (written down as they finish); a slot never seen, or 'Use the real length of my breaks' switched off, uses the
+    single estimate from the Breaks settings."""
+    try:
+        estimate = float(settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))
+    except Exception:
+        estimate = float(DEFAULT_BREAK_ESTIMATE_SECONDS)
+    measured = str(settings.value("break_use_measured", "true")).lower() != "false"
+    seen = {}
+    if measured:
+        try:
+            seen = json.loads(str(settings.value("break_seen_seconds", "") or "{}"))
+        except Exception:
+            seen = {}
+    slots = {}
+    for slot in (":00", ":15", ":30", ":45"):
+        try:
+            runs = [float(x) for x in (seen.get(slot) or []) if float(x) >= 1.0][-6:]
+        except Exception:
+            runs = []
+        slots[slot] = (sum(runs) / len(runs)) if runs else estimate
+    return {"start": slots[":00"] if measured else 0.0,
+            "marks": {900.0: slots[":15"], 1800.0: slots[":30"], 2700.0: slots[":45"]}, "slots": slots}
 CROSSFADE_OVERLAP_SECONDS = 4.0
 _OVERLAP = [CROSSFADE_OVERLAP_SECONDS]      # 0 when crossfading is off: songs play to their end
 
@@ -4227,11 +4271,8 @@ class RotationEngine:
         passed = []
         keep = list(entries)
         if offset >= 120:
-            try:
-                estimate = float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))
-            except Exception:
-                estimate = float(DEFAULT_BREAK_ESTIMATE_SECONDS)
-            clock = 0.0
+            plan = break_plan(self.settings)
+            clock = plan["start"]
             next_mark = 900.0
             keep = []
             starting = False
@@ -4246,7 +4287,7 @@ class RotationEngine:
                 start = clock
                 clock += get_track_duration(entry)
                 while clock >= next_mark:
-                    clock += estimate
+                    clock += plan["marks"].get(next_mark, plan["slots"][":00"])
                     next_mark += 900.0
                 if not starting and start >= offset - 10:
                     starting = True
@@ -4448,9 +4489,52 @@ class RotationEngine:
         self._notify_deck_update("B", None)
         self.on_status("Rotation stopped.")
 
+    EARLY_ROLL_SECONDS = 120
+
+    def holding_for_mix_hour(self):
+        """True when the queue is about to run into the next hour's playlist more than two minutes before that hour begins,
+        and that hour holds a mix: the mix is timed to the clock, so its hour must not start early."""
+        if not self.shuffled_queue or not self.show_marks:
+            return False
+        head = self.shuffled_queue[0]
+        if not is_hour_marker(head) or is_voice_marker(head):
+            return False
+        try:
+            start = datetime.strptime(marker_tag(head), "%Y%m%d%H")
+        except Exception:
+            return False
+        if (start - datetime.now()).total_seconds() <= self.EARLY_ROLL_SECONDS:
+            return False
+        return any(start <= mark < start + timedelta(hours=1) for mark in self.show_marks)
+
+    def pick_filler_song(self):
+        """A song from the current rotation that passes the programming rules, without touching the queue."""
+        try:
+            files = list(self.source_files())
+        except Exception:
+            return None
+        random.shuffle(files)
+        for candidate in files[:300]:
+            if not self.rule_problem(candidate):
+                self.pinned_tracks.discard(candidate)
+                return candidate
+        return None
+
     def pick_next_valid_track(self):
         """Next track from the queue. Hour markers are passed over; hand-placed tracks play where
         you put them; everything else must satisfy the artist/title separation rule."""
+        if self.holding_for_mix_hour():
+            filler = self.pick_filler_song()
+            if filler is not None:
+                tag = marker_tag(self.shuffled_queue[0])
+                logged = self.__dict__.setdefault("_hold_logged", set())
+                if tag not in logged:
+                    logged.add(tag)
+                    text = ("The next hour holds a mix that is timed to the clock, and this hour ran out of songs early, "
+                            "so regular songs play until that hour begins.")
+                    self.on_status(text)
+                    RUN_LOG.write("SHOWS", text)
+                return filler
         while self.shuffled_queue and is_hour_marker(self.shuffled_queue[0]):
             skipped = self.shuffled_queue.pop(0)
             if is_voice_marker(skipped):
@@ -6535,7 +6619,7 @@ ANALYSIS_VERSION = 1
 def decode_for_analysis(path, seconds=900):
     """Mono float32 audio at ANALYSIS_SR (or None if the song cannot be read)."""
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        flags = quiet_flags()
         out = subprocess.run([get_ffmpeg_path(), "-v", "error", "-nostdin", "-t", str(seconds), "-i", path, "-f", "f32le",
                               "-ac", "1", "-ar", str(ANALYSIS_SR), "-"], capture_output=True, creationflags=flags, timeout=300)
         if out.returncode != 0 or not out.stdout:
@@ -7348,7 +7432,7 @@ def decode_stereo(path, start=0.0, duration=None, sr=MIX_SR):
         cmd += ["-t", f"{duration:.4f}"]
     cmd += ["-f", "f32le", "-ac", "2", "-ar", str(sr), "-"]
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        flags = quiet_flags()
         out = subprocess.run(cmd, capture_output=True, creationflags=flags, timeout=600)
         raw = out.stdout
         if out.returncode != 0 or not raw:
@@ -7696,7 +7780,7 @@ def write_audio_file(path, audio, sr=MIX_SR, bitrate="256k"):
             handle.setframerate(sr)
             handle.writeframes(pcm.tobytes())
         return True
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    flags = quiet_flags()
     cmd = [get_ffmpeg_path(), "-y", "-v", "error", "-f", "s16le", "-ar", str(sr), "-ac", "2", "-i", "-",
            "-codec:a", "libmp3lame", "-b:a", bitrate, path]
     try:
@@ -14333,7 +14417,8 @@ def entry_start_offsets(entries, break_estimate=90.0, duration=None):
     """When each entry of an hour playlist would start, in seconds from the top of the hour, counting a break
     after each quarter-hour mark the way the engine estimates them. Markers have no length."""
     duration = duration or get_track_duration
-    clock = 0.0
+    plan = break_estimate if isinstance(break_estimate, dict) else None      # a break_plan(): each break at its own length
+    clock = plan["start"] if plan else 0.0
     next_mark = 900.0
     starts = []
     for entry in entries:
@@ -14343,7 +14428,7 @@ def entry_start_offsets(entries, break_estimate=90.0, duration=None):
         starts.append(clock)
         clock += duration(entry)
         while clock >= next_mark:
-            clock += break_estimate
+            clock += plan["marks"].get(next_mark, plan["slots"][":00"]) if plan else break_estimate
             next_mark += 900.0
     return starts
 
@@ -17306,6 +17391,8 @@ def study_candidates(pool, opts, analyze, cached, meta_for, progress, should_sto
             data = analyze(path)
         except Exception:
             data = None
+        if cached is not None:
+            time.sleep(0.01)
         studied += 1
         fresh += 1 if is_new else 0
         if not data:
@@ -17384,6 +17471,7 @@ class DjModeWorker(QThread):
             self.setPriority(QThread.Priority.LowestPriority)
         except Exception:
             pass
+        background_priority(True)          # the audio tools started from this thread run at a lower priority too
         for day, hour, pool, task_cfg in self.tasks:
             if self.stop_flag:
                 break
@@ -21283,6 +21371,10 @@ class BroadcastingApp(QWidget):
         except Exception:
             self.break_estimate_spin.setValue(DEFAULT_BREAK_ESTIMATE_SECONDS)
         form_breaks.addRow("Estimated length of one break, seconds (used to fit a built hour):", self.break_estimate_spin)
+        self.break_measured_check = QCheckBox("Use the real length of my breaks (:00, :15, :30 and :45 each) once the program has timed them")
+        self.break_measured_check.setChecked(str(self.settings.value("break_use_measured", "true")).lower() != "false")
+        self.break_measured_check.setAccessibleName("Use the real length of my breaks when building and fitting an hour")
+        form_breaks.addRow(self.break_measured_check)
         self.voice_slot_spin = QSpinBox()
         self.voice_slot_spin.setRange(5, 120)
         self.voice_slot_spin.setAccessibleName("Seconds reserved for each empty voice track slot")
@@ -21690,11 +21782,7 @@ class BroadcastingApp(QWidget):
                 self.announce(text)
                 return entries
             paths = self.show_store.part_paths(user, show_id, manifest)
-            try:
-                estimate = float(self.settings.value("break_estimate_seconds", DEFAULT_BREAK_ESTIMATE_SECONDS))
-            except Exception:
-                estimate = float(DEFAULT_BREAK_ESTIMATE_SECONDS)
-            new_entries = apply_show_to_entries(entries, manifest, paths, estimate)
+            new_entries = apply_show_to_entries(entries, manifest, paths, break_plan(self.settings))
             for number, path in enumerate(paths):
                 self.mix_parts[path] = (user, show_id, manifest, number)
             mark = hour_start + timedelta(seconds=first)
@@ -22954,6 +23042,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("fit_min_song_seconds", self.fit_min_song_spin.value())
         self.rotation.apply_fit_options()
         self.settings.setValue("break_estimate_seconds", self.break_estimate_spin.value())
+        self.settings.setValue("break_use_measured", "true" if self.break_measured_check.isChecked() else "false")
         self.settings.setValue("voice_slot_seconds", self.voice_slot_spin.value())
         self.settings.setValue("break_item_gap_ms", self.break_gap_spin.value())
         self.rotation.apply_separation_setting()
