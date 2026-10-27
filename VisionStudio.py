@@ -6975,7 +6975,9 @@ MIX_DEFAULTS = {
     "blend_bars": 8,              # bars the two songs play together (4, 8 or 16)
     "ramp_bars": 8,               # bars before the blend over which the outgoing song changes speed
     "max_tempo_change": 3.0,      # percent; 0 means a song's speed is never changed
-    "exit": "hook2",              # where a song ends: hook1, hook2 (end of the second hook) or end
+    "exit": "play",               # where a song ends: play (after its play time, at the end of a phrase), hook1, hook2 or end
+    "play_seconds": 120.0,        # play: a song plays about this long before it leaves (about the second chorus)
+    "min_play_seconds": 60.0,     # play: a song plays at least this long, unless that would miss the break
     "loop_bars": 4,               # bars of intro that loop under a talk break (2 or 4)
     "duck_db": -12.0,             # how far the music goes down while you talk
     "voice_lead_beats": 2.0,      # the voice starts this many beats into the loop
@@ -7014,8 +7016,10 @@ def mix_options(settings=None):
     opts["loop_bars"] = max(1, min(8, int(opts["loop_bars"])))
     opts["ramp_bars"] = max(0, min(32, int(opts["ramp_bars"])))
     opts["max_tempo_change"] = max(0.0, min(12.0, float(opts["max_tempo_change"])))
-    if opts["exit"] not in ("hook1", "hook2", "end"):
-        opts["exit"] = "hook2"
+    if opts["exit"] not in ("play", "hook1", "hook2", "end"):
+        opts["exit"] = "play"
+    opts["play_seconds"] = max(30.0, min(600.0, float(opts["play_seconds"])))
+    opts["min_play_seconds"] = max(10.0, min(opts["play_seconds"], float(opts["min_play_seconds"])))
     if opts["fallback"] not in ("delay", "cut"):
         opts["fallback"] = "delay"
     if opts["transition_style"] not in ("loop", "blend"):
@@ -7058,12 +7062,13 @@ def snap_to_bar(song, t, direction="down"):
     return song["downbeat"] + n * song["bar"]
 
 
-def exit_candidates(song):
-    """Places a song can end, earliest first: [(name, source seconds)]. Always includes the natural end."""
+def exit_candidates(song, limit=3):
+    """Places a song can end, earliest first: [(name, source seconds)]. Always includes the natural end.
+    `limit` is how many hooks count (the first 3 normally); None counts every hook the analysis found."""
     out = []
-    for number, hook in enumerate(song["hooks"][:3], 1):
+    for number, hook in enumerate(song["hooks"][:limit] if limit else song["hooks"], 1):
         t = snap_to_bar(song, float(hook["end"]))
-        if 0 < t < song["duration"] - 1.0:
+        if 0 < t < song["duration"] - 1.0 and (limit or not out or t > out[-1][1] + 1.0):
             out.append((f"hook{number}", t))
     if song["duration"] > 0:
         last = snap_to_bar(song, song["duration"] - 0.5) if song["bar"] > 0 else song["duration"] - 0.5
@@ -7074,8 +7079,25 @@ def exit_candidates(song):
     return out
 
 
-def default_exit(song, mode):
+def play_exit(song, play_seconds, src_start=0.0):
+    """The end of the first phrase that comes at least `play_seconds` after the song began. Returns (name, source seconds) or None
+    when the song ends before that."""
+    for name, t in exit_candidates(song, None):
+        if t - src_start >= play_seconds - 1e-6:
+            return name, t
+    return None
+
+
+def default_exit(song, mode, opts=None, src_start=0.0):
     """The exit this song uses unless the plan changes it: (name, source seconds, note)."""
+    if mode == "play":
+        found = play_exit(song, (opts or MIX_DEFAULTS)["play_seconds"], src_start)
+        if found:
+            return found[0], found[1], ""
+        cands = exit_candidates(song, None)
+        if cands:
+            return cands[-1][0], cands[-1][1], "the song is shorter than the play time, so it plays to the end"
+        return "end", max(1.0, song["duration"] - 0.5), "song length unknown"
     cands = exit_candidates(song)
     if not cands:
         return "end", max(1.0, song["duration"] - 0.5), "song length unknown"
@@ -7297,9 +7319,9 @@ def _set_exit(rec, name, src):
     rec["exit_name"], rec["exit_src"] = name, float(src)
 
 
-def _candidate_end_times(rec):
-    """Output times at which this song would end for each possible exit (as if nothing follows it)."""
-    return [(name, _out_time(rec, src)) for name, src in exit_candidates(rec["song"]) if src > rec["src_start"] + 1.0]
+def _candidate_end_times(rec, play=False):
+    """Output times at which this song would end for each possible exit (as if nothing follows it). In play mode every phrase end counts."""
+    return [(name, _out_time(rec, src)) for name, src in exit_candidates(rec["song"], None if play else 3) if src > rec["src_start"] + 1.0]
 
 
 def plan_block(items, parts, opts=None):
@@ -7321,16 +7343,18 @@ def plan_block(items, parts, opts=None):
             voice = (item.get("talk") or {}).get("seconds", 0.0)
             prev = recs[-1] if recs else None
             if prev is not None and not prev["exit_name"]:
-                _set_exit(prev, *default_exit(prev["song"], item_exit(prev["item"], opts))[:2])
+                _set_exit(prev, *default_exit(prev["song"], item_exit(prev["item"], opts), opts, prev["src_start"])[:2])
             rec = _place_song(item, prev, opts, voice)
             if rec["voice"] is not None:
                 rec["voice"]["t_start"] = _out_time(rec, rec["loop"]["src0"]) + rec["voice"]["lead"]
             recs.append(rec)
-            name, src, note = default_exit(rec["song"], item_exit(item, opts))
+            mode = item_exit(item, opts)
+            name, src, note = default_exit(rec["song"], mode, opts, rec["src_start"])
             if note:
                 rec["notes"].append(note)
             _set_exit(rec, name, src)
-            cands = _candidate_end_times(rec) or [(name, _out_time(rec, src))]
+            playing = mode == "play" and item.get("exit") not in ("hook1", "hook2", "end")
+            cands = _candidate_end_times(rec, playing) or [(name, _out_time(rec, src))]
             if item.get("exit") in ("hook1", "hook2", "end"):
                 # the user fixed this song's exit: it only closes the part if that exit is near the mark
                 fixed = dict(cands).get(name, cands[-1][1])
@@ -7338,15 +7362,30 @@ def plan_block(items, parts, opts=None):
             longest = max(t for _n, t in cands)
             lo = target - opts["early_tolerance"]
             hi = (latest if last_part else target + opts["late_tolerance"])
+            pool = dict(exit_candidates(rec["song"], None if playing else 3))
             in_range = [(n, t) for n, t in cands if lo <= t <= hi]
+            if playing and in_range:
+                # A song plays at least its minimum play time. Shorter (never under 20 seconds) only when nothing else lets the part end
+                # inside its normal window; ending later than that, up to the latest end, comes after both.
+                def played(nt):
+                    return pool.get(nt[0], 0.0) - rec["src_start"]
+                tight = [nt for nt in in_range if nt[1] <= target + opts["late_tolerance"]]
+                tiers = [([nt for nt in tight if played(nt) >= opts["min_play_seconds"] - 1e-6], False),
+                         ([nt for nt in tight if played(nt) >= 20.0], True),
+                         ([nt for nt in in_range if played(nt) >= opts["min_play_seconds"] - 1e-6], False),
+                         ([nt for nt in in_range if played(nt) >= 20.0], True)]
+                chosen = next(((found, short) for found, short in tiers if found), ([], False))
+                in_range = chosen[0]
+                if chosen[1]:
+                    rec["notes"].append("it plays less than the minimum play time so the part can end on its mark")
             if in_range:
                 pick = min(in_range, key=lambda nt: abs(nt[1] - target))
-                _set_exit(rec, pick[0], dict(exit_candidates(rec["song"])).get(pick[0], rec["exit_src"]))
+                _set_exit(rec, pick[0], pool.get(pick[0], rec["exit_src"]))
                 closed = True
             elif longest >= lo:
                 # no exit lands in range: take the one nearest the mark and report how far off it is
                 pick = min(cands, key=lambda nt: (max(0.0, nt[1] - hi) * 3.0 + max(0.0, lo - nt[1])))
-                _set_exit(rec, pick[0], dict(exit_candidates(rec["song"])).get(pick[0], rec["exit_src"]))
+                _set_exit(rec, pick[0], pool.get(pick[0], rec["exit_src"]))
                 closed = True
             if closed or not queue:
                 if not rec["exit_name"]:
@@ -7369,6 +7408,18 @@ def plan_block(items, parts, opts=None):
 
 def item_exit(item, opts):
     return item.get("exit") if item.get("exit") in ("hook1", "hook2", "end") else opts["exit"]
+
+
+def migrate_mix_exit(settings):
+    """Once: a station that still has the old 'end of the second hook' choice (or none) moves to the play-time exit. Returns True when it changed."""
+    if str(settings.value("mix_exit_migrated", "")) == "1":
+        return False
+    changed = False
+    if str(settings.value("mix_exit", "") or "") in ("", "hook2"):
+        settings.setValue("mix_exit", "play")
+        changed = True
+    settings.setValue("mix_exit_migrated", "1")
+    return changed
 
 
 def describe_part(part, number):
@@ -10752,6 +10803,17 @@ class ContentRules:
         item.update({"name": name, "kind": kind, "content": "explicit" if content == "explicit" else "clean", "crate": crate})
         self.save_sources()
         return ""
+
+    def crate_of(self, path):
+        """The crate whose folder holds this song (the innermost one), or 0 when it is in none."""
+        key = norm_path(path)
+        best, best_len = 0, -1
+        for x in self.sources:
+            root = x.get("_root") or norm_path(x["folder"])
+            if key.startswith(root.rstrip("/\\") + os.sep) or key.startswith(root.rstrip("/\\") + "/"):
+                if len(root) > best_len:
+                    best, best_len = int(x["crate"]), len(root)
+        return best
 
     def crate_songs(self, numbers):
         """The songs in those crates that may air: (paths, numbers that gave songs, numbers with no crate or no songs)."""
@@ -16465,8 +16527,11 @@ def build_package(project, plan, opts, song_for, progress=None, should_stop=None
         songs = []
         for rec in part["songs"]:
             s = rec["song"]
-            songs.append({"artist": s["artist"], "title": s["title"], "album": s["album"], "isrc": s["isrc"], "label": s["label"],
-                          "start": round(rec["t_start"], 2), "end": round(rec["t_end"], 2)})
+            entry = {"artist": s["artist"], "title": s["title"], "album": s["album"], "isrc": s["isrc"], "label": s["label"],
+                     "start": round(rec["t_start"], 2), "end": round(rec["t_end"], 2)}
+            if s.get("crate"):
+                entry["crate"] = int(s["crate"])
+            songs.append(entry)
         manifest["parts"].append({"file": name, "bytes": os.path.getsize(path), "sha256": file_sha256(path),
                                   "seconds": round(len(audio) / float(MIX_SR), 2), "start_offset": float(spec["start_clock"]),
                                   "target": round(part["target"], 2), "off": round(part["off"], 2), "songs": songs, "notes": notes})
@@ -17323,7 +17388,7 @@ DJ_BITRATE = "192k"
 DJ_DEFAULT_TIMES = (0, 58, 60)         # start, planned end, latest end: the mix starts right after the top-of-hour jingle and runs to the end of the hour
 DJ_OLD_DEFAULT_TIMES = (20, 47, 50)    # what earlier versions used
 DJ_TOP_BREAK_SECONDS = 20.0            # the top-of-hour jingle, until the station has measured its own
-MIX_STYLE_VERSION = 2          # 1: beat-matched blends only. 2: loop-and-echo-out changes. A built mix with an older number is rebuilt.
+MIX_STYLE_VERSION = 3          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. A built mix with an older number is rebuilt.
 DJ_RETRY_SECONDS = 3600
 
 
@@ -17345,7 +17410,7 @@ def parse_hours(text):
     return out or set(range(24))
 
 
-DJ_CRATE_MODES = (("everyday", "The everyday music (the rotation for that hour)"), ("all", "All my crates"), ("pick", "Only the crates I list"))
+DJ_CRATE_MODES = (("everyday", "The everyday music (the rotation for that hour)"), ("all", "All my crates"), ("pick", "Only the crates I check in the list below"))
 DJ_CRATE_MODE_TEXT = dict(DJ_CRATE_MODES)
 MIN_CRATE_SONGS = 6
 
@@ -17400,6 +17465,57 @@ def describe_crate_choice(mode, crates):
     if mode == "pick":
         return f"its songs come from {'crate' if len(crates) == 1 else 'crates'} {crates_text(crates)}"
     return "its songs come from the everyday music"
+
+
+def crate_checklist_entries(crate_names, selected):
+    """The lines of the crate checklist: (number, text, checked). Every crate you have is listed; a crate a row still names but that
+    was removed is listed too, so it can be unchecked."""
+    chosen = set(int(n) for n in (selected or []))
+    known = {int(n): str(label) for n, label in crate_names}
+    out = [(n, f"Crate {n}, {label}", n in chosen) for n, label in sorted(known.items())]
+    out += [(n, f"Crate {n}, this crate was removed", True) for n in sorted(chosen - set(known))]
+    return sorted(out)
+
+
+class CrateChecklist(QListWidget):
+    """One line per crate with a check box. Space checks or unchecks the line you are on; the list grows as crates are added."""
+
+    def __init__(self, crate_names, selected, name, on_change=None):
+        super().__init__()
+        self.setAccessibleName(name)
+        self.on_change = on_change
+        self.loading = False
+        self.setMaximumHeight(170)
+        self.fill(crate_names, selected)
+        self.itemChanged.connect(self.item_changed)
+
+    def fill(self, crate_names, selected):
+        self.loading = True
+        self.clear()
+        entries = crate_checklist_entries(crate_names, selected)
+        for number, text, checked in entries:
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, number)
+            self.addItem(item)
+        if not entries:
+            self.addItem(QListWidgetItem("You have no crates yet. Add them on the Crates page."))
+        self.setCurrentRow(0)
+        self.loading = False
+
+    def item_changed(self, _item):
+        if not self.loading and self.on_change:
+            self.on_change()
+
+    def checked(self):
+        out = []
+        for row in range(self.count()):
+            item = self.item(row)
+            number = item.data(Qt.ItemDataRole.UserRole)
+            if number is not None and item.checkState() == Qt.CheckState.Checked:
+                out.append(int(number))
+        return sorted(out)
 
 
 def dj_pool_from_crates(rules, cfg):
@@ -17755,6 +17871,8 @@ def transition_log_lines(plan, hour):
         for index, rec in enumerate(songs):
             s = rec["song"]
             name = f"{s['artist']} - {s['title']}" if s["artist"] else s["title"]
+            if s.get("crate"):
+                name += f" [crate {s['crate']}]"
             read = (f"{s['bpm']:.1f} BPM, {int(s['confidence'] * 100)}% sure, intro {intro_bars(s)} bars, {len(s['hooks'])} hook(s)"
                     if s["bpm"] else "no steady tempo found")
             if index == 0:
@@ -17769,7 +17887,7 @@ def transition_log_lines(plan, hour):
 
 
 def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None, rng=None, analyze=None, meta_for=None,
-                    decode=None, progress=None, should_stop=None, sample=150, want=60, fresh_budget=45, cached=None):
+                    decode=None, progress=None, should_stop=None, sample=150, want=60, fresh_budget=45, cached=None, crate_of=None):
     """Builds one hour's mix by itself and files it in the show store. Returns (show id, '') or ('', reason)."""
     rng = rng or random.Random()
     if cached is None and analyze is None:
@@ -17783,12 +17901,26 @@ def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None,
                                                    sample, want, fresh_budget)
     if candidates is None:
         return "", "stopped"
+    if crate_of is not None and cfg.get("crate_mode", "everyday") != "everyday":
+        for song in candidates:                    # which crate each song came from, for the log and the saved mix
+            try:
+                song["crate"] = int(crate_of(song["path"]) or 0)
+            except Exception:
+                song["crate"] = 0
     project = dj_project(day, hour, cfg)
     chosen, plan, info = choose_auto_songs_detail(project, candidates, opts, rules, history, rng)
     if not chosen:
         return "", failure_reason(candidates, studied, opts, info)
     for line in transition_log_lines(plan, hour):
         RUN_LOG.write("MIX", line)
+    counts = {}
+    for part in plan["parts"]:
+        for rec in part["songs"]:
+            key = rec["song"].get("crate") or 0
+            counts[key] = counts.get(key, 0) + 1
+    if cfg.get("crate_mode", "everyday") != "everyday":
+        RUN_LOG.write("MIX", f"{hour:02d}00 songs by crate: " + ", ".join(
+            f"{'crate ' + str(k) if k else 'not in a crate'}: {v}" for k, v in sorted(counts.items())) + f" (asked for: {describe_crate_choice(*clean_crate_choice(cfg.get('crate_mode'), cfg.get('crates')))}).")
     project["items"] = [{"path": s["path"], "talk": None, "exit": None, "transition": "auto", "loop_bars": None, "start_bar": 0} for s in chosen]
     by_path = {s["path"]: s for s in candidates}
     kwargs = {"decode": decode} if decode is not None else {}
@@ -17810,10 +17942,11 @@ class DjModeWorker(QThread):
     failed = pyqtSignal(str, int, str)         # day, hour, reason
     finished_all = pyqtSignal()
 
-    def __init__(self, tasks, opts, cfg, store, rules, history):
+    def __init__(self, tasks, opts, cfg, store, rules, history, crate_of=None):
         super().__init__()
         # tasks: (day, hour, songs, times for that hour)
         self.tasks, self.opts, self.cfg, self.store, self.rules, self.history = tasks, opts, cfg, store, rules, history
+        self.crate_of = crate_of
         self.stop_flag = False
 
     def cancel(self):
@@ -17834,7 +17967,7 @@ class DjModeWorker(QThread):
                     day, hour, pool, self.opts, task_cfg or self.cfg, self.store, self.rules, self.history,
                     meta_for=lambda p: {**{k: v for k, v in get_track_metadata(p).items() if k in ("artist", "title", "album")},
                                         **{k: v for k, v in read_licensing_tags(p).items() if k in ("isrc", "label")}},
-                    progress=self.progress.emit, should_stop=lambda: self.stop_flag)
+                    progress=self.progress.emit, should_stop=lambda: self.stop_flag, crate_of=self.crate_of)
             except Exception as e:
                 _log_exception(type(e), e, e.__traceback__)
                 show_id, reason = "", str(e) or type(e).__name__
@@ -17899,10 +18032,11 @@ class DjRowDialog(QDialog):
             self.crate_combo.addItem(text, code)
         self.crate_combo.setCurrentIndex(max(0, self.crate_combo.findData(row.get("crate_mode", "everyday"))))
         form.addRow("Songs come from:", self.crate_combo)
-        self.crates_edit = QLineEdit(crates_text(row.get("crates") or []))
-        self.crates_edit.setAccessibleName("Crate numbers for this row, for example 1, 3, 5-8. Used when you choose only the crates I list")
-        form.addRow("Crate numbers (for example 1, 3, 5-8):", self.crates_edit)
-        crate_note = QLabel("Your crates: " + ("; ".join(f"{n}, {name}" for n, name in crate_names) if crate_names else "none yet. Add them on the Crates page."))
+        self.crate_list = CrateChecklist(crate_names, row.get("crates") or [], "Crates this row's mix may use. Check the crates you want",
+                                         on_change=self.crate_checked)
+        form.addRow("Crates (check the ones to use):", self.crate_list)
+        crate_note = QLabel("Check one crate and only that crate plays. Check two and both play together, and so on. "
+                            "Checking a crate switches the choice above to only the crates you check.")
         crate_note.setWordWrap(True)
         crate_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         form.addRow(crate_note)
@@ -17924,11 +18058,16 @@ class DjRowDialog(QDialog):
         mixing = self.action_combo.currentData() == "mix"
         for spin in (self.start_spin, self.end_spin, self.latest_spin, self.crate_combo):
             spin.setEnabled(mixing)
-        self.crates_edit.setEnabled(mixing and self.crate_combo.currentData() == "pick")
+        self.crate_list.setEnabled(mixing)
+
+    def crate_checked(self):
+        """Checking a crate means the mix should use the checked crates."""
+        if self.crate_combo.currentData() != "pick":
+            self.crate_combo.setCurrentIndex(max(0, self.crate_combo.findData("pick")))
 
     def values(self):
         start, end, latest = clean_times(self.start_spin.value(), self.end_spin.value(), self.latest_spin.value())
-        mode, crates = clean_crate_choice(self.crate_combo.currentData(), parse_crates(self.crates_edit.text()))
+        mode, crates = clean_crate_choice(self.crate_combo.currentData(), self.crate_list.checked())
         return {"days": self.days_combo.currentData(), "from_hour": int(self.from_combo.currentData()),
                 "to_hour": int(self.to_combo.currentData()), "action": self.action_combo.currentData(),
                 "start": start, "end": end, "latest": latest, "crate_mode": mode, "crates": crates}
@@ -18183,6 +18322,8 @@ class BroadcastingApp(QWidget):
         self.gui_caller = GuiCaller()
         self.vt_service = VTService(self)
         self._dj_times_moved = migrate_dj_defaults(self.settings)
+        if migrate_mix_exit(self.settings):
+            RUN_LOG.write("SHOWS", "Mix setting 'Songs end at' moved from the end of the second hook to the play time (about 2 minutes a song).")
         self.content_rules = ContentRules(self.settings)
         CONTENT_FILTER["fn"] = self.content_rules.filter
         self.show_store = ShowStore()
@@ -22398,8 +22539,13 @@ class BroadcastingApp(QWidget):
                     self.mix_setting_spin("mix_max_tempo_change", 0.0, 12.0, 3.0, "Most a song's speed may change, percent", " %", 1))
         form.addRow("Speed change spread over this many bars before the blend:",
                     self.mix_setting_spin("mix_ramp_bars", 0, 32, 8, "Bars before the blend over which the outgoing song changes speed"))
-        form.addRow("Songs end at:", self.mix_setting_combo("mix_exit", (("hook1", "End of the first hook"), ("hook2", "End of the second hook"),
-                                                                       ("end", "Natural end")), "hook2", "Where songs end"))
+        form.addRow("Songs end at:", self.mix_setting_combo("mix_exit", (("play", "After the play time, at the end of a phrase"),
+                                                                       ("hook1", "End of the first hook"), ("hook2", "End of the second hook"),
+                                                                       ("end", "Natural end")), "play", "Where songs end"))
+        form.addRow("A song plays about this many seconds before it leaves:",
+                    self.mix_setting_spin("mix_play_seconds", 30, 600, 120, "Seconds a song plays before it leaves", " s"))
+        form.addRow("A song plays at least this many seconds (shorter only to make a part end on its break):",
+                    self.mix_setting_spin("mix_min_play_seconds", 10, 600, 60, "Fewest seconds a song plays", " s"))
         form.addRow("When songs cannot be beat-matched:", self.mix_setting_combo(
             "mix_fallback", (("delay", "Echo-out into the next song"), ("cut", "Cut")), "delay", "When songs cannot be beat-matched"))
         form.addRow("Intro loop under a talk break:", self.mix_setting_combo("mix_loop_bars", ((2, "2 bars"), (4, "4 bars")), 4,
@@ -22522,9 +22668,9 @@ class BroadcastingApp(QWidget):
             self.dj_crate_combo.addItem(text, code)
         self.dj_crate_combo.setCurrentIndex(max(0, self.dj_crate_combo.findData(crate_mode)))
         form.addRow("Default songs come from:", self.dj_crate_combo)
-        self.dj_crates_edit = QLineEdit(crates_text(crate_list))
-        self.dj_crates_edit.setAccessibleName("Default crate numbers, for example 1, 3, 5-8. Used when you choose only the crates I list")
-        form.addRow("Default crate numbers (for example 1, 3, 5-8):", self.dj_crates_edit)
+        self.dj_crate_list = CrateChecklist(self.crate_names(), crate_list, "Default crates the mix may use. Check the crates you want",
+                                            on_change=self.dj_crate_checked)
+        form.addRow("Default crates (check the ones to use):", self.dj_crate_list)
         crate_note = QLabel("Crates only feed the mix. The minutes outside the mix always play the everyday automation music. "
                             "Crates are added on the Crates page.")
         crate_note.setWordWrap(True)
@@ -22585,12 +22731,17 @@ class BroadcastingApp(QWidget):
             self.announce("Row added. Press Save DJ Schedule to apply it." + self.crate_choice_warning(dialog.crate_combo.currentData(), row))
 
     def crate_names(self):
-        return [(x["crate"], x["name"]) for x in self.content_rules.crate_sources()]
+        return [(x["crate"], f"{x['name']}, {'explicit' if x.get('content') == 'explicit' else 'clean'}") for x in self.content_rules.crate_sources()]
+
+    def dj_crate_checked(self):
+        """Checking a crate in the default list means the default mix uses the checked crates."""
+        if self.dj_crate_combo.currentData() != "pick":
+            self.dj_crate_combo.setCurrentIndex(max(0, self.dj_crate_combo.findData("pick")))
 
     def crate_choice_warning(self, asked_mode, row):
         """A sentence for the case where 'only the crates I list' was chosen but nothing usable was listed."""
         if asked_mode == "pick" and row.get("crate_mode") != "pick":
-            return " You chose only the crates you list, but no crate numbers were listed, so this row uses the everyday music."
+            return " You chose only the crates you check, but no crate was checked, so this row uses the everyday music."
         return ""
 
     def dj_row_edit(self):
@@ -22723,7 +22874,7 @@ class BroadcastingApp(QWidget):
         note = QLabel(f"Crates: each music folder (Classics, New school and so on) goes in its own numbered crate, Crate 1 up to Crate {CRATE_MAX}. "
                       "Crates feed the DJ mixes only. The minutes outside the mix always play the everyday automation music. "
                       "On the DJ Schedule page you say, for the default and for each row, whether the mix takes its songs from the everyday "
-                      "music, from all your crates, or from the crates you list.")
+                      "music, from all your crates, or from only the crates you check.")
         note.setWordWrap(True)
         note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(note)
@@ -22778,6 +22929,9 @@ class BroadcastingApp(QWidget):
             self.content_list.addItem(item)
         if self.content_list.count():
             self.content_list.setCurrentRow(0)
+        crate_list = getattr(self, "dj_crate_list", None)
+        if crate_list is not None:                                   # the default crate list on the DJ Schedule page follows the crates
+            crate_list.fill(self.crate_names(), crate_list.checked())
         used = len(self.content_rules.sources)
         self.content_status.setText(f"{used} of {CRATE_MAX} crates are in use." if used else
                                     f"All {CRATE_MAX} crates are empty. Use the buttons below to put a folder in Crate 1.")
@@ -22987,13 +23141,13 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("dj_latest_minute", latest)
         self.settings.setValue("dj_hours", self.dj_hours_edit.text().strip() or "all")
         asked = self.dj_crate_combo.currentData()
-        mode, crates = clean_crate_choice(asked, parse_crates(self.dj_crates_edit.text()))
+        mode, crates = clean_crate_choice(asked, self.dj_crate_list.checked())
         self.settings.setValue("dj_crate_mode", mode)
         self.settings.setValue("dj_crates", crates_text(crates))
         self.dj_crate_combo.setCurrentIndex(max(0, self.dj_crate_combo.findData(mode)))
-        self.dj_crates_edit.setText(crates_text(crates))
+        self.dj_crate_list.fill(self.crate_names(), crates)
         if asked == "pick" and mode != "pick":
-            self.announce("You chose only the crates you list, but no crate numbers were listed, so the default uses the everyday music.")
+            self.announce("You chose only the crates you check, but no crate was checked, so the default uses the everyday music.")
         for spin, value in ((self.dj_start_spin, start), (self.dj_end_spin, end), (self.dj_latest_spin, latest)):
             spin.setValue(value)
         self.refresh_dj_schedule_view()
@@ -23188,7 +23342,7 @@ class BroadcastingApp(QWidget):
             if not tasks:
                 return
             worker = DjModeWorker(tasks, mix_options(self.settings), dj_settings(self.settings), self.show_store,
-                                  self.rotation.rules, self.rotation.play_history)
+                                  self.rotation.rules, self.rotation.play_history, crate_of=self.content_rules.crate_of)
             worker.progress.connect(lambda t: self.dj_status.setText("DJ mode: " + t))
             worker.built.connect(self.dj_hour_built)
             worker.failed.connect(self.dj_hour_failed)
