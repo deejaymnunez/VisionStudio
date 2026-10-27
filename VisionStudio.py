@@ -643,6 +643,75 @@ def measure_loudness(path, cancel_event=None):
         return None
 
 
+LEVELED_MARK = ".leveled"           # sits next to a mix part that was already matched to the loudness target when it was built
+
+
+def _loudnorm_filter(original_path, cancel_event=None):
+    """Measures a file and returns (the exact ffmpeg filter that brings it to the loudness target, True when the measure was
+    good, the measured loudness or None)."""
+    data = measure_loudness(original_path, cancel_event)
+    filter_text = f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP=-1.5:LRA=11"
+    if data:
+        try:
+            measured_i = float(data["input_i"])
+            if measured_i > -70.0:
+                filter_text = (
+                    f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP=-1.5:LRA=11"
+                    f":measured_I={data['input_i']}:measured_LRA={data['input_lra']}"
+                    f":measured_TP={data['input_tp']}:measured_thresh={data['input_thresh']}"
+                    f":offset={data['target_offset']}:linear=true"
+                )
+                return filter_text, True, measured_i
+        except Exception:
+            pass
+    return filter_text, False, None
+
+
+def is_leveled(path):
+    """True when a mix part was matched to the loudness target at build time and has not changed since."""
+    try:
+        with open(path + LEVELED_MARK, "r", encoding="utf-8") as handle:
+            return int(handle.read().strip()) == os.path.getsize(path)
+    except Exception:
+        return False
+
+
+def level_file_in_place(path, cancel_event=None, bitrate="256k"):
+    """Matches a finished mix part to the loudness target right where it is, so nothing has to be done when it goes on air
+    (doing it then froze the whole stream for a minute). Returns True when the file is at the target."""
+    filter_text, measured_ok, measured_i = _loudnorm_filter(path, cancel_event)
+    if NORMALIZATION_STATE["ffmpeg_missing"] or not measured_ok:
+        return False
+    if abs(measured_i - LOUDNESS_TARGET_LUFS) < 0.5:
+        return True
+    ext = os.path.splitext(path)[1].lower()
+    codec = ["-c:a", "pcm_s16le"] if ext == ".wav" else ["-c:a", "libmp3lame", "-b:a", bitrate]
+    tmp_path = path + ".lvl" + ext
+    cmd = [get_ffmpeg_path(), "-y", "-hide_banner", "-nostats", "-i", path, "-vn", "-af", filter_text,
+           "-ar", "44100", "-ac", "2"] + codec + [tmp_path]
+    code, _text = run_ffmpeg(cmd, cancel_event=cancel_event)
+    if code == 0 and os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 1000:
+        try:
+            os.replace(tmp_path, path)
+            return True
+        except OSError:
+            pass
+    try:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        pass
+    return False
+
+
+def mark_leveled(path):
+    try:
+        with open(path + LEVELED_MARK, "w", encoding="utf-8") as handle:
+            handle.write(str(os.path.getsize(path)))
+    except OSError:
+        pass
+
+
 def normalize_file_loudness(original_path, on_status=None, cancel_event=None):
     """
     Two-pass loudness normalization to LOUDNESS_TARGET_LUFS. Pass one measures
@@ -653,6 +722,8 @@ def normalize_file_loudness(original_path, on_status=None, cancel_event=None):
     """
     if not original_path or not os.path.isfile(original_path):
         return original_path
+    if is_leveled(original_path):
+        return original_path
 
     out_path = get_normalized_path_for(original_path)
     if os.path.isfile(out_path):
@@ -662,25 +733,9 @@ def normalize_file_loudness(original_path, on_status=None, cancel_event=None):
         if os.path.isfile(out_path):
             return out_path
 
-        data = measure_loudness(original_path, cancel_event)
+        filter_text, measured_ok, _measured_i = _loudnorm_filter(original_path, cancel_event)
         if NORMALIZATION_STATE["ffmpeg_missing"]:
             return original_path
-
-        measured_ok = False
-        filter_text = f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP=-1.5:LRA=11"
-        if data:
-            try:
-                measured_i = float(data["input_i"])
-                if measured_i > -70.0:
-                    filter_text = (
-                        f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP=-1.5:LRA=11"
-                        f":measured_I={data['input_i']}:measured_LRA={data['input_lra']}"
-                        f":measured_TP={data['input_tp']}:measured_thresh={data['input_thresh']}"
-                        f":offset={data['target_offset']}:linear=true"
-                    )
-                    measured_ok = True
-            except Exception:
-                measured_ok = False
 
         tmp_path = out_path + f".{os.getpid()}.{threading.get_ident()}.part"
         cmd = [get_ffmpeg_path(), "-y", "-hide_banner", "-nostats", "-i", original_path,
@@ -7084,6 +7139,9 @@ MIX_DEFAULTS = {
                                   # or blend (beat-matched overlap)
     "overlay_loop_bars": 4,       # bars of the outgoing song that loop under the next song's intro (2 or 4)
     "echo_lead_seconds": 5.0,     # the echo-out starts this long before the next song's first verse or hook
+    "max_song_seconds": 210.0,    # a song never plays longer than about this without a phrase end to leave at; 0 turns the cap off
+    "fade_in_start": 40.0,        # percent: the next song comes in at this level and rises to full over the looped bars; 100 turns it off
+    "loop_end_level": 60.0,       # percent: the looped bars of the finishing song sink to this level as the next song comes up; 100 turns it off
 }
 
 
@@ -7115,6 +7173,9 @@ def mix_options(settings=None):
         opts["transition_style"] = "loop"
     opts["overlay_loop_bars"] = 2 if int(opts["overlay_loop_bars"]) <= 2 else 4
     opts["echo_lead_seconds"] = max(0.0, min(15.0, float(opts["echo_lead_seconds"])))
+    opts["max_song_seconds"] = 0.0 if float(opts["max_song_seconds"]) <= 0 else max(60.0, min(900.0, float(opts["max_song_seconds"])))
+    opts["fade_in_start"] = max(0.0, min(100.0, float(opts["fade_in_start"])))
+    opts["loop_end_level"] = max(0.0, min(100.0, float(opts["loop_end_level"])))
     return opts
 
 
@@ -7154,9 +7215,32 @@ def snap_to_bar(song, t, direction="down"):
     return song["downbeat"] + n * song["bar"]
 
 
-def exit_candidates(song, limit=3):
+def _fill_gaps(song, exits, max_gap):
+    """Where the hooks leave a stretch longer than `max_gap` seconds with nowhere to leave, adds a phrase end (every 8 bars)."""
+    if not max_gap or song["bar"] <= 0 or song["duration"] <= 0:
+        return exits
+    out = list(exits)
+    marks = [0.0] + [t for _n, t in exits]
+    if song["duration"] > marks[-1]:
+        marks.append(song["duration"])
+    phrase = 8 * song["bar"]
+    for a, b in zip(marks, marks[1:]):
+        if b - a <= max_gap:
+            continue
+        k = math.ceil((a + 20.0 - song["downbeat"]) / phrase)
+        t = song["downbeat"] + k * phrase
+        while t < b - 20.0:
+            if t > 30.0:
+                out.append((f"phrase{int(round(t))}", t))
+            t += phrase
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def exit_candidates(song, limit=3, max_gap=0.0):
     """Places a song can end, earliest first: [(name, source seconds)]. Always includes the natural end.
-    `limit` is how many hooks count (the first 3 normally); None counts every hook the analysis found."""
+    `limit` is how many hooks count (the first 3 normally); None counts every hook the analysis found. With a `max_gap`,
+    phrase ends are added wherever the hooks leave a stretch that long with nowhere to leave."""
     out = []
     for number, hook in enumerate(song["hooks"][:limit] if limit else song["hooks"], 1):
         t = snap_to_bar(song, float(hook["end"]))
@@ -7168,13 +7252,13 @@ def exit_candidates(song, limit=3):
             last -= song["bar"]
         if not out or last > out[-1][1] + 1.0:
             out.append(("end", max(1.0, last)))
-    return out
+    return _fill_gaps(song, out, max_gap) if limit is None else out
 
 
-def play_exit(song, play_seconds, src_start=0.0):
+def play_exit(song, play_seconds, src_start=0.0, max_gap=0.0):
     """The end of the first phrase that comes at least `play_seconds` after the song began. Returns (name, source seconds) or None
     when the song ends before that."""
-    for name, t in exit_candidates(song, None):
+    for name, t in exit_candidates(song, None, max_gap):
         if t - src_start >= play_seconds - 1e-6:
             return name, t
     return None
@@ -7183,10 +7267,10 @@ def play_exit(song, play_seconds, src_start=0.0):
 def default_exit(song, mode, opts=None, src_start=0.0):
     """The exit this song uses unless the plan changes it: (name, source seconds, note)."""
     if mode == "play":
-        found = play_exit(song, (opts or MIX_DEFAULTS)["play_seconds"], src_start)
+        found = play_exit(song, (opts or MIX_DEFAULTS)["play_seconds"], src_start, (opts or MIX_DEFAULTS).get("max_song_seconds", 0.0))
         if found:
             return found[0], found[1], ""
-        cands = exit_candidates(song, None)
+        cands = exit_candidates(song, None, (opts or MIX_DEFAULTS).get("max_song_seconds", 0.0))
         if cands:
             return cands[-1][0], cands[-1][1], "the song is shorter than the play time, so it plays to the end"
         return "end", max(1.0, song["duration"] - 0.5), "song length unknown"
@@ -7413,9 +7497,9 @@ def _set_exit(rec, name, src):
     rec["exit_name"], rec["exit_src"] = name, float(src)
 
 
-def _candidate_end_times(rec, play=False):
+def _candidate_end_times(rec, play=False, max_gap=0.0):
     """Output times at which this song would end for each possible exit (as if nothing follows it). In play mode every phrase end counts."""
-    return [(name, _out_time(rec, src)) for name, src in exit_candidates(rec["song"], None if play else 3) if src > rec["src_start"] + 1.0]
+    return [(name, _out_time(rec, src)) for name, src in exit_candidates(rec["song"], None if play else 3, max_gap) if src > rec["src_start"] + 1.0]
 
 
 def plan_block(items, parts, opts=None):
@@ -7448,7 +7532,7 @@ def plan_block(items, parts, opts=None):
                 rec["notes"].append(note)
             _set_exit(rec, name, src)
             playing = mode in ("play", "end") and item.get("exit") not in ("hook1", "hook2", "end")      # the song closing a part may end at any phrase end
-            cands = _candidate_end_times(rec, playing) or [(name, _out_time(rec, src))]
+            cands = _candidate_end_times(rec, playing, opts.get("max_song_seconds", 0.0)) or [(name, _out_time(rec, src))]
             if item.get("exit") in ("hook1", "hook2", "end"):
                 # the user fixed this song's exit: it only closes the part if that exit is near the mark
                 fixed = dict(cands).get(name, cands[-1][1])
@@ -7456,7 +7540,7 @@ def plan_block(items, parts, opts=None):
             longest = max(t for _n, t in cands)
             lo = target - opts["early_tolerance"]
             hi = (latest if last_part else target + opts["late_tolerance"])
-            pool = dict(exit_candidates(rec["song"], None if playing else 3))
+            pool = dict(exit_candidates(rec["song"], None if playing else 3, opts.get("max_song_seconds", 0.0)))
             in_range = [(n, t) for n, t in cands if lo <= t <= hi]
             if playing and in_range:
                 # A song plays at least its minimum play time. Shorter (never under 20 seconds) only when nothing else lets the part end
@@ -7961,30 +8045,35 @@ def measure_sync(outgoing, incoming, sr, beat_seconds):
     if n < int(2.0 * sr):
         return None
     a, b = _flux_envelope(outgoing[:n], sr), _flux_envelope(incoming[:n], sr)
-    max_lag = max(2, int(min(0.12, 0.25 * beat_seconds) * sr / SYNC_HOP))
     frame = SYNC_HOP / float(sr)
+    # only a quarter of a beat either way (and under a 16th note): looking further would let a hi-hat line up with the wrong hi-hat
+    max_lag = max(2, int(min(0.12, 0.25 * beat_seconds) * sr / SYNC_HOP))
     status, lag_frames, quality = _best_lag(a, b, max_lag)
     if status == "flat":
         return None
     if status == "weak":
-        return {"lag": 0.0, "residual_ms": 999.0, "quality": quality, "max_lag": max_lag * frame}
+        return {"lag": 0.0, "residual_ms": 999.0, "quality": quality, "max_lag": max_lag * frame, "checked": 0}
     lag = lag_frames * frame
-    # the beats must stay together all through the stretch, not only on average: look at three windows one after the other
-    size = min(len(a), len(b)) // 3
-    lags, weak = [], False
-    for k in range(3):
-        st, lg, _q = _best_lag(a[k * size:(k + 1) * size], b[k * size:(k + 1) * size], max_lag, min_pulses=4)
-        if st == "ok":
-            lags.append(lg * frame)
-        elif st == "weak":
-            weak = True
+    # the beats must stay together all through the stretch, not only on average: look at three windows one after the other, or at
+    # two halves when the windows are too short to hold a row of beats
+    for pieces in (3, 2):
+        size = min(len(a), len(b)) // pieces
+        lags, weak = [], False
+        for k in range(pieces):
+            st, lg, _q = _best_lag(a[k * size:(k + 1) * size], b[k * size:(k + 1) * size], max_lag, min_pulses=4)
+            if st == "ok":
+                lags.append(lg * frame)
+            elif st == "weak":
+                weak = True
+        if weak or len(lags) >= 2:
+            break
     if weak:
         residual = 999.0
     elif len(lags) >= 2:
         residual = max(abs(v - lag) for v in lags) * 1000.0
     else:
         residual = 0.0               # too little of the stretch has a beat to compare: the one measurement is all there is
-    return {"lag": lag, "residual_ms": residual, "quality": quality, "max_lag": max_lag * frame}
+    return {"lag": lag, "residual_ms": residual, "quality": quality, "max_lag": max_lag * frame, "checked": len(lags)}
 
 
 def _check_sync(p_rec, rec, incoming, probe, opts, sr):
@@ -7996,19 +8085,27 @@ def _check_sync(p_rec, rec, incoming, probe, opts, sr):
     tolerance = float(opts.get("sync_tolerance_ms", 25.0))
     looped = probe.get("looped")
     if tolerance <= 0 or looped is None or len(looped) == 0:
+        probe["result"] = "unchecked"
         return 0.0, True, label + ", the beats were not checked."
     seconds = min(lo["seconds"], len(looped) / float(sr), len(incoming) / float(sr))
     n = int(seconds * sr)
     found = measure_sync(looped[:n], incoming[:n], sr, 60.0 / lo["tempo_to"])
     if found is None:
+        probe["result"] = "unmeasured"
         return 0.0, True, label + ", the beats could not be measured in this stretch, so the song grids were used as they are."
     moved = found["lag"] * 1000.0
     if found["residual_ms"] > tolerance:
         apart = "did not line up at all" if found["residual_ms"] >= 999.0 else f"were {found['residual_ms']:.0f} milliseconds apart even after lining them up"
+        probe["result"] = "refused"
         return 0.0, False, label + f", but the beats {apart} (more than the {tolerance:.0f} allowed), so an echo-out was used instead."
-    text = label + f", beats lined up to within {found['residual_ms']:.0f} milliseconds"
-    text += f" after moving the loop {moved:+.0f} milliseconds." if abs(moved) >= 2.0 else "."
-    return found["lag"], True, text
+    if found.get("checked", 0) >= 2:
+        text = label + f", beats lined up to within {found['residual_ms']:.0f} milliseconds"
+        probe["result"] = "ok"
+    else:
+        text = label + ", beats matched in the one stretch that could be measured but could not be double-checked"
+        probe["result"] = "unchecked"
+    text += f" after moving the loop {moved:+.0f} milliseconds" if abs(moved) >= 2.0 else ""
+    return found["lag"], True, text + "."
 
 
 def render_loop_out(rec, gain, opts, decode=decode_stereo, sr=MIX_SR, probe=None):
@@ -8045,6 +8142,23 @@ def render_loop_out(rec, gain, opts, decode=decode_stereo, sr=MIX_SR, probe=None
     result[:n] = body
     result[n:n + len(ring)] += ring[:len(result) - n] * 0.8
     return result
+
+
+def _bring_in_under_loop(incoming, over, seconds, opts, sr):
+    """While the finishing song's bars loop, the next song comes up gradually and the loop sinks, so the new song never
+    jumps in on top at full level. Returns (incoming, loop)."""
+    n = int(round(seconds * sr))
+    start = float(opts.get("fade_in_start", 100.0)) / 100.0
+    end = float(opts.get("loop_end_level", 100.0)) / 100.0
+    if start < 0.999 and n > 1 and len(incoming):
+        incoming = incoming.copy()
+        k = min(n, len(incoming))
+        incoming[:k] *= np.linspace(start, 1.0, k, dtype=np.float32)[:, None]
+    if end < 0.999 and n > 1 and len(over):
+        over = over.copy()
+        k = min(n, len(over))
+        over[:k] *= np.linspace(1.0, end, k, dtype=np.float32)[:, None]
+    return incoming, over
 
 
 def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=None, sr=MIX_SR):
@@ -8118,7 +8232,9 @@ def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=No
             over = render_loop_out(p_rec, gains.get(id(p_rec), 1.0), opts, decode, sr, probe=probe)
             shift, use_loop, sync_text = _check_sync(p_rec, rec, audio, probe, opts, sr)
             part.setdefault("sync_report", []).append(sync_text)
+            part.setdefault("sync_pairs", []).append((p_rec["song"]["path"], rec["song"]["path"], probe.get("result", "")))
             if use_loop:
+                audio, over = _bring_in_under_loop(audio, over, p_rec["loop_out"]["seconds"], opts, sr)
                 if len(over):
                     write(over, p_off + len(p_audio) - int(round(shift * sr)))
             else:
@@ -16745,6 +16861,19 @@ def rules_problems(project, rules, history=None):
     return problems
 
 
+class _StopEvent:
+    """Lets the audio tools ask the builder whether it was told to stop."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def is_set(self):
+        try:
+            return bool(self.fn and self.fn())
+        except Exception:
+            return False
+
+
 def build_package(project, plan, opts, song_for, progress=None, should_stop=None, decode=None, bitrate="256k"):
     """Renders every part to an audio file in the project's package folder and writes the manifest. Returns the manifest."""
     folder = os.path.join(project_folder(project), "package")
@@ -16778,6 +16907,7 @@ def build_package(project, plan, opts, song_for, progress=None, should_stop=None
         kwargs = {"decode": decode} if decode is not None else {}
         audio, notes = render_part(part, opts, voice_loader=voice_loader, progress=part_progress, **kwargs)
         manifest.setdefault("sync", []).extend(part.get("sync_report") or [])
+        manifest.setdefault("sync_pairs", []).extend([list(p) for p in part.get("sync_pairs") or []])
         if progress is not None:
             progress(f"Part {number + 1}: saving the audio file...")
         if not write_audio_file(path, audio, bitrate=bitrate):
@@ -16787,6 +16917,13 @@ def build_package(project, plan, opts, song_for, progress=None, should_stop=None
             if not write_audio_file(path, audio):
                 raise RuntimeError(f"Part {number + 1} could not be saved.")
             manifest["notes"].append(f"Part {number + 1} was saved uncompressed because MP3 encoding was not available.")
+        if progress is not None:
+            progress(f"Part {number + 1}: matching the loudness...")
+        try:
+            if level_file_in_place(path, _StopEvent(should_stop), bitrate=bitrate):
+                mark_leveled(path)
+        except Exception:
+            pass                          # not matched here: it is matched when it goes on air, as before
         songs = []
         for rec in part["songs"]:
             s = rec["song"]
@@ -16805,15 +16942,82 @@ def build_package(project, plan, opts, song_for, progress=None, should_stop=None
 
 
 # --- Auto Mix: for a show with no DJ -----------------------------------------------------------------------
-def auto_mix_pick(candidates, parts, opts, rules=None, rng=None, history=None, max_songs=40):
+# Pairs of songs whose beats did not line up are remembered, so a later mix does not try them again (the list is a small file
+# in the VisionStudio data folder; delete the file to forget them all; entries also expire after a month or when the songs are re-read)
+PAIR_MEMORY_DAYS = 30
+
+
+def pair_memory_path():
+    return os.path.join(os.path.dirname(os.path.abspath(analysis_folder())), "mix_pairs.json")
+
+
+def mix_pair_key(first, second):
+    return f"{first}|{second}"
+
+
+def load_pair_memory(today=None):
+    today = today or datetime.now().date()
+    try:
+        with open(pair_memory_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    out = {}
+    for key, entry in (data.items() if isinstance(data, dict) else []):
+        try:
+            age = (today - datetime.strptime(str(entry["day"]), "%Y-%m-%d").date()).days
+            if entry.get("v") == ANALYSIS_VERSION and 0 <= age <= PAIR_MEMORY_DAYS:
+                out[key] = {"day": entry["day"], "v": entry["v"]}
+        except Exception:
+            continue
+    return out
+
+
+def remember_pairs(results, today=None):
+    """results: [(first path, second path, outcome)]. A refused pair is remembered; one that lined up is forgotten.
+    Returns how many pairs were newly remembered."""
+    today = today or datetime.now().date()
+    memory = load_pair_memory(today)
+    added = 0
+    for first, second, outcome in results or []:
+        key = mix_pair_key(first, second)
+        if outcome == "refused":
+            if key not in memory:
+                added += 1
+            memory[key] = {"day": today.isoformat(), "v": ANALYSIS_VERSION}
+        elif outcome == "ok":
+            memory.pop(key, None)
+    try:
+        path = pair_memory_path()
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(memory, handle)
+        os.replace(path + ".tmp", path)
+    except Exception:
+        pass
+    return added
+
+
+def _tempo_change(song, other):
+    """How far apart two songs' speeds are as a fraction, counting half and double time."""
+    if not song["bpm"] or not other["bpm"]:
+        return 9.9
+    target = min([song["bpm"], song["bpm"] * 2, song["bpm"] / 2], key=lambda b: abs(b / other["bpm"] - 1.0))
+    return abs(target / other["bpm"] - 1.0)
+
+
+def auto_mix_pick(candidates, parts, opts, rules=None, rng=None, history=None, max_songs=40, avoid_pairs=None):
     """Chooses and orders songs from `candidates` (a list of make_song() dictionaries) so the parts fill, with no talk
     breaks: each next song is close in speed to the one before, from a different artist, and passes the programming
-    rules. Returns the chosen list of song dictionaries."""
+    rules. Songs with many partners at their speed lead the way and songs with none are used last and only when nothing
+    fits; pairs that failed to line up before are tried last. Returns the chosen list of song dictionaries."""
     rng = rng or random.Random()
+    avoid_pairs = avoid_pairs or set()
+    limit = opts["max_tempo_change"] / 100.0 + 1e-9
     pool = [c for c in candidates if song_is_beatmatchable(c, opts) and c["duration"] > 60]
     rng.shuffle(pool)
     if not pool:
         return []
+    partners = {id(c): sum(1 for o in pool if o is not c and _tempo_change(c, o) <= limit) for c in pool}
 
     class H:
         last_played_track = {}
@@ -16822,23 +17026,28 @@ def auto_mix_pick(candidates, parts, opts, rules=None, rng=None, history=None, m
         last = chosen[-1] if chosen else None
         options = []
         stretch = []
+        taken = set(id(x) for x in chosen)
         for c in pool:
-            if c in chosen:
+            if id(c) in taken:
                 continue
             if rules is not None and rules.enabled and rules.check(c["path"], history or H(), [x["path"] for x in chosen]):
                 continue
+            hook_bonus = 0.0 if c["hooks"] else 0.01
+            sure = (1.0 - min(1.0, float(c.get("confidence") or 0.0))) * 0.01
             if last is not None:
                 if _normal(c["artist"]) and _normal(c["artist"]) == _normal(last["artist"]):
                     continue
-                target = min([c["bpm"], c["bpm"] * 2, c["bpm"] / 2], key=lambda b: abs(b / last["bpm"] - 1.0))
-                change = abs(target / last["bpm"] - 1.0)
-                if change > opts["max_tempo_change"] / 100.0 + 1e-9:
-                    stretch.append((change + rng.random() * 0.004, c))      # only if nothing blends: it comes in with an echo-out
+                change = _tempo_change(c, last)
+                known_bad = mix_pair_key(last["path"], c["path"]) in avoid_pairs
+                if change > limit or known_bad:
+                    # only if nothing blends: it comes in with an echo-out; the one with the most partners leads into a new group of songs
+                    stretch.append((change + (0.5 if known_bad else 0.0) - 0.002 * min(partners[id(c)], 12) + rng.random() * 0.004, c))
                     continue
+                left = sum(1 for o in pool if id(o) not in taken and o is not c and _tempo_change(c, o) <= limit)
+                dead_end = 0.03 if left == 0 else 0.0               # a song with no partner left is best saved for the end
+                options.append((change + hook_bonus + sure + dead_end + rng.random() * 0.004, c))
             else:
-                change = 0.0
-            hook_bonus = 0.0 if c["hooks"] else 0.01
-            options.append((change + hook_bonus + rng.random() * 0.004, c))
+                options.append((hook_bonus + sure - 0.0005 * min(partners[id(c)], 12) + rng.random() * 0.004, c))
         if not options:
             options = stretch
         if not options:
@@ -17651,7 +17860,7 @@ DJ_BITRATE = "192k"
 DJ_DEFAULT_TIMES = (0, 58, 60)         # start, planned end, latest end: the mix starts right after the top-of-hour jingle and runs to the end of the hour
 DJ_OLD_DEFAULT_TIMES = (20, 47, 50)    # what earlier versions used
 DJ_TOP_BREAK_SECONDS = 20.0            # the top-of-hour jingle, until the station has measured its own
-MIX_STYLE_VERSION = 4          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. 4: beats lined up, 8 percent tempo limit. A built mix with an older number is rebuilt.
+MIX_STYLE_VERSION = 5          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. 4: beats lined up, 8 percent tempo limit. 5: next song fades in, parts loudness-matched when built. A built mix with an older number is rebuilt.
 DJ_RETRY_SECONDS = 3600
 
 
@@ -17923,6 +18132,11 @@ def row_matches(row, day, hour):
     return (a <= hour <= b) if a <= b else (hour >= a or hour <= b)       # 22 to 5 wraps around midnight
 
 
+def row_hours_match(row, hour):
+    a, b = row["from_hour"], row["to_hour"]
+    return (a <= hour <= b) if a <= b else (hour >= a or hour <= b)
+
+
 def describe_row(row):
     days = DJ_DAY_TEXT.get(row["days"], row["days"])
     hours = (f"{clock_hour_text(row['from_hour'])} to the end of {clock_hour_text(row['to_hour'])}" if row["from_hour"] != row["to_hour"]
@@ -17958,10 +18172,29 @@ def schedule_signature(settings):
                        "rows": load_schedule_rows(settings)}, sort_keys=True)
 
 
+def exit_text(name):
+    name = name or "end"
+    return "a phrase end" if name.startswith("phrase") else f"its {name}"
+
+
+def hours_phrase(hours):
+    """{0,1,2,3,4,5,14} -> '12 AM to the end of 5 AM, the 2 PM hour'; all 24 -> 'every hour'."""
+    hours = sorted(set(int(h) for h in hours))
+    if len(hours) >= 24:
+        return "every hour"
+    runs = []
+    for h in hours:
+        if runs and h == runs[-1][1] + 1:
+            runs[-1][1] = h
+        else:
+            runs.append([h, h])
+    bits = [f"the {clock_hour_text(a)} hour" if a == b else f"{clock_hour_text(a)} to the end of {clock_hour_text(b)}" for a, b in runs]
+    return ", ".join(bits) if bits else "no hour"
+
+
 def describe_schedule(settings):
     base = dj_settings(settings)
-    hours = str(settings.value("dj_hours", "all") or "all")
-    lines = [f"By default, in {'every hour' if base['hours'] == set(range(24)) else 'these hours: ' + hours}, the mix starts at minute "
+    lines = [f"By default, in {hours_phrase(base['hours'])}, the mix starts at minute "
              f"{base['start']}, is planned to end at minute {base['end']} and may end as late as minute {base['latest']}; "
              f"{describe_crate_choice(base['crate_mode'], base['crates'])}."]
     rows = load_schedule_rows(settings)
@@ -17970,6 +18203,18 @@ def describe_schedule(settings):
         lines += [f"{n}. {describe_row(r)}" for n, r in enumerate(rows, 1)]
     else:
         lines.append("There are no extra rows.")
+    if base["hours"] != set(range(24)):
+        lines.append("Hours outside the default and outside every 'build a mix' row play the normal rotation, with no mix.")
+    for n, r in enumerate(rows, 1):
+        if r["action"] != "mix":
+            continue
+        span = [h for h in range(24) if row_hours_match(r, h)]
+        same = ((r["start"], r["end"], r["latest"], r.get("crate_mode", "everyday"), list(r.get("crates") or []))
+                == (base["start"], base["end"], base["latest"], base["crate_mode"], list(base["crates"] or [])))
+        if span and same and all(h in base["hours"] for h in span):
+            lines.append(f"Row {n} changes nothing: the default already builds the same mix for those hours. "
+                         "A 'build a mix' row does not limit the mix to its hours; to stop mixing in other hours, set the default's hours "
+                         "or add a 'no mix' row.")
     return lines
 
 
@@ -18021,7 +18266,7 @@ def plan_miss(plan, opts):
     return worst
 
 
-def choose_auto_songs_detail(project, candidates, opts, rules=None, history=None, rng=None, attempts=12):
+def choose_auto_songs_detail(project, candidates, opts, rules=None, history=None, rng=None, attempts=12, avoid_pairs=None):
     """Picks and orders songs so every part lands near its mark. Returns (chosen, plan, info); chosen is [] when nothing fit,
     and info says how close the best try came."""
     rng = rng or random.Random()
@@ -18029,7 +18274,7 @@ def choose_auto_songs_detail(project, candidates, opts, rules=None, history=None
     info = {"tries": 0, "empty": 0, "best_miss": None}
     for _ in range(attempts):
         info["tries"] += 1
-        chosen = auto_mix_pick(candidates, parts, opts, rules=rules, rng=rng, history=history)
+        chosen = auto_mix_pick(candidates, parts, opts, rules=rules, rng=rng, history=history, avoid_pairs=avoid_pairs)
         if not chosen:
             info["empty"] += 1
             continue
@@ -18055,6 +18300,9 @@ def install_local_show(store, user, show_id, manifest, package_dir):
         target = store.target(user, show_id, manifest, part)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.move(os.path.join(package_dir, part["file"]), target)
+        mark = os.path.join(package_dir, part["file"]) + LEVELED_MARK
+        if os.path.isfile(mark):
+            shutil.move(mark, target + LEVELED_MARK)
     return store.commit(user, show_id)
 
 
@@ -18144,7 +18392,7 @@ def transition_log_lines(plan, hour):
             prev = songs[index - 1]
             style = {"loop": "loop and echo-out", "blend": "beat-matched blend", "delay": "echo-out, then the next song",
                      "cut": "cut"}.get(rec["in_kind"], rec["in_kind"])
-            lines.append(f"{hour:02d}00 part {number}: {prev['song']['title']} leaves at its {prev['exit_name'] or 'end'} -> {style} -> "
+            lines.append(f"{hour:02d}00 part {number}: {prev['song']['title']} leaves at {exit_text(prev['exit_name'])} -> {style} -> "
                          f"{name} ({read}). " + " ".join(n[0].upper() + n[1:] + "." for n in rec["notes"]))
     return lines
 
@@ -18171,7 +18419,8 @@ def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None,
             except Exception:
                 song["crate"] = 0
     project = dj_project(day, hour, cfg)
-    chosen, plan, info = choose_auto_songs_detail(project, candidates, opts, rules, history, rng)
+    avoid = set(load_pair_memory())
+    chosen, plan, info = choose_auto_songs_detail(project, candidates, opts, rules, history, rng, avoid_pairs=avoid)
     if not chosen:
         return "", failure_reason(candidates, studied, opts, info)
     for line in transition_log_lines(plan, hour):
@@ -18192,6 +18441,9 @@ def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None,
     manifest["dj_cfg"] = dj_cfg_stamp(cfg)
     for line in manifest.get("sync") or []:
         RUN_LOG.write("MIX", f"{hour:02d}00 {line}")
+    added = remember_pairs([tuple(p) for p in manifest.get("sync_pairs") or [] if len(p) == 3])
+    if avoid or added:
+        RUN_LOG.write("MIX", f"{hour:02d}00 Song pairs that did not line up before and were put last: {len(avoid)}; newly remembered from this mix: {added}.")
     show_id = project_id(project)
     folder = os.path.join(project_folder(project), "package")
     state = install_local_show(store, AUTO_SHOW_USER, show_id, manifest, folder)
@@ -22801,6 +23053,10 @@ class BroadcastingApp(QWidget):
                                      ("blend", "Beat-matched blend")), "loop", "How one song changes to the next"))
         form.addRow("Bars of the last song that loop under the next intro:", self.mix_setting_combo(
             "mix_overlay_loop_bars", ((2, "2 bars"), (4, "4 bars")), 4, "Bars of the last song that loop under the next intro"))
+        form.addRow("The next song comes in at this percent of full level and rises over the looped bars (100 turns the fade-in off):",
+                    self.mix_setting_spin("mix_fade_in_start", 0, 100, 40, "Percent of full level the next song starts at", " %"))
+        form.addRow("The looped bars of the finishing song sink to this percent as the next song comes up (100 leaves them level):",
+                    self.mix_setting_spin("mix_loop_end_level", 0, 100, 60, "Percent of full level the looped bars sink to", " %"))
         form.addRow("The echo-out starts this many seconds before the next song drops in:",
                     self.mix_setting_spin("mix_echo_lead_seconds", 0.0, 15.0, 5.0, "Seconds before the next song's first verse or hook that the echo-out starts", " s", 1))
         form.addRow("Blend length:", self.mix_setting_combo("mix_blend_bars", ((4, "4 bars"), (8, "8 bars"), (16, "16 bars")), 8,
@@ -22817,6 +23073,8 @@ class BroadcastingApp(QWidget):
                                                                       "play", "Where songs end"))
         form.addRow("A song plays about this many seconds before it leaves:",
                     self.mix_setting_spin("mix_play_seconds", 30, 600, 120, "Seconds a song plays before it leaves", " s"))
+        form.addRow("A song never plays longer than about this many seconds without a phrase end to leave at (0 turns the limit off):",
+                    self.mix_setting_spin("mix_max_song_seconds", 0, 900, 210, "Most seconds a song plays before it leaves at a phrase end", " s"))
         form.addRow("A song plays at least this many seconds (shorter only to make a part end on its break):",
                     self.mix_setting_spin("mix_min_play_seconds", 10, 600, 60, "Fewest seconds a song plays", " s"))
         form.addRow("When songs cannot be beat-matched:", self.mix_setting_combo(
@@ -22908,7 +23166,8 @@ class BroadcastingApp(QWidget):
     def build_dj_schedule_tab(self):
         page = QWidget()
         layout = QVBoxLayout()
-        note = QLabel("DJ schedule: when each hour's mix starts and ends. The default below applies to the hours you list. Extra rows can give "
+        note = QLabel("DJ schedule: when each hour's mix starts and ends. The default below applies only to the hours you list in 'Hours that get a mix'; "
+                      "every other hour plays the normal rotation with no mix. Extra rows can give "
                       "other days or hours their own times, or switch the mix off for them. Rows are checked from the top and the first one "
                       "that fits an hour decides it. Press Save DJ Schedule to apply your changes; mixes that still fit are kept.")
         note.setWordWrap(True)
@@ -22932,8 +23191,8 @@ class BroadcastingApp(QWidget):
         self.dj_latest_spin.setAccessibleName("Default latest end minute")
         form.addRow("Default latest end minute:", self.dj_latest_spin)
         self.dj_hours_edit = QLineEdit(str(self.settings.value("dj_hours", "all")))
-        self.dj_hours_edit.setAccessibleName("Hours the default applies to: all, or for example 5-9, 14")
-        form.addRow("Hours the default applies to (all, or for example 5-9, 14):", self.dj_hours_edit)
+        self.dj_hours_edit.setAccessibleName("Hours that get a mix: all, or for example 0-5 for midnight to the end of 5 AM, 14 for the 2 PM hour")
+        form.addRow("Hours that get a mix (all = every hour; 0-5 = midnight to the end of 5 AM; 22-23, 0-5 = 10 PM to the end of 5 AM):", self.dj_hours_edit)
         crate_mode, crate_list = crate_settings(self.settings)
         self.dj_crate_combo = QComboBox()
         self.dj_crate_combo.setAccessibleName("Where the default mix takes its songs from")
