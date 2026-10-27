@@ -6613,7 +6613,8 @@ def meeting_main():
 
 ANALYSIS_SR = 22050
 ANALYSIS_HOP = 256
-ANALYSIS_VERSION = 1
+GRID_STEADY_MS = 30.0          # a song whose beats stray from the fitted grid by more than this (rms) is not forced to sync
+ANALYSIS_VERSION = 2          # 2: the beat grid is fitted to the whole song and its steadiness is recorded
 
 
 def decode_for_analysis(path, seconds=900):
@@ -6692,19 +6693,37 @@ def _comb_scores(env, bpms, phases_per_period):
     return best, best_phase
 
 
+def _windowed_comb_scores(env, bpms, phases_per_period, seconds=24.0):
+    """Like _comb_scores, but the grid may slide to its best place in every stretch of `seconds` and the scores are averaged. A tempo that
+    is a little off (a song at 124.3 BPM tried at 124.5) no longer smears over the whole song, so the coarse search can find it."""
+    size = int(seconds * ANALYSIS_SR / ANALYSIS_HOP)
+    spans = [(a, a + size) for a in range(0, max(1, len(env) - size // 2), size)]
+    total = np.zeros(len(bpms))
+    used = 0
+    for a, b in spans:
+        part = env[a:b]
+        if len(part) < size // 2 or float(np.mean(part)) < 1e-4:
+            continue
+        sc, _ph = _comb_scores(part, bpms, phases_per_period)
+        total += sc
+        used += 1
+    return total / max(1, used)
+
+
 def estimate_tempo(env):
     """(bpm, first beat time in seconds, confidence 0 to 1)."""
     coarse = np.arange(70.0, 180.5, 0.5)
     score, phase = _comb_scores(env, coarse, 40)
+    score_w = _windowed_comb_scores(env, coarse, 20)
     prior = np.exp(-0.5 * (np.log2(coarse / 120.0) / 0.55) ** 2)
-    pick = int(np.argmax(score * (0.55 + 0.45 * prior)))
+    pick = int(np.argmax(score_w * (0.55 + 0.45 * prior)))
     bpm = float(coarse[pick])
     # a tempo at half or double speed that scores nearly as well is the same groove: keep the one nearer 120
     for factor in (2.0, 0.5):
         other = bpm * factor
         if 70.0 <= other <= 180.0:
             k = int(np.argmin(np.abs(coarse - other)))
-            if score[k] > 0.92 * score[pick] and abs(np.log2(other / 120.0)) < abs(np.log2(bpm / 120.0)):
+            if score_w[k] > 0.92 * score_w[pick] and abs(np.log2(other / 120.0)) < abs(np.log2(bpm / 120.0)):
                 bpm, pick = float(coarse[k]), k
     fine = np.arange(bpm - 0.8, bpm + 0.8, 0.02)
     fscore, fphase = _comb_scores(env, fine, 120)
@@ -6727,6 +6746,59 @@ def estimate_tempo(env):
     return bpm, frame_phase * ANALYSIS_HOP / ANALYSIS_SR, confidence
 
 
+def grid_fit(env, bpm, first_beat_seconds):
+    """Fits the beat grid to the whole song, the way a DJ program lines up its grid: the song is cut into stretches of 16 beats, the grid
+    is slid within each stretch to where the beats really fall, and a straight line through those offsets corrects the tempo and the
+    first beat. Returns (bpm, first beat in seconds, rms error in milliseconds, worst error in milliseconds, stretches used).
+    A song whose beat wanders (live drums, a tempo that moves) gets a large error and is not forced to sync."""
+    period = 60.0 * ANALYSIS_SR / (ANALYSIS_HOP * bpm)               # frames per beat
+    f0 = first_beat_seconds * ANALYSIS_SR / ANALYSIS_HOP
+    n = len(env)
+    seg_beats = 16
+    steps = np.arange(-0.4 * period, 0.4 * period + 1e-6, 0.25)
+    centers, offsets, weights = [], [], []
+    total_beats = int((n - f0) // period) - 1
+    for k0 in range(0, max(0, total_beats - seg_beats), seg_beats):
+        beats = f0 + period * (k0 + np.arange(seg_beats))
+        values = np.array([_interp(env, beats + d).mean() for d in steps])
+        j = int(np.argmax(values))
+        lo_f, hi_f = int(max(0, beats[0])), int(min(n, beats[-1] + period))
+        weights.append(float(np.mean(env[lo_f:hi_f])) if hi_f > lo_f else 0.0)       # how much is going on, so silence is told from a wandering beat
+        offsets.append(float(steps[j]))
+        centers.append(float(beats.mean() - f0))
+    if len(centers) < 4:
+        return bpm, first_beat_seconds, 999.0, 999.0, len(centers)
+    centers, offsets, weights = np.array(centers), np.array(offsets), np.array(weights)
+    keep = weights >= 0.35 * np.median(weights)                       # silent stretches say nothing about the grid
+    if keep.sum() < 4:
+        return bpm, first_beat_seconds, 999.0, 999.0, int(keep.sum())
+    c, o, w = centers[keep], offsets[keep], weights[keep]
+    slope, intercept = np.polyfit(c, o, 1, w=np.sqrt(w))             # a line through the offsets
+    resid = o - (slope * c + intercept)
+    drop = int(0.15 * len(c))                                          # a few stretches (a break, a rap over no drums) may be ignored, no more
+    if drop:
+        worst_first = np.argsort(-np.abs(resid))[:drop]
+        far = [i for i in worst_first if abs(resid[i]) > 2.0]
+        if far:
+            ok = np.ones(len(c), dtype=bool)
+            ok[far] = False
+            if ok.sum() >= 4:
+                c, o, w = c[ok], o[ok], w[ok]
+    slope, intercept = np.polyfit(c, o, 1, w=np.sqrt(w))
+    resid = o - (slope * c + intercept)
+    new_period = period * (1.0 + slope)
+    new_f0 = f0 + intercept
+    while new_f0 < 0:
+        new_f0 += new_period
+    frame_ms = 1000.0 * ANALYSIS_HOP / ANALYSIS_SR
+    rms = float(np.sqrt(np.mean(resid ** 2))) * frame_ms
+    worst = float(np.max(np.abs(resid))) * frame_ms
+    new_bpm = 60.0 * ANALYSIS_SR / (ANALYSIS_HOP * new_period)
+    if not (0.97 * bpm <= new_bpm <= 1.03 * bpm):
+        return bpm, first_beat_seconds, rms, worst, len(c)
+    return float(new_bpm), float(new_f0 * ANALYSIS_HOP / ANALYSIS_SR), rms, worst, len(c)
+
+
 def _chroma_per_frame(x):
     n_fft, hop = 4096, 2048
     mag = _stft_mag(x, n_fft, hop)
@@ -6743,13 +6815,18 @@ def analyze_samples(x):
     """Studies mono audio at ANALYSIS_SR. Returns a dictionary (see the keys below)."""
     duration = len(x) / float(ANALYSIS_SR)
     result = {"version": ANALYSIS_VERSION, "duration": round(duration, 3), "bpm": 0.0, "first_beat": 0.0, "downbeat": 0.0,
-              "beats_per_bar": 4, "confidence": 0.0, "drop_bar": None, "hooks": [], "hook_confidence": 0.0, "bar_seconds": 0.0}
+              "beats_per_bar": 4, "confidence": 0.0, "drop_bar": None, "hooks": [], "hook_confidence": 0.0, "bar_seconds": 0.0,
+              "grid_ms": 999.0, "grid_worst_ms": 999.0, "steady": False}
     if duration < 20.0 or float(np.max(np.abs(x))) < 1e-4:
         return result
     full, low = _onset_envelopes(x)
-    bpm, first_beat, confidence = estimate_tempo(full + 1.5 * low)       # the bass drum is the surest sign of where a beat is
+    beat_env = full + 1.5 * low                                           # the bass drum is the surest sign of where a beat is
+    bpm, first_beat, confidence = estimate_tempo(beat_env)
+    bpm, first_beat, grid_ms, grid_worst, _used = grid_fit(beat_env, bpm, first_beat)
     period = 60.0 / bpm
-    result.update({"bpm": round(bpm, 3), "first_beat": round(first_beat, 4), "confidence": round(confidence, 3)})
+    result.update({"bpm": round(bpm, 3), "first_beat": round(first_beat, 4), "confidence": round(confidence, 3),
+                   "grid_ms": round(grid_ms, 1), "grid_worst_ms": round(grid_worst, 1),
+                   "steady": bool(grid_ms <= GRID_STEADY_MS and grid_worst <= 3.0 * GRID_STEADY_MS)})
     # which beat is the first of a bar: the one that carries the most bass and the biggest change in the harmony
     chroma, chroma_step = _chroma_per_frame(x)
     beat_count = int((duration - first_beat) / period) - 1
@@ -6871,6 +6948,15 @@ def load_analysis(path):
         return None
 
 
+def load_analysis_any_version(path):
+    """The saved file whatever its version (only the hand-set marks in it are wanted)."""
+    try:
+        with open(analysis_cache_path(path), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
 def save_analysis(path, data):
     try:
         with open(analysis_cache_path(path), "w", encoding="utf-8") as handle:
@@ -6882,7 +6968,7 @@ def save_analysis(path, data):
 def get_analysis(path, force=False, decode=None):
     """The saved analysis for a song, studying it first when needed. Manual marks (set by hand) are kept and win."""
     cached = None if force else load_analysis(path)
-    manual = (cached or load_analysis(path) or {}).get("manual", {})
+    manual = (cached or load_analysis(path) or load_analysis_any_version(path) or {}).get("manual", {})
     if cached is not None:
         return merge_manual(cached)
     samples = (decode or decode_for_analysis)(path)
@@ -6974,7 +7060,8 @@ BEATS_PER_BAR = 4
 MIX_DEFAULTS = {
     "blend_bars": 8,              # bars the two songs play together (4, 8 or 16)
     "ramp_bars": 8,               # bars before the blend over which the outgoing song changes speed
-    "max_tempo_change": 3.0,      # percent; 0 means a song's speed is never changed
+    "max_tempo_change": 8.0,      # percent; 0 means a song's speed is never changed
+    "sync_tolerance_ms": 25.0,    # beats of the two songs must line up within this many milliseconds, or the change is an echo-out; 0 skips the check
     "exit": "play",               # where a song ends: play (after its play time, at the end of a phrase), end (it plays to its natural end), hook1 or hook2
     "play_seconds": 120.0,        # play: a song plays about this long before it leaves (about the second chorus)
     "min_play_seconds": 60.0,     # play: a song plays at least this long, unless that would miss the break
@@ -7017,6 +7104,7 @@ def mix_options(settings=None):
     opts["loop_bars"] = max(1, min(8, int(opts["loop_bars"])))
     opts["ramp_bars"] = max(0, min(32, int(opts["ramp_bars"])))
     opts["max_tempo_change"] = max(0.0, min(12.0, float(opts["max_tempo_change"])))
+    opts["sync_tolerance_ms"] = max(0.0, min(100.0, float(opts["sync_tolerance_ms"])))
     if opts["exit"] not in ("play", "hook1", "hook2", "end"):
         opts["exit"] = "play"
     opts["play_seconds"] = max(30.0, min(600.0, float(opts["play_seconds"])))
@@ -7046,12 +7134,15 @@ def make_song(path, analysis=None, meta=None):
         "bar": (BEATS_PER_BAR * 60.0 / bpm) if bpm > 0 else 0.0,
         "drop_bar": a.get("drop_bar"), "hooks": [dict(h) for h in (a.get("hooks") or [])],
         "hook_confidence": float(a.get("hook_confidence") or 0.0),
+        "grid_ms": float(a.get("grid_ms") if a.get("grid_ms") is not None else 0.0),
+        "steady": bool(a.get("steady", True)) or bool((a.get("manual") or {}).get("bpm")),
     }
     return song
 
 
 def song_is_beatmatchable(song, opts):
-    return song["bpm"] > 0 and song["bar"] > 0 and song["confidence"] >= opts["min_confidence"]
+    """A song can be sped to another's tempo only when its tempo is read well and its beat stays on the grid."""
+    return song["bpm"] > 0 and song["bar"] > 0 and song["confidence"] >= opts["min_confidence"] and song.get("steady", True)
 
 
 def snap_to_bar(song, t, direction="down"):
@@ -7430,6 +7521,23 @@ def undo_mix_echo(settings):
     return changed
 
 
+def migrate_mix_sync(settings):
+    """Once: the old default for how far a song's speed may change (3 percent) becomes 8 percent. Any other number stays.
+    Returns True when it changed."""
+    if str(settings.value("mix_sync_migrated", "")) == "1":
+        return False
+    changed = False
+    raw = str(settings.value("mix_max_tempo_change", "") or "")
+    try:
+        if raw and abs(float(raw) - 3.0) < 1e-9:
+            settings.setValue("mix_max_tempo_change", "8.0")
+            changed = True
+    except ValueError:
+        pass
+    settings.setValue("mix_sync_migrated", "1")
+    return changed
+
+
 def migrate_mix_exit(settings):
     """Once: a station that still has the old 'end of the second hook' choice (or none) moves to the play-time exit. Returns True when it changed."""
     if str(settings.value("mix_exit_migrated", "")) == "1":
@@ -7779,7 +7887,131 @@ def _voice_prepare(path, opts, sr=MIX_SR, decode=decode_stereo):
     return soft_limit(v * g * (10 ** (opts.get("voice_gain_db", 0.0) / 20.0)), 0.9)
 
 
-def render_loop_out(rec, gain, opts, decode=decode_stereo, sr=MIX_SR):
+# --- lining the beats up, like a sync button -------------------------------------------------------------------
+SYNC_FFT = 512
+SYNC_HOP = 128
+SYNC_LOW_HZ = 60.0
+
+
+def _flux_envelope(x, sr):
+    """Onset strength of audio (mono or stereo), one value per SYNC_HOP samples: how sharply the sound changes, bass drum included."""
+    mono = x.mean(axis=1) if getattr(x, "ndim", 1) == 2 else x
+    mag = _stft_mag(np.asarray(mono, dtype=np.float32), SYNC_FFT, SYNC_HOP)
+    first = int(SYNC_LOW_HZ / (sr / float(SYNC_FFT))) + 1
+    comp = np.log1p(30.0 * mag[:, first:])
+    diff = np.maximum(0.0, comp[1:] - comp[:-1]).sum(axis=1)
+    env = np.concatenate([[0.0], diff])
+    k = max(3, int(0.25 * sr / SYNC_HOP))
+    local = np.convolve(env, np.ones(k) / k, mode="same")
+    return np.maximum(0.0, env - local).astype(np.float32)
+
+
+def _pulse_count(env):
+    """How many separate clear peaks an onset envelope has (peaks closer than about 20 milliseconds count once)."""
+    top = float(np.max(env))
+    if top <= 0.0:
+        return 0
+    level = 0.4 * top
+    inner = env[1:-1]
+    peaks = np.where((inner > level) & (inner >= env[:-2]) & (inner > env[2:]))[0]
+    count, last = 0, -10 ** 9
+    for p in peaks:
+        if p - last >= 7:
+            count += 1
+        last = p
+    return count
+
+
+def _best_lag(a, b, max_lag, min_pulses=6):
+    """How many frames later the events of `a` come than the events of `b` (fractional), and how well they match (0 to 1).
+    Returns (status, lag, match): status is 'ok', 'flat' (one of them has no beat to speak of) or 'weak' (both have beats but no
+    shift makes them match)."""
+    n = min(len(a), len(b))
+    if n < 8 * max_lag + 16:
+        return "flat", 0.0, 0.0
+    a, b = a[:n] - float(np.mean(a[:n])), b[:n] - float(np.mean(b[:n]))
+    # a stretch with a pulse has a row of clear peaks; a pad, a single note or silence does not
+    for env in (a, b):
+        if float(np.std(env)) < 1e-6 or _pulse_count(env) < min_pulses:
+            return "flat", 0.0, 0.0
+    norm = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if norm < 1e-9:
+        return "flat", 0.0, 0.0
+    lags = np.arange(-max_lag, max_lag + 1)
+    corr = np.zeros(len(lags))
+    for i, lag in enumerate(lags):
+        corr[i] = float(np.sum(a[lag:] * b[:n - lag])) if lag >= 0 else float(np.sum(a[:n + lag] * b[-lag:]))
+    corr /= norm
+    j = int(np.argmax(corr))
+    if corr[j] < 0.08 or corr[j] < 2.0 * float(np.median(np.abs(corr))) or j in (0, len(lags) - 1):
+        return "weak", 0.0, float(corr[j])
+    frac = 0.0
+    left, mid, right = corr[j - 1], corr[j], corr[j + 1]
+    denom = left - 2.0 * mid + right
+    if abs(denom) > 1e-12:
+        frac = float(np.clip(0.5 * (left - right) / denom, -0.5, 0.5))
+    return "ok", float(lags[j] + frac), float(corr[j])
+
+
+def measure_sync(outgoing, incoming, sr, beat_seconds):
+    """How far the beats of the looping outgoing song are from the beats of the incoming song, in the stretch they play together.
+    Returns None when one of them has no beat to measure, else {'lag': seconds the outgoing events come later, 'residual_ms': how far
+    apart the beats are once that is corrected (999 when they do not match at all), 'quality': 0 to 1, 'max_lag': widest shift looked for}."""
+    n = min(len(outgoing), len(incoming))
+    if n < int(2.0 * sr):
+        return None
+    a, b = _flux_envelope(outgoing[:n], sr), _flux_envelope(incoming[:n], sr)
+    max_lag = max(2, int(min(0.12, 0.25 * beat_seconds) * sr / SYNC_HOP))
+    frame = SYNC_HOP / float(sr)
+    status, lag_frames, quality = _best_lag(a, b, max_lag)
+    if status == "flat":
+        return None
+    if status == "weak":
+        return {"lag": 0.0, "residual_ms": 999.0, "quality": quality, "max_lag": max_lag * frame}
+    lag = lag_frames * frame
+    # the beats must stay together all through the stretch, not only on average: look at three windows one after the other
+    size = min(len(a), len(b)) // 3
+    lags, weak = [], False
+    for k in range(3):
+        st, lg, _q = _best_lag(a[k * size:(k + 1) * size], b[k * size:(k + 1) * size], max_lag, min_pulses=4)
+        if st == "ok":
+            lags.append(lg * frame)
+        elif st == "weak":
+            weak = True
+    if weak:
+        residual = 999.0
+    elif len(lags) >= 2:
+        residual = max(abs(v - lag) for v in lags) * 1000.0
+    else:
+        residual = 0.0               # too little of the stretch has a beat to compare: the one measurement is all there is
+    return {"lag": lag, "residual_ms": residual, "quality": quality, "max_lag": max_lag * frame}
+
+
+def _check_sync(p_rec, rec, incoming, probe, opts, sr):
+    """Decides how the loop under the next song's intro is placed. Returns (shift in seconds, use the loop, one sentence for the log)."""
+    lo = p_rec["loop_out"]
+    prev_song, song = p_rec["song"], rec["song"]
+    change = abs(lo["tempo_to"] / max(1e-6, prev_song["bpm"]) - 1.0) * 100.0
+    label = f"Sync: {prev_song['title']} -> {song['title']}: tempo changed {change:.1f} percent"
+    tolerance = float(opts.get("sync_tolerance_ms", 25.0))
+    looped = probe.get("looped")
+    if tolerance <= 0 or looped is None or len(looped) == 0:
+        return 0.0, True, label + ", the beats were not checked."
+    seconds = min(lo["seconds"], len(looped) / float(sr), len(incoming) / float(sr))
+    n = int(seconds * sr)
+    found = measure_sync(looped[:n], incoming[:n], sr, 60.0 / lo["tempo_to"])
+    if found is None:
+        return 0.0, True, label + ", the beats could not be measured in this stretch, so the song grids were used as they are."
+    moved = found["lag"] * 1000.0
+    if found["residual_ms"] > tolerance:
+        apart = "did not line up at all" if found["residual_ms"] >= 999.0 else f"were {found['residual_ms']:.0f} milliseconds apart even after lining them up"
+        return 0.0, False, label + f", but the beats {apart} (more than the {tolerance:.0f} allowed), so an echo-out was used instead."
+    text = label + f", beats lined up to within {found['residual_ms']:.0f} milliseconds"
+    text += f" after moving the loop {moved:+.0f} milliseconds." if abs(moved) >= 2.0 else "."
+    return found["lag"], True, text
+
+
+def render_loop_out(rec, gain, opts, decode=decode_stereo, sr=MIX_SR, probe=None):
     """What plays under the next song's intro: the outgoing song's last bars, looped, sped to the next song's tempo, with the bass
     cut so the new song's bass is the only one, ending in an echo. Starts where the outgoing song's audio ends."""
     lo = rec["loop_out"]
@@ -7800,6 +8032,8 @@ def render_loop_out(rec, gain, opts, decode=decode_stereo, sr=MIX_SR):
     while len(looped) < total:
         looped = _cat(looped, x, int(0.002 * sr))
     looped = looped[:total].copy()
+    if probe is not None:
+        probe["looped"] = looped.copy()                  # as it sounds before the bass is cut, for lining the beats up
     low, high = split_low_high(looped, sr)
     beat = 60.0 / lo["tempo_to"]
     n = len(looped)
@@ -7880,9 +8114,17 @@ def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=No
             body = p_audio.copy()
             _fade_edges_tail(body, int(0.002 * sr))
             write(body, p_off, p_skip)
-            over = render_loop_out(p_rec, gains.get(id(p_rec), 1.0), opts, decode, sr)
-            if len(over):
-                write(over, p_off + len(p_audio))
+            probe = {}
+            over = render_loop_out(p_rec, gains.get(id(p_rec), 1.0), opts, decode, sr, probe=probe)
+            shift, use_loop, sync_text = _check_sync(p_rec, rec, audio, probe, opts, sr)
+            part.setdefault("sync_report", []).append(sync_text)
+            if use_loop:
+                if len(over):
+                    write(over, p_off + len(p_audio) - int(round(shift * sr)))
+            else:
+                beat = 60.0 / max(40.0, p_rec["song"]["bpm"] or 120.0)
+                ring = echo_ring(p_audio, sr, beat, opts)
+                write(ring * 0.8, p_off + len(p_audio))
             pending = [audio, offset, 0, rec]
         else:
             # echo-out or cut: the outgoing song ends on the bar line and the next one starts there
@@ -16535,6 +16777,7 @@ def build_package(project, plan, opts, song_for, progress=None, should_stop=None
                 progress(f"Part {base + 1}: mixing song {i + 1} of {n}: {title}")
         kwargs = {"decode": decode} if decode is not None else {}
         audio, notes = render_part(part, opts, voice_loader=voice_loader, progress=part_progress, **kwargs)
+        manifest.setdefault("sync", []).extend(part.get("sync_report") or [])
         if progress is not None:
             progress(f"Part {number + 1}: saving the audio file...")
         if not write_audio_file(path, audio, bitrate=bitrate):
@@ -17408,7 +17651,7 @@ DJ_BITRATE = "192k"
 DJ_DEFAULT_TIMES = (0, 58, 60)         # start, planned end, latest end: the mix starts right after the top-of-hour jingle and runs to the end of the hour
 DJ_OLD_DEFAULT_TIMES = (20, 47, 50)    # what earlier versions used
 DJ_TOP_BREAK_SECONDS = 20.0            # the top-of-hour jingle, until the station has measured its own
-MIX_STYLE_VERSION = 3          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. A built mix with an older number is rebuilt.
+MIX_STYLE_VERSION = 4          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. 4: beats lined up, 8 percent tempo limit. A built mix with an older number is rebuilt.
 DJ_RETRY_SECONDS = 3600
 
 
@@ -17947,6 +18190,8 @@ def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None,
     manifest = build_package(project, plan, opts, lambda p: by_path[p], progress=progress, should_stop=should_stop,
                              bitrate=DJ_BITRATE, **kwargs)
     manifest["dj_cfg"] = dj_cfg_stamp(cfg)
+    for line in manifest.get("sync") or []:
+        RUN_LOG.write("MIX", f"{hour:02d}00 {line}")
     show_id = project_id(project)
     folder = os.path.join(project_folder(project), "package")
     state = install_local_show(store, AUTO_SHOW_USER, show_id, manifest, folder)
@@ -18344,6 +18589,8 @@ class BroadcastingApp(QWidget):
         self._dj_times_moved = migrate_dj_defaults(self.settings)
         if migrate_mix_exit(self.settings):
             RUN_LOG.write("SHOWS", "Mix setting 'Songs end at' moved from the end of the second hook to the play time (about 2 minutes a song).")
+        if migrate_mix_sync(self.settings):
+            RUN_LOG.write("SHOWS", "Mix setting: a song's speed may now change up to 8 percent to match the next song (it was 3).")
         if undo_mix_echo(self.settings):
             RUN_LOG.write("SHOWS", "Mix settings: songs play about two minutes and change with the loop-and-echo style again.")
         self.content_rules = ContentRules(self.settings)
@@ -22559,7 +22806,9 @@ class BroadcastingApp(QWidget):
         form.addRow("Blend length:", self.mix_setting_combo("mix_blend_bars", ((4, "4 bars"), (8, "8 bars"), (16, "16 bars")), 8,
                                                              "Bars the two songs play together"))
         form.addRow("Most a song's speed may change (percent, 0 never changes it):",
-                    self.mix_setting_spin("mix_max_tempo_change", 0.0, 12.0, 3.0, "Most a song's speed may change, percent", " %", 1))
+                    self.mix_setting_spin("mix_max_tempo_change", 0.0, 12.0, 8.0, "Most a song's speed may change, percent", " %", 1))
+        form.addRow("Beats of the two songs must line up within this many milliseconds, or the change is an echo-out (0 skips the check):",
+                    self.mix_setting_spin("mix_sync_tolerance_ms", 0, 100, 25, "Milliseconds the beats of two songs may be apart", " ms"))
         form.addRow("Speed change spread over this many bars before the blend:",
                     self.mix_setting_spin("mix_ramp_bars", 0, 32, 8, "Bars before the blend over which the outgoing song changes speed"))
         form.addRow("Songs end at:", self.mix_setting_combo("mix_exit", (("play", "After the play time, at the end of a phrase"),
