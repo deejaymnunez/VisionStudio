@@ -6975,7 +6975,7 @@ MIX_DEFAULTS = {
     "blend_bars": 8,              # bars the two songs play together (4, 8 or 16)
     "ramp_bars": 8,               # bars before the blend over which the outgoing song changes speed
     "max_tempo_change": 3.0,      # percent; 0 means a song's speed is never changed
-    "exit": "play",               # where a song ends: play (after its play time, at the end of a phrase), hook1, hook2 or end
+    "exit": "end",                # where a song ends: end (it plays to its natural end), play (after its play time, at the end of a phrase), hook1 or hook2
     "play_seconds": 120.0,        # play: a song plays about this long before it leaves (about the second chorus)
     "min_play_seconds": 60.0,     # play: a song plays at least this long, unless that would miss the break
     "loop_bars": 4,               # bars of intro that loop under a talk break (2 or 4)
@@ -6992,8 +6992,9 @@ MIX_DEFAULTS = {
     "early_tolerance": 35.0,      # a part may end up to this many seconds before its mark
     "late_tolerance": 8.0,        # or this many seconds after
     "min_confidence": 0.3,        # tempo readings below this are not trusted for beat matching
-    "transition_style": "loop",   # how automatic changes work: loop (the last bars of the outgoing song loop under the next song's intro,
-                                  # then echo out just before it drops) or blend (beat-matched overlap)
+    "transition_style": "echo",   # how automatic changes work: echo (the song plays through, echoes out, and the next song starts),
+                                  # loop (the last bars of the outgoing song loop under the next song's intro, then echo out just before it drops)
+                                  # or blend (beat-matched overlap)
     "overlay_loop_bars": 4,       # bars of the outgoing song that loop under the next song's intro (2 or 4)
     "echo_lead_seconds": 5.0,     # the echo-out starts this long before the next song's first verse or hook
 }
@@ -7017,13 +7018,13 @@ def mix_options(settings=None):
     opts["ramp_bars"] = max(0, min(32, int(opts["ramp_bars"])))
     opts["max_tempo_change"] = max(0.0, min(12.0, float(opts["max_tempo_change"])))
     if opts["exit"] not in ("play", "hook1", "hook2", "end"):
-        opts["exit"] = "play"
+        opts["exit"] = "end"
     opts["play_seconds"] = max(30.0, min(600.0, float(opts["play_seconds"])))
     opts["min_play_seconds"] = max(10.0, min(opts["play_seconds"], float(opts["min_play_seconds"])))
     if opts["fallback"] not in ("delay", "cut"):
         opts["fallback"] = "delay"
-    if opts["transition_style"] not in ("loop", "blend"):
-        opts["transition_style"] = "loop"
+    if opts["transition_style"] not in ("echo", "loop", "blend"):
+        opts["transition_style"] = "echo"
     opts["overlay_loop_bars"] = 2 if int(opts["overlay_loop_bars"]) <= 2 else 4
     opts["echo_lead_seconds"] = max(0.0, min(15.0, float(opts["echo_lead_seconds"])))
     return opts
@@ -7218,7 +7219,9 @@ def _plan_transition(prev, rec, item, opts):
     notes = []
     if mode in ("delay", "cut"):
         return mode, {"notes": ["you chose " + ("an echo-out" if mode == "delay" else "a cut") + " for this change"]}
-    if mode == "loop" or (mode == "auto" and opts.get("transition_style", "loop") == "loop"):
+    if mode == "auto" and opts.get("transition_style", "echo") == "echo" and not rec.get("loop"):      # a talk break over the intro keeps the blend
+        return "delay", {"notes": []}
+    if mode == "loop" or (mode == "auto" and opts.get("transition_style", "echo") == "loop"):
         planned = _plan_loop(prev, rec, opts)
         if planned is not None:
             return "loop", planned
@@ -7353,7 +7356,7 @@ def plan_block(items, parts, opts=None):
             if note:
                 rec["notes"].append(note)
             _set_exit(rec, name, src)
-            playing = mode == "play" and item.get("exit") not in ("hook1", "hook2", "end")
+            playing = mode in ("play", "end") and item.get("exit") not in ("hook1", "hook2", "end")      # the song closing a part may end at any phrase end
             cands = _candidate_end_times(rec, playing) or [(name, _out_time(rec, src))]
             if item.get("exit") in ("hook1", "hook2", "end"):
                 # the user fixed this song's exit: it only closes the part if that exit is near the mark
@@ -7408,6 +7411,22 @@ def plan_block(items, parts, opts=None):
 
 def item_exit(item, opts):
     return item.get("exit") if item.get("exit") in ("hook1", "hook2", "end") else opts["exit"]
+
+
+def migrate_mix_echo(settings):
+    """Once: songs play to their natural end and change with an echo-out into the next song (the way the last two songs before a break
+    sounded right). Only the old defaults are moved; any other choice stays. Returns True when it changed."""
+    if str(settings.value("mix_echo_migrated", "")) == "1":
+        return False
+    changed = False
+    if str(settings.value("mix_exit", "") or "") in ("", "hook2", "play"):
+        settings.setValue("mix_exit", "end")
+        changed = True
+    if str(settings.value("mix_transition_style", "") or "") in ("", "loop"):
+        settings.setValue("mix_transition_style", "echo")
+        changed = True
+    settings.setValue("mix_echo_migrated", "1")
+    return changed
 
 
 def migrate_mix_exit(settings):
@@ -17388,7 +17407,7 @@ DJ_BITRATE = "192k"
 DJ_DEFAULT_TIMES = (0, 58, 60)         # start, planned end, latest end: the mix starts right after the top-of-hour jingle and runs to the end of the hour
 DJ_OLD_DEFAULT_TIMES = (20, 47, 50)    # what earlier versions used
 DJ_TOP_BREAK_SECONDS = 20.0            # the top-of-hour jingle, until the station has measured its own
-MIX_STYLE_VERSION = 3          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. A built mix with an older number is rebuilt.
+MIX_STYLE_VERSION = 4          # 1: beat-matched blends only. 2: loop-and-echo-out changes. 3: songs play about two minutes. 4: songs play through and echo out. A built mix with an older number is rebuilt.
 DJ_RETRY_SECONDS = 3600
 
 
@@ -18324,6 +18343,9 @@ class BroadcastingApp(QWidget):
         self._dj_times_moved = migrate_dj_defaults(self.settings)
         if migrate_mix_exit(self.settings):
             RUN_LOG.write("SHOWS", "Mix setting 'Songs end at' moved from the end of the second hook to the play time (about 2 minutes a song).")
+        if migrate_mix_echo(self.settings):
+            RUN_LOG.write("SHOWS", "Mix settings: songs now play through to their natural end and change with an echo-out into the next song. "
+                                   "Both can be changed in Settings, Mix Blocks.")
         self.content_rules = ContentRules(self.settings)
         CONTENT_FILTER["fn"] = self.content_rules.filter
         self.show_store = ShowStore()
@@ -22527,8 +22549,9 @@ class BroadcastingApp(QWidget):
             "mix_show_mode", (("none", "None"), ("each", "Each hour, with a start and end I set"), ("full", "Full hour, commercial-free"),
                               ("hour", "Decide hour by hour")), "none", "Does this show use mix blocks"))
         form.addRow("How one song changes to the next:", self.mix_setting_combo(
-            "mix_transition_style", (("loop", "Loop the end of the last song under the next intro, then echo out"),
-                                     ("blend", "Beat-matched blend")), "loop", "How one song changes to the next"))
+            "mix_transition_style", (("echo", "The song plays through, echoes out, then the next song starts"),
+                                     ("loop", "Loop the end of the last song under the next intro, then echo out"),
+                                     ("blend", "Beat-matched blend")), "echo", "How one song changes to the next"))
         form.addRow("Bars of the last song that loop under the next intro:", self.mix_setting_combo(
             "mix_overlay_loop_bars", ((2, "2 bars"), (4, "4 bars")), 4, "Bars of the last song that loop under the next intro"))
         form.addRow("The echo-out starts this many seconds before the next song drops in:",
@@ -22539,9 +22562,10 @@ class BroadcastingApp(QWidget):
                     self.mix_setting_spin("mix_max_tempo_change", 0.0, 12.0, 3.0, "Most a song's speed may change, percent", " %", 1))
         form.addRow("Speed change spread over this many bars before the blend:",
                     self.mix_setting_spin("mix_ramp_bars", 0, 32, 8, "Bars before the blend over which the outgoing song changes speed"))
-        form.addRow("Songs end at:", self.mix_setting_combo("mix_exit", (("play", "After the play time, at the end of a phrase"),
-                                                                       ("hook1", "End of the first hook"), ("hook2", "End of the second hook"),
-                                                                       ("end", "Natural end")), "play", "Where songs end"))
+        form.addRow("Songs end at:", self.mix_setting_combo("mix_exit", (("end", "Natural end (the whole song)"),
+                                                                       ("play", "After the play time, at the end of a phrase"),
+                                                                       ("hook1", "End of the first hook"), ("hook2", "End of the second hook")),
+                                                                      "end", "Where songs end"))
         form.addRow("A song plays about this many seconds before it leaves:",
                     self.mix_setting_spin("mix_play_seconds", 30, 600, 120, "Seconds a song plays before it leaves", " s"))
         form.addRow("A song plays at least this many seconds (shorter only to make a part end on its break):",
