@@ -4186,7 +4186,7 @@ class RotationEngine:
         for item in prefix:
             RUN_LOG.write("FIT", f"Removed from the queue to make the break land on time: {os.path.basename(item)}")
         message = (f"Swapped {len(prefix)} queued song(s) for {len(replacement)} so the hour ends on time "
-                   f"(about {int(total)} seconds of music for {int(gap)} seconds left).")
+                   f"(about {int(total)} seconds of music for {int(gap)} seconds left, fitted to {mark.strftime('%H:%M:%S')}).")
         self.on_status(message)
         RUN_LOG.write("FIT", message)
         self._queue_changed()
@@ -6990,6 +6990,10 @@ MIX_DEFAULTS = {
     "early_tolerance": 35.0,      # a part may end up to this many seconds before its mark
     "late_tolerance": 8.0,        # or this many seconds after
     "min_confidence": 0.3,        # tempo readings below this are not trusted for beat matching
+    "transition_style": "loop",   # how automatic changes work: loop (the last bars of the outgoing song loop under the next song's intro,
+                                  # then echo out just before it drops) or blend (beat-matched overlap)
+    "overlay_loop_bars": 4,       # bars of the outgoing song that loop under the next song's intro (2 or 4)
+    "echo_lead_seconds": 5.0,     # the echo-out starts this long before the next song's first verse or hook
 }
 
 
@@ -7014,6 +7018,10 @@ def mix_options(settings=None):
         opts["exit"] = "hook2"
     if opts["fallback"] not in ("delay", "cut"):
         opts["fallback"] = "delay"
+    if opts["transition_style"] not in ("loop", "blend"):
+        opts["transition_style"] = "loop"
+    opts["overlay_loop_bars"] = 2 if int(opts["overlay_loop_bars"]) <= 2 else 4
+    opts["echo_lead_seconds"] = max(0.0, min(15.0, float(opts["echo_lead_seconds"])))
     return opts
 
 
@@ -7171,6 +7179,8 @@ def _place_song(item, prev, opts, voice_seconds):
         rec["notes"].extend(geom["notes"])
     else:
         prev["out_kind"] = kind
+        if kind == "loop":
+            prev["loop_out"] = geom["loop_out"]
         prev["t_end"] = _out_time(prev, prev["exit_src"])
         rec["t_start"] = prev["t_end"]
         rec["in_kind"] = kind
@@ -7186,16 +7196,19 @@ def _plan_transition(prev, rec, item, opts):
     notes = []
     if mode in ("delay", "cut"):
         return mode, {"notes": ["you chose " + ("an echo-out" if mode == "delay" else "a cut") + " for this change"]}
-    if mode == "auto" or mode == "blend":
-        pass
+    if mode == "loop" or (mode == "auto" and opts.get("transition_style", "loop") == "loop"):
+        planned = _plan_loop(prev, rec, opts)
+        if planned is not None:
+            return "loop", planned
+        notes.append("the loop-and-echo style could not be used here, so the blend was tried instead")
     if not (song_is_beatmatchable(song, opts) and song_is_beatmatchable(ps, opts)):
-        return fallback, {"notes": ["the speed of one of the two songs could not be read well enough to beat-match"]}
+        return fallback, {"notes": notes + ["the speed of one of the two songs could not be read well enough to beat-match"]}
     cands = [song["bpm"], song["bpm"] * 2, song["bpm"] / 2]
     target = min(cands, key=lambda b: abs(b / ps["bpm"] - 1.0))
     change = abs(target / ps["bpm"] - 1.0)
     limit = opts["max_tempo_change"] / 100.0
     if change > max(limit, 0.0005) + 1e-9:
-        return fallback, {"notes": [f"the songs are {change * 100:.1f} percent apart in speed, more than the {opts['max_tempo_change']:g} percent allowed"]}
+        return fallback, {"notes": notes + [f"the songs are {change * 100:.1f} percent apart in speed, more than the {opts['max_tempo_change']:g} percent allowed"]}
     pre = rec.get("pre_bars", None)
     if rec.get("loop") is not None:
         nb = int(pre or 0)
@@ -7234,6 +7247,50 @@ def _plan_transition(prev, rec, item, opts):
         notes.append(f"{prev['song']['title']} changes speed from {ps['bpm']:.1f} to {target:.1f} BPM over {ramp} bars")
     return "blend", {"nb": nb, "ramp": ramp, "tail_start": tail_start, "t_exit": t_exit, "window_start": t_exit - window,
                      "tempo_to": target, "notes": notes, "out_t": out_t, "src_t": src_t}
+
+
+def _plan_loop(prev, rec, opts):
+    """The loop-and-echo style: when the outgoing song reaches the end of its hook, its last bars loop (bass cut) under the next
+    song's intro, and about `echo_lead_seconds` before that song drops into its first verse or hook the loop echoes out.
+    Returns the plan numbers, or None when it cannot be done (the caller then tries the blend)."""
+    song, ps = rec["song"], prev["song"]
+    if rec.get("loop") is not None:
+        return None                                  # a talk break over the intro keeps its own way of coming in
+    if not (song_is_beatmatchable(song, opts) and song_is_beatmatchable(ps, opts)):
+        return None
+    cands = [song["bpm"], song["bpm"] * 2, song["bpm"] / 2]
+    target = min(cands, key=lambda b: abs(b / ps["bpm"] - 1.0))
+    change = abs(target / ps["bpm"] - 1.0)
+    if change > max(opts["max_tempo_change"] / 100.0, 0.0005) + 1e-9:
+        return None
+    E = prev["exit_src"]
+    free_from = prev["src_start"]
+    if prev.get("loop"):
+        free_from = prev["loop"]["src1"]
+    avail = int((E - free_from) / ps["bar"] + 0.02)
+    bars = min(int(opts["overlay_loop_bars"]), avail)
+    if bars < 2:
+        return None
+    notes = []
+    start_bar = int(rec["item"].get("start_bar") or 0)
+    d = intro_bars(song)
+    if d and d - start_bar >= 2:
+        intro_b = min(16, d - start_bar)
+        notes.append(f"{song['title']} has an intro of about {intro_b} bars; the end of {ps['title']} loops under it")
+    else:
+        intro_b = max(4, int(opts["blend_bars"]))
+        notes.append(f"no clear intro was found in {song['title']}, so the end of {ps['title']} loops under its first {intro_b} bars")
+    beat = song["bar"] / BEATS_PER_BAR
+    intro_seconds = intro_b * song["bar"]
+    lead = min(float(opts["echo_lead_seconds"]), max(0.0, intro_seconds - 4 * beat))
+    beats = int(math.floor((intro_seconds - lead) / beat + 1e-6))
+    if beats < 4:
+        return None
+    if change > 0.0005:
+        notes.append(f"{ps['title']} is sped to {target:.1f} BPM to match")
+    notes.append(f"it echoes out about {lead:.0f} seconds before {song['title']} drops")
+    return {"notes": notes, "loop_out": {"bars": bars, "src0": E - bars * ps["bar"], "src1": E, "tempo_to": target,
+                                         "seconds": beats * beat, "lead": lead, "intro_bars": intro_b}}
 
 
 def _set_exit(rec, name, src):
@@ -7339,7 +7396,8 @@ def describe_part(part, number):
         s = r["song"]
         label = f"{s['artist']} - {s['title']}" if s["artist"] else s["title"]
         how = {"start": "starts", "talk": "starts with a talk break over its intro", "blend": "blends in",
-               "delay": "comes in after an echo-out", "cut": "comes in after a cut"}.get(r["in_kind"], "plays")
+               "delay": "comes in after an echo-out", "cut": "comes in after a cut",
+               "loop": "comes in while the last song loops under its intro and echoes out"}.get(r["in_kind"], "plays")
         lines.append(f"  {fmt_clock(r['t_start'])}  {label} {how}" + (f" ({len(r['notes'])} note{'s' if len(r['notes']) != 1 else ''})" if r["notes"] else ""))
         for n in r["notes"]:
             lines.append("      " + n[0].upper() + n[1:] + ".")
@@ -7650,6 +7708,40 @@ def _voice_prepare(path, opts, sr=MIX_SR, decode=decode_stereo):
     return soft_limit(v * g * (10 ** (opts.get("voice_gain_db", 0.0) / 20.0)), 0.9)
 
 
+def render_loop_out(rec, gain, opts, decode=decode_stereo, sr=MIX_SR):
+    """What plays under the next song's intro: the outgoing song's last bars, looped, sped to the next song's tempo, with the bass
+    cut so the new song's bass is the only one, ending in an echo. Starts where the outgoing song's audio ends."""
+    lo = rec["loop_out"]
+    song = rec["song"]
+    src_len = lo["src1"] - lo["src0"]
+    x = decode(song["path"], lo["src0"], src_len, sr)
+    if len(x) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    need = int(round(src_len * sr)) - len(x)
+    if need > 0:
+        x = np.concatenate([x, np.zeros((need, 2), dtype=np.float32)])
+    x = x * gain
+    out_len = src_len * (song["bpm"] / lo["tempo_to"])
+    if abs(song["bpm"] / lo["tempo_to"] - 1.0) > 0.0005:
+        x = wsola_warp(x, sr, np.array([0.0, out_len]), np.array([0.0, src_len]), 0)
+    total = int(round(lo["seconds"] * sr))
+    looped = x
+    while len(looped) < total:
+        looped = _cat(looped, x, int(0.002 * sr))
+    looped = looped[:total].copy()
+    low, high = split_low_high(looped, sr)
+    beat = 60.0 / lo["tempo_to"]
+    n = len(looped)
+    low_env = np.clip(1.0 - np.arange(n) / max(1.0, beat * sr), 0.0, 1.0).astype(np.float32)[:, None]
+    body = high * 0.9 + low * low_env
+    _fade_edges_tail(body, int(0.02 * sr))
+    ring = echo_ring(high * 0.9, sr, beat, opts)
+    result = np.zeros((n + len(ring), 2), dtype=np.float32)
+    result[:n] = body
+    result[n:n + len(ring)] += ring[:len(result) - n] * 0.8
+    return result
+
+
 def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=None, sr=MIX_SR):
     """Makes one part's audio, exactly part['target'] seconds long. Returns (audio, notes)."""
     notes = []
@@ -7657,6 +7749,7 @@ def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=No
     mix = np.zeros((total + sr * 40, 2), dtype=np.float32)
     songs = part["songs"]
     pending = None            # [audio, offset in samples, samples at the start already written]
+    gains = {}
     ducks = []
     voices = []
 
@@ -7678,6 +7771,7 @@ def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=No
         if len(audio) == 0:
             notes.append(f"'{rec['song']['title']}' could not be read and was left out.")
             continue
+        gains[id(rec)] = _gain
         offset = int(round(rec["t_start"] * sr))
         if rec.get("voice") and voice_loader is not None:
             vpath = (rec["item"].get("talk") or {}).get("path")
@@ -7710,6 +7804,15 @@ def render_part(part, opts, decode=decode_stereo, voice_loader=None, progress=No
             win_mix = a_hi * g_a + b_hi * g_b + a_lo * low_a + b_lo * low_b
             write(win_mix, p_off + len(p_audio) - win)
             pending = [audio, p_off + len(p_audio) - win, win, rec]
+        elif p_rec["out_kind"] == "loop" and p_rec.get("loop_out"):
+            # loop and echo out: the outgoing song plays to the end of its hook, then its last bars loop under the next song's intro
+            body = p_audio.copy()
+            _fade_edges_tail(body, int(0.002 * sr))
+            write(body, p_off, p_skip)
+            over = render_loop_out(p_rec, gains.get(id(p_rec), 1.0), opts, decode, sr)
+            if len(over):
+                write(over, p_off + len(p_audio))
+            pending = [audio, offset, 0, rec]
         else:
             # echo-out or cut: the outgoing song ends on the bar line and the next one starts there
             beat = 60.0 / max(40.0, p_rec["song"]["bpm"] or 120.0)
@@ -16253,7 +16356,14 @@ def project_parts(project):
     parts = []
     t = start * 60.0
     for mark in marks:
-        if mark * 60 <= t + 30 or mark >= end:
+        if mark >= end:
+            continue
+        if mark * 60 <= t + 30:
+            # a break at or before the start that runs on past it pushes the start back to the end of that break
+            try:
+                t = max(t, mark * 60.0 + float(by_mark.get(str(mark), by_mark.get(mark, brk))))
+            except Exception:
+                t = max(t, mark * 60.0 + brk)
             continue
         parts.append({"name": f"Part {len(parts) + 1}", "start_clock": t, "target": mark * 60.0 - t, "latest": mark * 60.0 - t})
         try:
@@ -16587,7 +16697,7 @@ class SongSettingsDialog(QDialog):
         layout.addRow("Song ends:", self.exit_combo)
         self.trans_combo = QComboBox()
         self.trans_combo.setAccessibleName("How the song before it changes into this one")
-        for key, text in (("auto", "Blend if the speeds allow, otherwise echo-out"), ("blend", "Blend"), ("delay", "Echo-out"), ("cut", "Cut")):
+        for key, text in (("auto", "Automatic (the style set in Settings, Mix Blocks)"), ("loop", "Loop the last song under the intro, then echo out"), ("blend", "Blend"), ("delay", "Echo-out"), ("cut", "Cut")):
             self.trans_combo.addItem(text, key)
         self.trans_combo.setCurrentIndex(max(0, self.trans_combo.findData(entry.get("transition", "auto"))))
         layout.addRow("Coming in from the song before:", self.trans_combo)
@@ -16808,7 +16918,7 @@ class MixBuilderDialog(QDialog):
         if entry.get("exit"):
             bits.append("ends at " + {"hook1": "the first hook", "hook2": "the second hook", "end": "its end"}[entry["exit"]])
         if entry.get("transition", "auto") != "auto":
-            bits.append({"blend": "blend", "delay": "echo-out", "cut": "cut"}[entry["transition"]] + " in")
+            bits.append({"blend": "blend", "delay": "echo-out", "cut": "cut", "loop": "loop and echo-out"}.get(entry["transition"], "automatic") + " in")
         return f"{number}. {name} ({'; '.join(bits)})"
 
     def fill_list(self, select=None):
@@ -17205,6 +17315,7 @@ class MixBuilderDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 DJ_BITRATE = "192k"
+MIX_STYLE_VERSION = 2          # 1: beat-matched blends only. 2: loop-and-echo-out changes. A built mix with an older number is rebuilt.
 DJ_RETRY_SECONDS = 3600
 
 
@@ -17533,6 +17644,7 @@ def dj_cfg_stamp(cfg):
     """What a built mix remembers about the times it was built for, so a later Save can tell whether it is still right."""
     mode, crates = clean_crate_choice(cfg.get("crate_mode", "everyday"), cfg.get("crates"))
     return {"start": cfg["start"], "end": cfg["end"], "latest": cfg["latest"], "crate_mode": mode, "crates": crates,
+            "style": MIX_STYLE_VERSION,
             "breaks": {str(k): v for k, v in sorted((cfg.get("breaks") or {}).items())}}
 
 
@@ -17541,8 +17653,8 @@ def dj_stamp_matches(stamp, cfg):
     stamp = stamp or {}
     mode, crates = clean_crate_choice(cfg.get("crate_mode", "everyday"), cfg.get("crates"))
     old_mode, old_crates = clean_crate_choice(stamp.get("crate_mode", "everyday"), stamp.get("crates"))
-    return ((stamp.get("start"), stamp.get("end"), stamp.get("latest"), old_mode, old_crates)
-            == (cfg["start"], cfg["end"], cfg["latest"], mode, crates))
+    return ((stamp.get("start"), stamp.get("end"), stamp.get("latest"), old_mode, old_crates, stamp.get("style", 1))
+            == (cfg["start"], cfg["end"], cfg["latest"], mode, crates, MIX_STYLE_VERSION))
 
 
 def study_candidates(pool, opts, analyze, cached, meta_for, progress, should_stop, hour, sample, want, fresh_budget):
@@ -17596,6 +17708,27 @@ def failure_reason(candidates, studied, opts, info):
             f"the closest try missed by {int(round(info['best_miss']))} seconds over the allowed window")
 
 
+def transition_log_lines(plan, hour):
+    """One line per song change in a built mix: what style was used, which song left where, and why a fallback was used."""
+    lines = []
+    for number, part in enumerate(plan["parts"], 1):
+        songs = part["songs"]
+        for index, rec in enumerate(songs):
+            s = rec["song"]
+            name = f"{s['artist']} - {s['title']}" if s["artist"] else s["title"]
+            read = (f"{s['bpm']:.1f} BPM, {int(s['confidence'] * 100)}% sure, intro {intro_bars(s)} bars, {len(s['hooks'])} hook(s)"
+                    if s["bpm"] else "no steady tempo found")
+            if index == 0:
+                lines.append(f"{hour:02d}00 part {number}: starts with {name} ({read}).")
+                continue
+            prev = songs[index - 1]
+            style = {"loop": "loop and echo-out", "blend": "beat-matched blend", "delay": "echo-out, then the next song",
+                     "cut": "cut"}.get(rec["in_kind"], rec["in_kind"])
+            lines.append(f"{hour:02d}00 part {number}: {prev['song']['title']} leaves at its {prev['exit_name'] or 'end'} -> {style} -> "
+                         f"{name} ({read}). " + " ".join(n[0].upper() + n[1:] + "." for n in rec["notes"]))
+    return lines
+
+
 def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None, rng=None, analyze=None, meta_for=None,
                     decode=None, progress=None, should_stop=None, sample=150, want=60, fresh_budget=45, cached=None):
     """Builds one hour's mix by itself and files it in the show store. Returns (show id, '') or ('', reason)."""
@@ -17615,6 +17748,8 @@ def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None,
     chosen, plan, info = choose_auto_songs_detail(project, candidates, opts, rules, history, rng)
     if not chosen:
         return "", failure_reason(candidates, studied, opts, info)
+    for line in transition_log_lines(plan, hour):
+        RUN_LOG.write("MIX", line)
     project["items"] = [{"path": s["path"], "talk": None, "exit": None, "transition": "auto", "loop_bars": None, "start_bar": 0} for s in chosen]
     by_path = {s["path"]: s for s in candidates}
     kwargs = {"decode": decode} if decode is not None else {}
@@ -18069,6 +18204,7 @@ class BroadcastingApp(QWidget):
         self.dj_worker = None
         self.dj_failed = {}
         self.dj_reasons = {}                   # (day, hour) -> why DJ mode could not build that hour's mix
+        self._dj_stale_done = False
         self.dj_pool_notes = {}                # (day, hour) -> why the crates were not (fully) used for that hour's mix
         self.dj_build_seconds = []             # how long the last few builds took
         self.dj_timer = QTimer()
@@ -22204,6 +22340,13 @@ class BroadcastingApp(QWidget):
         form.addRow("Does this show use mix blocks?", self.mix_setting_combo(
             "mix_show_mode", (("none", "None"), ("each", "Each hour, with a start and end I set"), ("full", "Full hour, commercial-free"),
                               ("hour", "Decide hour by hour")), "none", "Does this show use mix blocks"))
+        form.addRow("How one song changes to the next:", self.mix_setting_combo(
+            "mix_transition_style", (("loop", "Loop the end of the last song under the next intro, then echo out"),
+                                     ("blend", "Beat-matched blend")), "loop", "How one song changes to the next"))
+        form.addRow("Bars of the last song that loop under the next intro:", self.mix_setting_combo(
+            "mix_overlay_loop_bars", ((2, "2 bars"), (4, "4 bars")), 4, "Bars of the last song that loop under the next intro"))
+        form.addRow("The echo-out starts this many seconds before the next song drops in:",
+                    self.mix_setting_spin("mix_echo_lead_seconds", 0.0, 15.0, 5.0, "Seconds before the next song's first verse or hook that the echo-out starts", " s", 1))
         form.addRow("Blend length:", self.mix_setting_combo("mix_blend_bars", ((4, "4 bars"), (8, "8 bars"), (16, "16 bars")), 8,
                                                              "Bars the two songs play together"))
         form.addRow("Most a song's speed may change (percent, 0 never changes it):",
@@ -22744,6 +22887,32 @@ class BroadcastingApp(QWidget):
                 del self.mix_parts[path]
         return removed, kept
 
+    def dj_clear_stale(self):
+        """Once after the program starts: mixes built an older way (for example before an update changed how songs change over) are
+        removed so they are rebuilt. The hour on air and earlier hours are never touched."""
+        now = datetime.now()
+        top = now.replace(minute=0, second=0, microsecond=0)
+        removed = 0
+        for show in self.show_store.list_shows(AUTO_SHOW_USER):
+            try:
+                if show["status"] == "aired":
+                    continue
+                day = datetime.strptime(show["day"], "%Y-%m-%d").date()
+                if datetime(day.year, day.month, day.day, int(show["hour"])) <= top:
+                    continue
+                if self.dj_show_is_current(show):
+                    continue
+                self.show_store.delete(AUTO_SHOW_USER, show["show_id"])
+                removed += 1
+            except Exception as e:
+                _log_exception(type(e), e, e.__traceback__)
+        if removed:
+            for path, info in list(self.mix_parts.items()):
+                if info[0] == AUTO_SHOW_USER and not os.path.isfile(path):
+                    del self.mix_parts[path]
+            RUN_LOG.write("SHOWS", f"DJ mode: {removed} mix(es) built an older way were removed and will be rebuilt with the current style.")
+        return removed
+
     def dj_remove_auto_shows(self):
         return self.dj_clear_auto_shows()[0]
 
@@ -22967,6 +23136,9 @@ class BroadcastingApp(QWidget):
                 return
             if self.dj_worker is not None and self.dj_worker.isRunning():
                 return
+            if not self._dj_stale_done:
+                self._dj_stale_done = True
+                self.dj_clear_stale()
             tasks = self.dj_pending_hours()
             if not tasks:
                 return
