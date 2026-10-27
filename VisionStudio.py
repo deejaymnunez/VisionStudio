@@ -10435,6 +10435,7 @@ CONTENT_MODES = (("off", "Do not check (every song plays, as before)"),
                  ("clean", "Clean only: explicit songs never air"),
                  ("explicit", "Explicit allowed"))
 CONTENT_KINDS = (("classics", "Classics"), ("newschool", "New school"), ("other", "Other"))
+CRATE_MAX = 100
 EXPLICIT_TAG_NAMES = {"ITUNESADVISORY", "EXPLICIT", "ADVISORY", "PARENTAL ADVISORY", "PARENTALADVISORY"}
 _BRACKET_RE = re.compile(r"[\(\[][^\)\]]*[\)\]]")
 _EXPLICIT_MARK_RE = re.compile(r"\b(explicit|dirty|uncensored|uncut|unedited)\b", re.IGNORECASE)
@@ -10547,6 +10548,8 @@ class ContentRules:
         self.sources = [x for x in sources if isinstance(x, dict) and x.get("folder")]
         for x in self.sources:
             x["_root"] = norm_path(x["folder"])
+        if self._number_crates():
+            self.save_sources()
         path = self.marks_path or os.path.join(get_data_folder("Content"), "marks.json")
         self.marks_path = path
         try:
@@ -10572,18 +10575,98 @@ class ContentRules:
             pass
 
     # --- the sources (named folders)
-    def add_source(self, name, kind, folder, content):
+    def _number_crates(self):
+        """Every source sits in a numbered crate (1 to CRATE_MAX). Sources saved before crates existed, or with a clashing or
+        impossible number, take the next free one in the order they were added. Returns True when anything changed."""
+        changed = False
+        taken = set()
+        for x in self.sources:
+            try:
+                n = int(x.get("crate", 0))
+            except Exception:
+                n = 0
+            if 1 <= n <= CRATE_MAX and n not in taken:
+                taken.add(n)
+                x["crate"] = n
+            else:
+                x["crate"] = 0
+        for x in self.sources:
+            if x["crate"] == 0:
+                free = next((n for n in range(1, CRATE_MAX + 1) if n not in taken), 0)
+                x["crate"] = free
+                if free:
+                    taken.add(free)
+                changed = True
+        # a source that could not get a crate (more than CRATE_MAX folders) is dropped from the list
+        kept = [x for x in self.sources if x["crate"]]
+        if len(kept) != len(self.sources):
+            self.sources = kept
+            changed = True
+        return changed
+
+    def next_free_crate(self):
+        taken = {x["crate"] for x in self.sources}
+        return next((n for n in range(1, CRATE_MAX + 1) if n not in taken), 0)
+
+    def crate_source(self, number):
+        return next((x for x in self.sources if x.get("crate") == number), None)
+
+    def crate_sources(self):
+        return sorted(self.sources, key=lambda x: x["crate"])
+
+    def crate_label(self, source):
+        return f"Crate {source['crate']}, {source['name']}"
+
+    def add_source(self, name, kind, folder, content, crate=None):
+        """Files a folder in a crate: the one asked for (it must be free) or the next free one. A folder already in a crate keeps
+        its crate. Returns the source, or None when the crate is taken or all CRATE_MAX crates are full."""
         norm = norm_path(folder)
         for x in self.sources:
             if x["_root"] == norm:
-                x.update({"name": name, "kind": kind, "content": content})
+                x.update({"name": name, "kind": kind, "content": "explicit" if content == "explicit" else "clean"})
                 self.save_sources()
                 return x
+        if crate is None:
+            crate = self.next_free_crate()
+        if not (isinstance(crate, int) and 1 <= crate <= CRATE_MAX) or self.crate_source(crate) is not None:
+            return None
         item = {"id": uuid.uuid4().hex[:8], "name": name, "kind": kind, "folder": folder,
-                "content": "explicit" if content == "explicit" else "clean", "_root": norm}
+                "content": "explicit" if content == "explicit" else "clean", "crate": crate, "_root": norm}
         self.sources.append(item)
         self.save_sources()
         return item
+
+    def update_source(self, source_id, name, kind, content, crate):
+        """Changes a crate's name, kind, clean/explicit and number. Returns '' when done, or the reason it was refused."""
+        item = self.find_source(source_id)
+        if item is None:
+            return "That crate is no longer in the list."
+        if not (isinstance(crate, int) and 1 <= crate <= CRATE_MAX):
+            return f"A crate number is 1 to {CRATE_MAX}."
+        other = self.crate_source(crate)
+        if other is not None and other is not item:
+            return f"Crate {crate} already holds {other['name']}."
+        item.update({"name": name, "kind": kind, "content": "explicit" if content == "explicit" else "clean", "crate": crate})
+        self.save_sources()
+        return ""
+
+    def crate_songs(self, numbers):
+        """The songs in those crates that may air: (paths, numbers that gave songs, numbers with no crate or no songs)."""
+        paths, used, missing = [], [], []
+        seen = set()
+        for n in numbers:
+            source = self.crate_source(n)
+            found = filter_playable(scan_audio_files(source["folder"])) if source is not None else []
+            if not found:
+                missing.append(n)
+                continue
+            used.append(n)
+            for p in found:
+                key = norm_path(p)
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(p)
+        return paths, used, missing
 
     def find_source(self, source_id):
         return next((x for x in self.sources if x.get("id") == source_id), None)
@@ -10667,7 +10750,7 @@ class ContentRules:
     def describe(self, source):
         count = len(scan_audio_files(source["folder"]))
         kind = dict(CONTENT_KINDS).get(source.get("kind", "other"), "Other")
-        return f"{source['name']}: {kind}, {source['content'].title()}, {count} songs, {source['folder']}"
+        return f"Crate {source.get('crate', 0)}, {source['name']}: {kind}, {source['content'].title()}, {count} songs, {source['folder']}"
 
 
 class ExplicitScanWorker(QThread):
@@ -17143,6 +17226,86 @@ def parse_hours(text):
     return out or set(range(24))
 
 
+DJ_CRATE_MODES = (("everyday", "The everyday music (the rotation for that hour)"), ("all", "All my crates"), ("pick", "Only the crates I list"))
+DJ_CRATE_MODE_TEXT = dict(DJ_CRATE_MODES)
+MIN_CRATE_SONGS = 6
+
+
+def parse_crates(text):
+    """'1, 3, 5-8' -> [1, 3, 5, 6, 7, 8]. Numbers outside 1 to 100 are left out. Nothing listed -> []."""
+    out = set()
+    for chunk in re.split(r"[,;\s]+", re.sub(r"\s*-\s*", "-", str(text or "").strip())):
+        m = re.match(r"^(\d{1,3})(?:\s*-\s*(\d{1,3}))?$", chunk)
+        if not m:
+            continue
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) is not None else a
+        if a > b:
+            a, b = b, a
+        out.update(n for n in range(a, b + 1) if 1 <= n <= CRATE_MAX)
+    return sorted(out)
+
+
+def crates_text(numbers):
+    """[1, 2, 3, 5] -> '1-3, 5'."""
+    numbers = sorted(set(int(n) for n in numbers))
+    parts, i = [], 0
+    while i < len(numbers):
+        j = i
+        while j + 1 < len(numbers) and numbers[j + 1] == numbers[j] + 1:
+            j += 1
+        parts.append(str(numbers[i]) if i == j else f"{numbers[i]}-{numbers[j]}")
+        i = j + 1
+    return ", ".join(parts)
+
+
+def clean_crate_choice(mode, crates):
+    """A mode and its list of crate numbers, made sensible: 'pick' with nothing listed means the everyday music."""
+    mode = mode if mode in DJ_CRATE_MODE_TEXT else "everyday"
+    if isinstance(crates, str):
+        crates = parse_crates(crates)
+    crates = sorted(set(int(n) for n in (crates or []) if 1 <= int(n) <= CRATE_MAX))
+    if mode == "pick" and not crates:
+        mode = "everyday"
+    return mode, (crates if mode == "pick" else [])
+
+
+def crate_settings(settings):
+    """The default songs-come-from choice for the mix: (mode, crate numbers)."""
+    return clean_crate_choice(str(settings.value("dj_crate_mode", "everyday")), parse_crates(settings.value("dj_crates", "")))
+
+
+def describe_crate_choice(mode, crates):
+    if mode == "all":
+        return "its songs come from all your crates"
+    if mode == "pick":
+        return f"its songs come from {'crate' if len(crates) == 1 else 'crates'} {crates_text(crates)}"
+    return "its songs come from the everyday music"
+
+
+def dj_pool_from_crates(rules, cfg):
+    """The songs a mix may use, from the crates the hour's times ask for.
+    Returns (songs or None, note). None means 'use the everyday music'; the note then says why (empty when crates were never asked for).
+    A crate that is empty or whose folder is gone is skipped and named; when fewer than a handful of songs are left, the everyday music is used."""
+    mode, wanted = clean_crate_choice(cfg.get("crate_mode", "everyday"), cfg.get("crates"))
+    if mode == "everyday":
+        return None, ""
+    if rules is None:
+        return None, "the crates could not be read, so the everyday music was used"
+    numbers = [x["crate"] for x in rules.crate_sources()] if mode == "all" else wanted
+    if not numbers:
+        return None, "you have no crates yet, so the everyday music was used"
+    songs, used, missing = rules.crate_songs(numbers)
+    songs = [p for p in songs if is_song_entry(p)]
+    note = ""
+    if missing and mode == "pick":
+        note = f"{'crate' if len(missing) == 1 else 'crates'} {crates_text(missing)} had no songs and {'was' if len(missing) == 1 else 'were'} left out"
+    if len(songs) < MIN_CRATE_SONGS:
+        why = f"the crates hold only {len(songs)} usable song(s)"
+        return None, (note + "; " if note else "") + why + ", so the everyday music was used"
+    return songs, note
+
+
 def load_break_lengths(settings):
     """{slot: [seconds, ...]} of the last few breaks the station really ran (written by note_break_length)."""
     try:
@@ -17173,8 +17336,9 @@ def dj_settings(settings):
     start = number("dj_start_minute", 20, 0, 55)
     end = number("dj_end_minute", 47, start + 3, 60)
     latest = number("dj_latest_minute", 50, end, 60)
+    mode, crates = crate_settings(settings)
     return {"start": start, "end": end, "latest": latest, "hours": parse_hours(settings.value("dj_hours", "all")),
-            "breaks": real_break_seconds(settings)}
+            "breaks": real_break_seconds(settings), "crate_mode": mode, "crates": crates}
 
 
 DJ_DAY_CHOICES = (("all", "Every day"), ("weekdays", "Weekdays (Monday to Friday)"), ("weekends", "Weekends (Saturday and Sunday)"),
@@ -17210,9 +17374,10 @@ def load_schedule_rows(settings):
                 continue
             action = "off" if str(item.get("action", "mix")) == "off" else "mix"
             start, end, latest = clean_times(item.get("start", 20), item.get("end", 47), item.get("latest", 50))
+            mode, crates = clean_crate_choice(str(item.get("crate_mode", "everyday")), item.get("crates"))
             rows.append({"days": days, "from_hour": max(0, min(23, int(item.get("from_hour", 0)))),
                          "to_hour": max(0, min(23, int(item.get("to_hour", 23)))), "action": action,
-                         "start": start, "end": end, "latest": latest})
+                         "start": start, "end": end, "latest": latest, "crate_mode": mode, "crates": crates})
         except Exception:
             continue
     return rows
@@ -17238,7 +17403,8 @@ def describe_row(row):
     if row["action"] == "off":
         return f"{days}, {hours}: no mix, normal rotation."
     return (f"{days}, {hours}: the mix starts at minute {row['start']}, is planned to end at minute {row['end']} "
-            f"and may end as late as minute {row['latest']}.")
+            f"and may end as late as minute {row['latest']}; "
+            f"{describe_crate_choice(row.get('crate_mode', 'everyday'), row.get('crates') or [])}.")
 
 
 def dj_cfg_for(settings, day, hour):
@@ -17249,7 +17415,8 @@ def dj_cfg_for(settings, day, hour):
             if row["action"] == "off":
                 return None
             base = dj_settings(settings)
-            return {"start": row["start"], "end": row["end"], "latest": row["latest"], "breaks": base["breaks"], "hours": base["hours"]}
+            return {"start": row["start"], "end": row["end"], "latest": row["latest"], "breaks": base["breaks"], "hours": base["hours"],
+                    "crate_mode": row.get("crate_mode", "everyday"), "crates": list(row.get("crates") or [])}
     base = dj_settings(settings)
     if hour not in base["hours"]:
         return None
@@ -17260,6 +17427,7 @@ def schedule_signature(settings):
     """Everything about the schedule that decides what a built mix should look like; a Save compares it with the last one."""
     base = dj_settings(settings)
     return json.dumps({"start": base["start"], "end": base["end"], "latest": base["latest"], "hours": sorted(base["hours"]),
+                       "crate_mode": base["crate_mode"], "crates": base["crates"],
                        "rows": load_schedule_rows(settings)}, sort_keys=True)
 
 
@@ -17267,7 +17435,8 @@ def describe_schedule(settings):
     base = dj_settings(settings)
     hours = str(settings.value("dj_hours", "all") or "all")
     lines = [f"By default, in {'every hour' if base['hours'] == set(range(24)) else 'these hours: ' + hours}, the mix starts at minute "
-             f"{base['start']}, is planned to end at minute {base['end']} and may end as late as minute {base['latest']}."]
+             f"{base['start']}, is planned to end at minute {base['end']} and may end as late as minute {base['latest']}; "
+             f"{describe_crate_choice(base['crate_mode'], base['crates'])}."]
     rows = load_schedule_rows(settings)
     if rows:
         lines.append("Extra rows, in the order they are checked:")
@@ -17362,8 +17531,18 @@ def install_local_show(store, user, show_id, manifest, package_dir):
 
 def dj_cfg_stamp(cfg):
     """What a built mix remembers about the times it was built for, so a later Save can tell whether it is still right."""
-    return {"start": cfg["start"], "end": cfg["end"], "latest": cfg["latest"],
+    mode, crates = clean_crate_choice(cfg.get("crate_mode", "everyday"), cfg.get("crates"))
+    return {"start": cfg["start"], "end": cfg["end"], "latest": cfg["latest"], "crate_mode": mode, "crates": crates,
             "breaks": {str(k): v for k, v in sorted((cfg.get("breaks") or {}).items())}}
+
+
+def dj_stamp_matches(stamp, cfg):
+    """A built mix is still right when it was built for the same times and the same songs-come-from choice."""
+    stamp = stamp or {}
+    mode, crates = clean_crate_choice(cfg.get("crate_mode", "everyday"), cfg.get("crates"))
+    old_mode, old_crates = clean_crate_choice(stamp.get("crate_mode", "everyday"), stamp.get("crates"))
+    return ((stamp.get("start"), stamp.get("end"), stamp.get("latest"), old_mode, old_crates)
+            == (cfg["start"], cfg["end"], cfg["latest"], mode, crates))
 
 
 def study_candidates(pool, opts, analyze, cached, meta_for, progress, should_stop, hour, sample, want, fresh_budget):
@@ -17495,7 +17674,7 @@ class DjModeWorker(QThread):
 class DjRowDialog(QDialog):
     """One extra DJ schedule row: which days, which hours, and either the times to mix or 'no mix'. Every field is labeled."""
 
-    def __init__(self, parent, row=None):
+    def __init__(self, parent, row=None, crate_names=()):
         super().__init__(parent)
         self.setWindowTitle("DJ schedule row")
         row = row or {"days": "all", "from_hour": 0, "to_hour": 23, "action": "mix", "start": 20, "end": 47, "latest": 50}
@@ -17539,12 +17718,26 @@ class DjRowDialog(QDialog):
         self.latest_spin.setValue(int(row["latest"]))
         self.latest_spin.setAccessibleName("Latest end minute")
         form.addRow("Latest end minute:", self.latest_spin)
+        self.crate_combo = QComboBox()
+        self.crate_combo.setAccessibleName("Where the songs for this row's mix come from")
+        for code, text in DJ_CRATE_MODES:
+            self.crate_combo.addItem(text, code)
+        self.crate_combo.setCurrentIndex(max(0, self.crate_combo.findData(row.get("crate_mode", "everyday"))))
+        form.addRow("Songs come from:", self.crate_combo)
+        self.crates_edit = QLineEdit(crates_text(row.get("crates") or []))
+        self.crates_edit.setAccessibleName("Crate numbers for this row, for example 1, 3, 5-8. Used when you choose only the crates I list")
+        form.addRow("Crate numbers (for example 1, 3, 5-8):", self.crates_edit)
+        crate_note = QLabel("Your crates: " + ("; ".join(f"{n}, {name}" for n, name in crate_names) if crate_names else "none yet. Add them on the Crates page."))
+        crate_note.setWordWrap(True)
+        crate_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        form.addRow(crate_note)
         note = QLabel("The start minute is when the mix begins in the hour. The end minute is when it is planned to finish, and the latest "
                       "end minute is the last moment it may run to. The program fits the songs to your breaks at :15, :30 and :45.")
         note.setWordWrap(True)
         note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         form.addRow(note)
         self.action_combo.currentIndexChanged.connect(lambda _i: self.show_state())
+        self.crate_combo.currentIndexChanged.connect(lambda _i: self.show_state())
         self.show_state()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -17554,26 +17747,29 @@ class DjRowDialog(QDialog):
 
     def show_state(self):
         mixing = self.action_combo.currentData() == "mix"
-        for spin in (self.start_spin, self.end_spin, self.latest_spin):
+        for spin in (self.start_spin, self.end_spin, self.latest_spin, self.crate_combo):
             spin.setEnabled(mixing)
+        self.crates_edit.setEnabled(mixing and self.crate_combo.currentData() == "pick")
 
     def values(self):
         start, end, latest = clean_times(self.start_spin.value(), self.end_spin.value(), self.latest_spin.value())
+        mode, crates = clean_crate_choice(self.crate_combo.currentData(), parse_crates(self.crates_edit.text()))
         return {"days": self.days_combo.currentData(), "from_hour": int(self.from_combo.currentData()),
                 "to_hour": int(self.to_combo.currentData()), "action": self.action_combo.currentData(),
-                "start": start, "end": end, "latest": latest}
+                "start": start, "end": end, "latest": latest, "crate_mode": mode, "crates": crates}
 
 
 # ---------------------------------------------------------------------------
-# DJ tab pieces: importing a named music folder as Clean or Explicit.
+# Crates: a music folder filed in a numbered crate (1 to 100), marked Clean or Explicit.
 # ---------------------------------------------------------------------------
 
 class ContentSourceDialog(QDialog):
-    """Asks what a folder is: its name, whether it is Classics / New school / Other, and whether it is Clean or Explicit."""
+    """Asks what a folder is: its crate number, its name, whether it is Classics / New school / Other, and whether it is Clean or Explicit."""
 
-    def __init__(self, parent, folder, kind="other", name=""):
+    def __init__(self, parent, folder, kind="other", name="", content=None, crate=None, taken=None, editing=False):
         super().__init__(parent)
-        self.setWindowTitle("Import a music folder")
+        self.taken = dict(taken or {})          # crate number -> name of what is already in it
+        self.setWindowTitle("Change this crate" if editing else "Put a music folder in a crate")
         layout = QFormLayout()
         info = QLabel(f"Folder: {folder}")
         info.setWordWrap(True)
@@ -17582,8 +17778,14 @@ class ContentSourceDialog(QDialog):
         label = dict(CONTENT_KINDS).get(kind, "Other")
         guess = name or label
         low = os.path.basename(os.path.normpath(folder)).lower()
+        free = next((n for n in range(1, CRATE_MAX + 1) if n not in self.taken), 1)
+        self.crate_spin = QSpinBox()
+        self.crate_spin.setRange(1, CRATE_MAX)
+        self.crate_spin.setValue(int(crate) if crate else free)
+        self.crate_spin.setAccessibleName(f"Crate number, 1 to {CRATE_MAX}")
+        layout.addRow(f"Crate number (1 to {CRATE_MAX}):", self.crate_spin)
         self.name_edit = QLineEdit(guess)
-        self.name_edit.setAccessibleName("Name for this folder")
+        self.name_edit.setAccessibleName("Name for this crate")
         layout.addRow("Name:", self.name_edit)
         self.kind_combo = QComboBox()
         self.kind_combo.setAccessibleName("What kind of music this folder holds")
@@ -17595,25 +17797,44 @@ class ContentSourceDialog(QDialog):
         self.content_combo.setAccessibleName("Is this folder clean or explicit?")
         self.content_combo.addItem("Clean", "clean")
         self.content_combo.addItem("Explicit", "explicit")
-        if re.search(r"explicit|dirty|uncensored|uncut", low):
+        if content in ("clean", "explicit"):
+            self.content_combo.setCurrentIndex(1 if content == "explicit" else 0)
+        elif re.search(r"explicit|dirty|uncensored|uncut", low):
             self.content_combo.setCurrentIndex(1)
         layout.addRow("This folder is:", self.content_combo)
-        self.schedule_check = QCheckBox("Spread it across the everyday schedule now (this resets hours you set by hand in the Schedule)")
-        layout.addRow(self.schedule_check)
-        note = QLabel("If you have the same songs in two folders, one clean and one explicit, import both and mark each. "
+        note = QLabel("A crate feeds the DJ mixes only, on the hours you choose on the DJ Schedule page. It never changes the everyday automation. "
+                      "If you have the same songs in two folders, one clean and one explicit, put both in crates and mark each. "
                       "Which version plays is set on the DJ tab.")
         note.setWordWrap(True)
         layout.addRow(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
+        self.problem = QLabel("")
+        self.problem.setWordWrap(True)
+        self.problem.setAccessibleName("Problem with this crate number")
+        self.problem.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addRow(self.problem)
+        buttons.accepted.connect(self.try_accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
         self.setLayout(layout)
-        self.name_edit.setFocus()
+        self.crate_spin.setFocus()
+
+    def try_accept(self):
+        number = self.crate_spin.value()
+        if number in self.taken:
+            text = f"Crate {number} already holds {self.taken[number]}. Choose another number."
+            self.problem.setText(text)
+            try:
+                self.parent().announce(text)
+            except Exception:
+                pass
+            self.crate_spin.setFocus()
+            return
+        self.accept()
 
     def values(self):
         return (self.name_edit.text().strip() or "Music", self.kind_combo.currentData(), self.content_combo.currentData(),
-                self.schedule_check.isChecked())
+                int(self.crate_spin.value()))
 
 
 
@@ -17848,6 +18069,7 @@ class BroadcastingApp(QWidget):
         self.dj_worker = None
         self.dj_failed = {}
         self.dj_reasons = {}                   # (day, hour) -> why DJ mode could not build that hour's mix
+        self.dj_pool_notes = {}                # (day, hour) -> why the crates were not (fully) used for that hour's mix
         self.dj_build_seconds = []             # how long the last few builds took
         self.dj_timer = QTimer()
         self.dj_timer.setInterval(20 * 60 * 1000)
@@ -19330,6 +19552,7 @@ class BroadcastingApp(QWidget):
         dj_menu.addSeparator()
         add(dj_menu, "open_dj_settings", "Open the DJ settings", lambda: self.show_settings_section("DJ"))
         add(dj_menu, "open_dj_schedule", "Open the DJ schedule", lambda: self.show_settings_section("DJ Schedule"))
+        add(dj_menu, "open_crates", "Open the crates", lambda: self.show_settings_section("Crates"))
         add(dj_menu, "open_mix_builder", "Open the Mix Builder", self.open_mix_builder)
         add(voice_menu, "voice_track_before", "Record a voice track before the selected queue item", self.voice_track_before)
         add(voice_menu, "voice_track_after", "Record a voice track after the selected queue item", self.voice_track_after)
@@ -21204,11 +21427,14 @@ class BroadcastingApp(QWidget):
             choose.clicked.connect(lambda _checked=False, k=key, t=title: self.choose_folder_setting(k, t))
             layout_a.addRow(choose)
 
-        music_head = QLabel("Music folders: add as many as you like. Each is marked Clean or Explicit, and each becomes a rotation.")
-        music_head.setWordWrap(True)
-        music_head.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        layout_a.addRow(music_head)
-        layout_a.addRow(self.build_music_folders_widget())
+        crates_head = QLabel("Your DJ crates (Classics, New school and so on) are on the Crates page of Settings.")
+        crates_head.setWordWrap(True)
+        crates_head.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout_a.addRow(crates_head)
+        go_crates = QPushButton("Go To The Crates Page")
+        go_crates.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        go_crates.clicked.connect(lambda _c=False: self.show_settings_section("Crates"))
+        layout_a.addRow(go_crates)
 
         log_label = QLabel(RUN_LOG.folder)
         log_label.setWordWrap(True)
@@ -21445,6 +21671,7 @@ class BroadcastingApp(QWidget):
         self.conference_tab = self.build_conference_tab()
         self.mix_tab = self.build_mix_tab()
         self.dj_schedule_tab = self.build_dj_schedule_tab()
+        self.crates_tab = self.build_crates_tab()
         self.dj_tab = self.build_dj_tab()
         self.vt_page = VoiceTrackerPage(self)
         sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
@@ -21455,7 +21682,7 @@ class BroadcastingApp(QWidget):
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("DJ", self.dj_tab), ("DJ Schedule", self.dj_schedule_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("DJ", self.dj_tab), ("Crates", self.crates_tab), ("DJ Schedule", self.dj_schedule_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
@@ -22100,6 +22327,21 @@ class BroadcastingApp(QWidget):
         self.dj_hours_edit = QLineEdit(str(self.settings.value("dj_hours", "all")))
         self.dj_hours_edit.setAccessibleName("Hours the default applies to: all, or for example 5-9, 14")
         form.addRow("Hours the default applies to (all, or for example 5-9, 14):", self.dj_hours_edit)
+        crate_mode, crate_list = crate_settings(self.settings)
+        self.dj_crate_combo = QComboBox()
+        self.dj_crate_combo.setAccessibleName("Where the default mix takes its songs from")
+        for code, text in DJ_CRATE_MODES:
+            self.dj_crate_combo.addItem(text, code)
+        self.dj_crate_combo.setCurrentIndex(max(0, self.dj_crate_combo.findData(crate_mode)))
+        form.addRow("Default songs come from:", self.dj_crate_combo)
+        self.dj_crates_edit = QLineEdit(crates_text(crate_list))
+        self.dj_crates_edit.setAccessibleName("Default crate numbers, for example 1, 3, 5-8. Used when you choose only the crates I list")
+        form.addRow("Default crate numbers (for example 1, 3, 5-8):", self.dj_crates_edit)
+        crate_note = QLabel("Crates only feed the mix. The minutes outside the mix always play the everyday automation music. "
+                            "Crates are added on the Crates page.")
+        crate_note.setWordWrap(True)
+        crate_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        form.addRow(crate_note)
         layout.addLayout(form)
         self.dj_rows_list = QListWidget()
         self.dj_rows_list.setAccessibleName("Extra schedule rows")
@@ -22145,13 +22387,23 @@ class BroadcastingApp(QWidget):
         self.dj_schedule_summary.setText(" ".join(lines) + pending)
 
     def dj_row_add(self):
-        dialog = DjRowDialog(self)
+        dialog = DjRowDialog(self, crate_names=self.crate_names())
         if dialog.exec() == QDialog.DialogCode.Accepted:
             rows = load_schedule_rows(self.settings)
-            rows.append(dialog.values())
+            row = dialog.values()
+            rows.append(row)
             save_schedule_rows(self.settings, rows)
             self.refresh_dj_schedule_view(len(rows) - 1)
-            self.announce("Row added. Press Save DJ Schedule to apply it.")
+            self.announce("Row added. Press Save DJ Schedule to apply it." + self.crate_choice_warning(dialog.crate_combo.currentData(), row))
+
+    def crate_names(self):
+        return [(x["crate"], x["name"]) for x in self.content_rules.crate_sources()]
+
+    def crate_choice_warning(self, asked_mode, row):
+        """A sentence for the case where 'only the crates I list' was chosen but nothing usable was listed."""
+        if asked_mode == "pick" and row.get("crate_mode") != "pick":
+            return " You chose only the crates you list, but no crate numbers were listed, so this row uses the everyday music."
+        return ""
 
     def dj_row_edit(self):
         rows = load_schedule_rows(self.settings)
@@ -22159,12 +22411,12 @@ class BroadcastingApp(QWidget):
         if not 0 <= index < len(rows):
             self.announce("There is no row to edit. Choose Add Row first.")
             return
-        dialog = DjRowDialog(self, rows[index])
+        dialog = DjRowDialog(self, rows[index], crate_names=self.crate_names())
         if dialog.exec() == QDialog.DialogCode.Accepted:
             rows[index] = dialog.values()
             save_schedule_rows(self.settings, rows)
             self.refresh_dj_schedule_view(index)
-            self.announce("Row changed. Press Save DJ Schedule to apply it.")
+            self.announce("Row changed. Press Save DJ Schedule to apply it." + self.crate_choice_warning(dialog.crate_combo.currentData(), rows[index]))
 
     def dj_row_remove(self):
         rows = load_schedule_rows(self.settings)
@@ -22205,14 +22457,14 @@ class BroadcastingApp(QWidget):
         form.addRow("Which songs may air:", mode_combo)
         form.addRow("When a song is in a clean and an explicit folder, play the:", prefer_combo)
         layout.addLayout(form)
-        folders_note = QLabel("Your music folders (Classics, New school and so on) are added on the Folders page of Settings, "
-                              "with as many as you like. Whether each is clean or explicit is set there.")
+        folders_note = QLabel("Your music folders (Classics, New school and so on) are kept in crates, Crate 1 up to Crate 100. They are added on the "
+                              "Crates page of Settings, where you also mark each clean or explicit. The DJ Schedule page says which crates feed which mixes.")
         folders_note.setWordWrap(True)
         folders_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(folders_note)
-        go_folders = QPushButton("Go To The Folders Page")
+        go_folders = QPushButton("Go To The Crates Page")
         go_folders.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        go_folders.clicked.connect(lambda _c=False: self.show_settings_section("Folders"))
+        go_folders.clicked.connect(lambda _c=False: self.show_settings_section("Crates"))
         layout.addWidget(go_folders)
         dj_note = QLabel("DJ mode: the program builds the mix for each hour by itself, like automation, and puts it in that hour's playlist, "
                          "starting with the hour that is playing now. Tick Turn on DJ mode and press Save DJ Mode. Hours you voice tracked, and "
@@ -22277,25 +22529,39 @@ class BroadcastingApp(QWidget):
         self.refresh_content_list()
         return page
 
+    def build_crates_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        note = QLabel(f"Crates: each music folder (Classics, New school and so on) goes in its own numbered crate, Crate 1 up to Crate {CRATE_MAX}. "
+                      "Crates feed the DJ mixes only. The minutes outside the mix always play the everyday automation music. "
+                      "On the DJ Schedule page you say, for the default and for each row, whether the mix takes its songs from the everyday "
+                      "music, from all your crates, or from the crates you list.")
+        note.setWordWrap(True)
+        note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(note)
+        layout.addWidget(self.build_music_folders_widget(), 1)
+        page.setLayout(layout)
+        return page
+
     def build_music_folders_widget(self):
-        """The list of named music folders (as many as you like), each Clean or Explicit, with the import buttons."""
+        """The list of crates (up to 100), each Clean or Explicit, with the buttons that fill them."""
         holder = QWidget()
         box = QVBoxLayout()
         box.setContentsMargins(0, 0, 0, 0)
-        box.addWidget(QLabel("Music folders:"))
+        box.addWidget(QLabel("Crates:"))
         self.content_list = QListWidget()
-        self.content_list.setAccessibleName("Music folders and whether each is clean or explicit")
+        self.content_list.setAccessibleName("Crates and whether each is clean or explicit")
         box.addWidget(self.content_list, 1)
         row = QHBoxLayout()
-        for text, kind in (("Import Classics Folder...", "classics"), ("Import New School Folder...", "newschool"),
-                           ("Import Another Folder...", "other")):
+        for text, kind in (("Put A Classics Folder In A Crate...", "classics"), ("Put A New School Folder In A Crate...", "newschool"),
+                           ("Put Another Folder In A Crate...", "other")):
             button = QPushButton(text)
             button.setStyleSheet(BUTTON_STYLE_CONSOLE)
             button.clicked.connect(lambda _c=False, k=kind: self.import_content_folder(k))
             row.addWidget(button)
         box.addLayout(row)
         row2 = QHBoxLayout()
-        for text, slot in (("Change Selected Folder's Type...", self.change_content_type), ("Remove Selected Folder From This List", self.remove_content_folder),
+        for text, slot in (("Change Selected Crate...", self.change_crate), ("Empty Selected Crate", self.remove_content_folder),
                            ("Read Explicit Flags From The Songs Now", self.scan_explicit_tags)):
             button = QPushButton(text)
             button.setStyleSheet(BUTTON_STYLE_CONSOLE)
@@ -22304,7 +22570,8 @@ class BroadcastingApp(QWidget):
         box.addLayout(row2)
         self.content_status = QLabel("")
         self.content_status.setWordWrap(True)
-        self.content_status.setAccessibleName("Music folder status")
+        self.content_status.setAccessibleName("Crates status")
+        self.content_status.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         box.addWidget(self.content_status)
         holder.setLayout(box)
         self.refresh_content_list()
@@ -22317,16 +22584,22 @@ class BroadcastingApp(QWidget):
 
     def refresh_content_list(self):
         self.content_list.clear()
-        for source in self.content_rules.sources:
+        for source in self.content_rules.crate_sources():
             item = QListWidgetItem(self.content_rules.describe(source))
             item.setData(Qt.ItemDataRole.UserRole, source["id"])
             self.content_list.addItem(item)
         if self.content_list.count():
             self.content_list.setCurrentRow(0)
+        used = len(self.content_rules.sources)
+        self.content_status.setText(f"{used} of {CRATE_MAX} crates are in use." if used else
+                                    f"All {CRATE_MAX} crates are empty. Use the buttons below to put a folder in Crate 1.")
 
     def selected_content_source(self):
         item = self.content_list.currentItem()
         return self.content_rules.find_source(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
+
+    def crate_taken_map(self, ignore_id=None):
+        return {x["crate"]: x["name"] for x in self.content_rules.sources if x.get("id") != ignore_id}
 
     def import_content_folder(self, kind):
         start = self.settings.value("music_library_folder", "")
@@ -22336,65 +22609,59 @@ class BroadcastingApp(QWidget):
         if not scan_audio_files(folder):
             self.announce("That folder has no songs in it.")
             return
-        dialog = ContentSourceDialog(self, folder, kind)
+        known = next((x for x in self.content_rules.sources if x["_root"] == norm_path(folder)), None)
+        if known is None and not self.content_rules.next_free_crate():
+            self.announce(f"All {CRATE_MAX} crates are full. Empty one first.")
+            return
+        dialog = ContentSourceDialog(self, folder, kind, taken=self.crate_taken_map(known["id"] if known else None))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        name, picked_kind, content, spread = dialog.values()
-        source = self.content_rules.add_source(name, picked_kind, folder, content)
-        added = self.ensure_rotation_for_folder(source, spread)
+        name, picked_kind, content, crate = dialog.values()
+        source = self.content_rules.add_source(name, picked_kind, folder, content, crate)
+        if source is None:
+            self.announce(f"Crate {crate} is already in use, so nothing was added.")
+            return
         self.content_rules.load()
         self.refresh_content_list()
-        text = f"{name} added as {content}. "
-        if added:
-            text += (f"It is a new rotation named {added}, spread across the schedule. " if spread else
-                     f"It is a new rotation named {added}; choose its hours in Settings, Schedule. ")
+        text = (f"{name} is in Crate {source['crate']}, marked {source['content']}. It feeds the DJ mixes only where the DJ Schedule page "
+                "says Songs come from all crates, or lists this crate.")
         self.content_status.setText(text)
         self.announce(text)
         self.scan_explicit_tags(only=folder)
 
-    def ensure_rotation_for_folder(self, source, spread=False):
-        """A folder outside the music library becomes a rotation; one inside it already has one. Returns the new name or ''."""
-        norm = norm_path(source["folder"])
-        for rotation in self.rotation_library.rotations:
-            if rotation.folder and norm_path(rotation.folder) == norm:
-                return ""
-        root = self.settings.value("music_library_folder", "")
-        if root and (norm == norm_path(root) or norm.startswith(norm_path(root).rstrip(os.sep) + os.sep)):
-            return ""
-        rotation = self.rotation_library.add_rotation(source["name"], source["folder"], True, auto=False, regular=bool(spread))
-        if spread:
-            self.rotation_schedule.regenerate_even()
-        try:
-            self.rotations_tab.refresh()
-            self.schedule_tab.refresh()
-        except Exception as e:
-            _log_exception(type(e), e, e.__traceback__)
-        return rotation.name
-
-    def change_content_type(self):
+    def change_crate(self):
         source = self.selected_content_source()
         if source is None:
-            self.announce("Select a folder in the list first.")
+            self.announce("Select a crate in the list first.")
             return
-        choice, ok = QInputDialog.getItem(self, "Clean or explicit", f"{source['name']} is:", ["Clean", "Explicit"],
-                                          1 if source["content"] == "explicit" else 0, False)
-        if ok:
-            self.content_rules.set_content(source["id"], choice.lower())
-            self.content_rules.load()
-            row = self.content_list.currentRow()
-            self.refresh_content_list()
-            self.content_list.setCurrentRow(row)
-            self.announce(f"{source['name']} is now marked {choice.lower()}.")
+        dialog = ContentSourceDialog(self, source["folder"], source.get("kind", "other"), name=source["name"], content=source["content"],
+                                     crate=source["crate"], taken=self.crate_taken_map(source["id"]), editing=True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, kind, content, crate = dialog.values()
+        problem = self.content_rules.update_source(source["id"], name, kind, content, crate)
+        if problem:
+            self.announce(problem)
+            return
+        self.content_rules.load()
+        self.refresh_content_list()
+        for n in range(self.content_list.count()):
+            if self.content_list.item(n).data(Qt.ItemDataRole.UserRole) == source["id"]:
+                self.content_list.setCurrentRow(n)
+        self.announce(f"Crate {crate} is now {name}, marked {content}. Mixes already built keep their songs; "
+                      "press Save DJ Schedule to rebuild them if you changed what a crate holds.")
 
     def remove_content_folder(self):
         source = self.selected_content_source()
         if source is None:
-            self.announce("Select a folder in the list first.")
+            self.announce("Select a crate in the list first.")
             return
+        number = source["crate"]
         self.content_rules.remove_source(source["id"])
         self.content_rules.load()
         self.refresh_content_list()
-        self.announce(f"{source['name']} removed from this list. The folder and its songs are untouched.")
+        self.announce(f"Crate {number} is empty again. The folder and its songs are untouched. A schedule row that lists Crate {number} "
+                      "skips it, and uses the everyday music if too few songs are left.")
 
     def scan_explicit_tags(self, only=None):
         if isinstance(only, bool):
@@ -22490,8 +22757,7 @@ class BroadcastingApp(QWidget):
             if cfg is None:
                 return False
             manifest = self.show_store.manifest(AUTO_SHOW_USER, show["show_id"])
-            stamp = (manifest or {}).get("dj_cfg") or {}
-            return (stamp.get("start"), stamp.get("end"), stamp.get("latest")) == (cfg["start"], cfg["end"], cfg["latest"])
+            return dj_stamp_matches((manifest or {}).get("dj_cfg"), cfg)
         except Exception:
             return False
 
@@ -22506,6 +22772,14 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("dj_end_minute", end)
         self.settings.setValue("dj_latest_minute", latest)
         self.settings.setValue("dj_hours", self.dj_hours_edit.text().strip() or "all")
+        asked = self.dj_crate_combo.currentData()
+        mode, crates = clean_crate_choice(asked, parse_crates(self.dj_crates_edit.text()))
+        self.settings.setValue("dj_crate_mode", mode)
+        self.settings.setValue("dj_crates", crates_text(crates))
+        self.dj_crate_combo.setCurrentIndex(max(0, self.dj_crate_combo.findData(mode)))
+        self.dj_crates_edit.setText(crates_text(crates))
+        if asked == "pick" and mode != "pick":
+            self.announce("You chose only the crates you list, but no crate numbers were listed, so the default uses the everyday music.")
         for spin, value in ((self.dj_start_spin, start), (self.dj_end_spin, end), (self.dj_latest_spin, latest)):
             spin.setValue(value)
         self.refresh_dj_schedule_view()
@@ -22594,7 +22868,11 @@ class BroadcastingApp(QWidget):
                     elif state.get("status") == "aired":
                         text = "its mix has aired"
                     else:
-                        text = "its mix is built and ready" + (f". {note}" if note else "")
+                        stamp = (manifest or {}).get("dj_cfg") or {}
+                        mode, crates = clean_crate_choice(stamp.get("crate_mode", "everyday"), stamp.get("crates"))
+                        pool_note = self.dj_pool_notes.get((day, hour), "")
+                        where = (f"; {pool_note}" if pool_note else (f"; {describe_crate_choice(mode, crates)}" if mode != "everyday" else ""))
+                        text = "its mix is built and ready" + where + (f". {note}" if note else "")
                 elif (day, hour) in self.dj_reasons:
                     text = "could not build a mix: " + self.dj_reasons[(day, hour)] + ". It plays its normal rotation"
                 elif offset == 0:
@@ -22602,7 +22880,8 @@ class BroadcastingApp(QWidget):
                 elif t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
                     text = "too late to build a mix, so it plays its normal rotation"
                 else:
-                    text = "waiting its turn to be built"
+                    pool_note = self.dj_pool_notes.get((day, hour), "")
+                    text = "waiting its turn to be built" + (f"; {pool_note}" if pool_note else f"; {describe_crate_choice(cfg.get('crate_mode', 'everyday'), cfg.get('crates') or [])}")
             lines.append(f"{name}: {text}.")
         return lines
 
@@ -22636,6 +22915,7 @@ class BroadcastingApp(QWidget):
         now = datetime.now()
         top = now.replace(minute=0, second=0, microsecond=0)
         tasks = []
+        crate_pools = {}                       # the crates are read once per look, not once per hour
         for offset in range(0, 49):
             t = top + timedelta(hours=offset)
             day, hour = t.date(), t.hour
@@ -22660,10 +22940,24 @@ class BroadcastingApp(QWidget):
                     continue
             elif t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
                 continue
-            rotation = self.rotation_library.find(self.rotation_schedule.rotation_id_for(day, hour))
-            if rotation is None:
-                continue
-            tasks.append((day, hour, rotation.track_paths(), task_cfg))
+            pool, note = None, ""
+            key = (cfg.get("crate_mode"), tuple(cfg.get("crates") or []))
+            if key[0] not in (None, "everyday"):
+                if key not in crate_pools:
+                    crate_pools[key] = dj_pool_from_crates(self.content_rules, cfg)
+                pool, note = crate_pools[key]
+            if note:
+                if self.dj_pool_notes.get((day, hour)) != note:
+                    RUN_LOG.write("SHOWS", f"DJ mode, {day} hour {hour:02d}: {note}.")
+                self.dj_pool_notes[(day, hour)] = note
+            else:
+                self.dj_pool_notes.pop((day, hour), None)
+            if pool is None:
+                rotation = self.rotation_library.find(self.rotation_schedule.rotation_id_for(day, hour))
+                if rotation is None:
+                    continue
+                pool = rotation.track_paths()
+            tasks.append((day, hour, list(pool), task_cfg))
         return tasks
 
     def dj_mode_tick(self):
