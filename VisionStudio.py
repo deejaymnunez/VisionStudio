@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QInputDialog, QGroupBox, QDialog, QDialogButtonBox,
                              QAbstractItemView, QWizard, QWizardPage, QTreeWidget, QTreeWidgetItem,
                              QMenuBar, QMenu, QSystemTrayIcon, QStackedWidget, QAbstractSpinBox, QPlainTextEdit)
-from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths
+from PyQt6.QtCore import QSettings, QUrl, QTimer, Qt, QThread, QObject, pyqtSignal, QPointF, QRectF, QEvent, QStandardPaths, QEventLoop
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QPainter, QColor, QPen, QBrush, QIcon, QAction, QKeyEvent
 from PyQt6.QtMultimedia import (QMediaDevices, QMediaPlayer, QAudioOutput, QAudioSource,
                                  QAudioSink, QAudioFormat, QAudio, QSoundEffect)
@@ -1952,6 +1952,21 @@ class PlaylistGenerator:
         self.events = None            # EventLibrary, set by the app
         self.marks = None             # BreakMarks, set by the app
         self.rotor = FolderRotor(settings)
+        self.pump = None              # set by the app: called now and then so the stream keeps getting audio while a day is written
+        self._last_pump = 0.0
+        self.last_timing = ""
+
+    def _pump(self):
+        if self.pump is None:
+            return
+        now = time.monotonic()
+        if now - self._last_pump < 0.2:
+            return
+        self._last_pump = now
+        try:
+            self.pump()
+        except Exception:
+            pass
 
     def rotate_folders_on(self):
         try:
@@ -2068,6 +2083,7 @@ class PlaylistGenerator:
 
         while filled < target and guard < 5000:
             guard += 1
+            self._pump()
             remaining = target - filled
             if FIT_MIN_SECONDS <= remaining <= 480:
                 candidates = [c for c in pool if c not in used and separation_ok(c)]
@@ -2167,11 +2183,15 @@ class PlaylistGenerator:
         written = []
         combined = []
         locked_hours = {h for h in range(24) if self.hour_is_locked(day, h)}
+        began = time.monotonic()
         self.remove_day_playlists(day, keep_hours=locked_hours)    # replaced, except hours you voice tracked
         self._pool_cache = {}
         for rotation in self.library.rotations:
             self._pool_cache[rotation.id] = rotation.track_paths()
+            self._pump()
+        scanned = time.monotonic() - began
         for hour in range(24):            # 00:00 up to and including 23:00
+            self._pump()
             if hour in locked_hours:
                 existing = self.current_hour_playlist(day, hour)
                 if existing:
@@ -2195,6 +2215,8 @@ class PlaylistGenerator:
             write_m3u(full_path, combined)
             written.append(full_path)
         self._pool_cache = {}
+        self.last_timing = (f"Writing the day's playlists took {time.monotonic() - began:.1f} seconds "
+                            f"({scanned:.1f} of them finding the songs in {len(self.library.rotations)} rotation folder(s)).")
         return written
 
     def remove_day_playlists(self, day, keep_hours=()):
@@ -3537,6 +3559,7 @@ class RotationEngine:
     """
     show_marks = ()      # safe defaults until __init__ has run
     passed_hour = None
+    last_marker_tag = ""
 
 
     def __init__(self, settings, on_status, on_now_playing, on_track_ending=None,
@@ -4434,6 +4457,7 @@ class RotationEngine:
                 self.on_status("A voice track slot had no recording, so the music carries on.")
                 RUN_LOG.write("VOICE", "An empty voice track slot was skipped.")
             else:
+                self.last_marker_tag = marker_tag(skipped)
                 self.on_status("Hour marker passed.")
         if not self.shuffled_queue:
             if self.build_shuffled_queue() == 0:
@@ -5442,6 +5466,7 @@ class SequencePlayer:
         self.item_index = -1
         self.active = True
         self.slot = slot
+        self.began_at = time.monotonic()
         self.on_status(f"Starting {slot} sequence, {len(self.queue)} item(s) queued.")
         for i, item in enumerate(self.items, 1):
             self.on_status(f"{slot} break item {i} of {len(self.items)}: {item}")
@@ -5451,6 +5476,7 @@ class SequencePlayer:
     def play_next_in_queue(self):
         if not self.queue:
             self.on_status("Sequence finished.")
+            self.finished_seconds = time.monotonic() - getattr(self, "began_at", time.monotonic())
             self.active = False
             self.item_index = len(self.items)
             self._changed()
@@ -16055,13 +16081,17 @@ def project_parts(project):
     end = 60 if full else int(project.get("end_minute", 47))
     latest = 60 if full else int(project.get("latest_minute", 50))
     brk = float(project.get("ids_break_seconds", MIX_IDS_BREAK_SECONDS) if full else project.get("break_seconds", MIX_NORMAL_BREAK_SECONDS))
+    by_mark = project.get("break_by_mark") or {}      # the real length of each break, where the station has measured it
     parts = []
     t = start * 60.0
     for mark in marks:
         if mark * 60 <= t + 30 or mark >= end:
             continue
         parts.append({"name": f"Part {len(parts) + 1}", "start_clock": t, "target": mark * 60.0 - t, "latest": mark * 60.0 - t})
-        t = mark * 60.0 + brk
+        try:
+            t = mark * 60.0 + float(by_mark.get(str(mark), by_mark.get(mark, brk)))
+        except Exception:
+            t = mark * 60.0 + brk
     if end * 60.0 - t >= 45:
         parts.append({"name": f"Part {len(parts) + 1}", "start_clock": t, "target": end * 60.0 - t, "latest": max(end, latest) * 60.0 - t})
     elif not parts:
@@ -17028,6 +17058,27 @@ def parse_hours(text):
     return out or set(range(24))
 
 
+def load_break_lengths(settings):
+    """{slot: [seconds, ...]} of the last few breaks the station really ran (written by note_break_length)."""
+    try:
+        data = json.loads(str(settings.value("break_seen_seconds", "") or "{}"))
+        return {str(k): [float(x) for x in v] for k, v in data.items() if isinstance(v, list)}
+    except Exception:
+        return {}
+
+
+def real_break_seconds(settings):
+    """{15: seconds, 30: seconds, 45: seconds}: the longest of the last few breaks at each mark, plus a few seconds,
+    because a break that runs longer than planned cuts into the next part. Marks never seen are left out."""
+    out = {}
+    seen = load_break_lengths(settings)
+    for mark in (15, 30, 45):
+        runs = seen.get(f":{mark}") or []
+        if runs:
+            out[mark] = round(max(runs) + 5.0, 1)
+    return out
+
+
 def dj_settings(settings):
     def number(key, default, low, high):
         try:
@@ -17037,12 +17088,14 @@ def dj_settings(settings):
     start = number("dj_start_minute", 20, 0, 55)
     end = number("dj_end_minute", 47, start + 3, 60)
     latest = number("dj_latest_minute", 50, end, 60)
-    return {"start": start, "end": end, "latest": latest, "hours": parse_hours(settings.value("dj_hours", "all"))}
+    return {"start": start, "end": end, "latest": latest, "hours": parse_hours(settings.value("dj_hours", "all")),
+            "breaks": real_break_seconds(settings)}
 
 
 def dj_project(day, hour, cfg):
     project = new_project(day=day, hour=hour, name="Auto Mix", mode="each")
-    project.update({"start_minute": cfg["start"], "end_minute": cfg["end"], "latest_minute": cfg["latest"], "marks": [15, 30, 45]})
+    project.update({"start_minute": cfg["start"], "end_minute": cfg["end"], "latest_minute": cfg["latest"], "marks": [15, 30, 45],
+                    "break_by_mark": {str(k): v for k, v in (cfg.get("breaks") or {}).items()}})
     return project
 
 
@@ -17055,18 +17108,47 @@ def plan_is_good(plan, opts):
     return True
 
 
-def choose_auto_songs(project, candidates, opts, rules=None, history=None, rng=None, attempts=4):
-    """Picks and orders songs so every part of the project lands near its mark. Returns (chosen, plan) or ([], None)."""
+def plan_miss(plan, opts):
+    """How many seconds the worst part misses its window by (0: it fits). None when there is nothing to judge."""
+    if not plan or not plan["parts"]:
+        return None
+    worst = 0.0
+    for part in plan["parts"]:
+        if not part["songs"]:
+            return 9999.0
+        off = part["off"]
+        if off < -opts["early_tolerance"]:
+            worst = max(worst, -off - opts["early_tolerance"])
+        elif off > opts["late_tolerance"]:
+            worst = max(worst, off - opts["late_tolerance"])
+    return worst
+
+
+def choose_auto_songs_detail(project, candidates, opts, rules=None, history=None, rng=None, attempts=12):
+    """Picks and orders songs so every part lands near its mark. Returns (chosen, plan, info); chosen is [] when nothing fit,
+    and info says how close the best try came."""
     rng = rng or random.Random()
     parts = project_parts(project)
+    info = {"tries": 0, "empty": 0, "best_miss": None}
     for _ in range(attempts):
+        info["tries"] += 1
         chosen = auto_mix_pick(candidates, parts, opts, rules=rules, rng=rng, history=history)
         if not chosen:
+            info["empty"] += 1
             continue
         plan = plan_block([{"song": s} for s in chosen], parts, opts)
         if plan_is_good(plan, opts):
-            return chosen, plan
-    return [], None
+            return chosen, plan, info
+        miss = plan_miss(plan, opts)
+        if miss is not None and (info["best_miss"] is None or miss < info["best_miss"]):
+            info["best_miss"] = miss
+    return [], None, info
+
+
+def choose_auto_songs(project, candidates, opts, rules=None, history=None, rng=None, attempts=12):
+    """Same as choose_auto_songs_detail, without the info. Returns (chosen, plan) or ([], None)."""
+    chosen, plan, _info = choose_auto_songs_detail(project, candidates, opts, rules, history, rng, attempts)
+    return chosen, plan
 
 
 def install_local_show(store, user, show_id, manifest, package_dir):
@@ -17079,38 +17161,86 @@ def install_local_show(store, user, show_id, manifest, package_dir):
     return store.commit(user, show_id)
 
 
+def dj_cfg_stamp(cfg):
+    """What a built mix remembers about the times it was built for, so a later Save can tell whether it is still right."""
+    return {"start": cfg["start"], "end": cfg["end"], "latest": cfg["latest"],
+            "breaks": {str(k): v for k, v in sorted((cfg.get("breaks") or {}).items())}}
+
+
+def study_candidates(pool, opts, analyze, cached, meta_for, progress, should_stop, hour, sample, want, fresh_budget):
+    """Songs already studied come first (they cost nothing); new songs are studied only until there are enough that mix.
+    Returns (candidates, studied, fresh_studied)."""
+    candidates = []
+    studied = fresh = steady = 0
+    known, unknown = [], []
+    for path in pool:
+        (known if (cached is not None and cached(path) is not None) else unknown).append(path)
+    if cached is None:
+        known, unknown = [], list(pool)
+    order = [(p, False) for p in known[:sample]] + [(p, True) for p in unknown]
+    for path, is_new in order:
+        if should_stop is not None and should_stop():
+            return None, studied, fresh
+        if is_new:
+            if cached is not None and (steady >= want or fresh >= fresh_budget):
+                break
+            if cached is None and studied >= sample:
+                break
+        if progress is not None:
+            progress(f"Studying songs for {hour:02d}00: {studied + 1} ({steady} usable so far)")
+        try:
+            data = analyze(path)
+        except Exception:
+            data = None
+        studied += 1
+        fresh += 1 if is_new else 0
+        if not data:
+            continue
+        meta = meta_for(path) if meta_for else {}
+        song = make_song(path, data, meta)
+        candidates.append(song)
+        if song_is_beatmatchable(song, opts) and song["duration"] > 60:
+            steady += 1
+    return candidates, studied, fresh
+
+
+def failure_reason(candidates, studied, opts, info):
+    steady = sum(1 for c in candidates if song_is_beatmatchable(c, opts) and c["duration"] > 60)
+    if steady < 6:
+        return (f"only {steady} of the {studied} songs studied have a steady beat the program can mix "
+                f"(it needs at least 6; the confidence needed is set in the Mix settings)")
+    if info.get("best_miss") is None:
+        return (f"none of the {steady} songs with a steady beat could be used: the programming rules, "
+                f"artist separation or play history ruled them out")
+    return (f"no order of the {steady} songs with a steady beat filled every part to its break mark; "
+            f"the closest try missed by {int(round(info['best_miss']))} seconds over the allowed window")
+
+
 def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None, rng=None, analyze=None, meta_for=None,
-                    decode=None, progress=None, should_stop=None, sample=60):
+                    decode=None, progress=None, should_stop=None, sample=150, want=60, fresh_budget=45, cached=None):
     """Builds one hour's mix by itself and files it in the show store. Returns (show id, '') or ('', reason)."""
     rng = rng or random.Random()
+    if cached is None and analyze is None:
+        cached = load_analysis                  # songs studied before are free to use
     analyze = analyze or get_analysis
     pool = [p for p in pool if is_song_entry(p)]
     if len(pool) < 6:
         return "", "the hour's rotation has too few songs"
     rng.shuffle(pool)
-    candidates = []
-    for number, path in enumerate(pool[:sample], 1):
-        if should_stop is not None and should_stop():
-            return "", "stopped"
-        if progress is not None:
-            progress(f"Studying songs for {hour:02d}00: {number} of {min(sample, len(pool))}")
-        try:
-            data = analyze(path)
-        except Exception:
-            data = None
-        if not data:
-            continue
-        meta = meta_for(path) if meta_for else {}
-        candidates.append(make_song(path, data, meta))
+    candidates, studied, _fresh = study_candidates(pool, opts, analyze, cached, meta_for, progress, should_stop, hour,
+                                                   sample, want, fresh_budget)
+    if candidates is None:
+        return "", "stopped"
     project = dj_project(day, hour, cfg)
-    chosen, plan = choose_auto_songs(project, candidates, opts, rules, history, rng)
+    chosen, plan, info = choose_auto_songs_detail(project, candidates, opts, rules, history, rng)
     if not chosen:
-        return "", "not enough songs with a steady beat that go together and fill the block"
+        return "", failure_reason(candidates, studied, opts, info)
     project["items"] = [{"path": s["path"], "talk": None, "exit": None, "transition": "auto", "loop_bars": None, "start_bar": 0} for s in chosen]
     by_path = {s["path"]: s for s in candidates}
     kwargs = {"decode": decode} if decode is not None else {}
     manifest = build_package(project, plan, opts, lambda p: by_path[p], progress=progress, should_stop=should_stop,
                              bitrate=DJ_BITRATE, **kwargs)
+    manifest["dj_cfg"] = dj_cfg_stamp(cfg)
     show_id = project_id(project)
     folder = os.path.join(project_folder(project), "package")
     state = install_local_show(store, AUTO_SHOW_USER, show_id, manifest, folder)
@@ -17386,6 +17516,10 @@ class BroadcastingApp(QWidget):
         self.mix_parts = {}                    # part file on the station -> (person, show id, manifest, part number)
         self.show_tracker = ShowAirTracker()
         self.show_notes = {}                   # (day, hour) -> why a received show was or was not used
+        self._pumping = False
+        self._generating_day = False
+        self._hour_change_waiting = False
+        self.playlist_generator.pump = self.pump_events
         self.show_service = ShowService(self.show_store, on_verified=self.on_show_verified, run_on_gui=self.gui_caller.call,
                                         log=lambda text: RUN_LOG.write("SHOWS", text))
         self.vt_service.shows = self.show_service
@@ -17437,6 +17571,7 @@ class BroadcastingApp(QWidget):
         self.rotation.on_assist = self.announce
         self.dj_worker = None
         self.dj_failed = {}
+        self.dj_reasons = {}                   # (day, hour) -> why DJ mode could not build that hour's mix
         self.dj_timer = QTimer()
         self.dj_timer.setInterval(20 * 60 * 1000)
         self.dj_timer.timeout.connect(self.dj_mode_tick)
@@ -18660,14 +18795,34 @@ class BroadcastingApp(QWidget):
     def playlists_enabled(self):
         return str(self.settings.value("playlist_autoload", "true")).lower() != "false"
 
+    def pump_events(self):
+        """Lets the program do its other work (feeding the stream, the clock) while a long job runs. Keys and clicks wait."""
+        if self._pumping:
+            return
+        self._pumping = True
+        try:
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        finally:
+            self._pumping = False
+
     def generate_day(self, day):
         """Writes every hour from 0000 through 2300 for that day, replacing earlier playlists for it."""
-        files = self.playlist_generator.generate_full_day(day)
+        if self._generating_day:
+            return []
+        self._generating_day = True
+        try:
+            files = self.playlist_generator.generate_full_day(day)
+        finally:
+            self._generating_day = False
         self.day_generated.add(day)
         self.write_day_report(day, files)
         hourly = max(0, len(files) - 1)
         self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, 0000 through 2300: {hourly} hourly "
                       f"files in {self.playlist_generator.output_folder()}. Earlier playlists for that day were replaced.")
+        RUN_LOG.write("STATUS", self.playlist_generator.last_timing)
+        if self._hour_change_waiting:
+            self._hour_change_waiting = False
+            QTimer.singleShot(0, self.on_hour_changed)
         return files
 
     def write_day_report(self, day, files):
@@ -18689,7 +18844,7 @@ class BroadcastingApp(QWidget):
 
     def maybe_append_next_hour(self):
         """Near the end of the hour, the next hour's playlist is put at the bottom of the queue."""
-        if not self.rotation.playlist_driven or not self.playlists_enabled():
+        if not self.rotation.playlist_driven or not self.playlists_enabled() or self._generating_day:
             return
         now = datetime.now()
         if 3600 - (now.minute * 60 + now.second) > self.queue_lead_seconds():
@@ -18704,7 +18859,7 @@ class BroadcastingApp(QWidget):
 
     def ensure_hour_playlists(self, force=False):
         """Makes sure the queue holds this hour's playlist, and next hour's once the hour is near its end."""
-        if self.voice_only or not self.rotation_library.rotations or not self.playlists_enabled():
+        if self.voice_only or not self.rotation_library.rotations or not self.playlists_enabled() or self._generating_day:
             return False
         now = datetime.now()
         tag = marker_for(now.date(), now.hour)[len(HOUR_MARKER_TOKEN):]
@@ -18728,7 +18883,7 @@ class BroadcastingApp(QWidget):
 
     def append_hour(self, day, hour):
         """Builds that hour's playlist and puts it at the bottom of the queue."""
-        if not self.playlists_enabled():
+        if not self.playlists_enabled() or self._generating_day:
             return
         tag = marker_for(day, hour)[len(HOUR_MARKER_TOKEN):]
         if self.rotation.queue_has_tag(tag):
@@ -18750,14 +18905,20 @@ class BroadcastingApp(QWidget):
         """The hour turned over: what is left of the old hour goes, the new hour's playlist leads."""
         if not self.playlists_enabled() or not self.rotation_library.rotations:
             return
+        if self._generating_day:
+            self._hour_change_waiting = True      # the day is being written right now; this runs when it is done
+            return
         now = datetime.now()
         tag = marker_for(now.date(), now.hour)[len(HOUR_MARKER_TOKEN):]
         if self.rotation.queue_has_tag(tag):
             dropped = self.rotation.drop_before_marker(tag)
             if dropped:
                 self.update_status(f"New hour: {dropped} unplayed track(s) from the last hour were removed.")
+        elif self.rotation.last_marker_tag == tag:
+            # The new hour's playlist was already playing before the clock turned (its marker was used up), so nothing is rebuilt.
+            self.update_status("New hour: its playlist was already playing.")
         else:
-            self.ensure_hour_playlists(force=True)
+            self.ensure_hour_playlists()          # the day's file is used if it exists; the whole day is only rewritten when it does not
         if self.rotation.is_running:
             self.rotation.drop_stale_cue()
         self.refresh_status_tree()
@@ -21359,7 +21520,14 @@ class BroadcastingApp(QWidget):
         now = datetime.now()
         hour_start = datetime(day.year, day.month, day.day, hour)
         tag = marker_for(day, hour)[len(HOUR_MARKER_TOKEN):]
-        if hour_start <= now or not self.rotation.queue_has_tag(tag):
+        if hour_start <= now:
+            text = f"The mix show {show_id} is ready, but the {hour_label(hour)} hour has already started, so it is not used."
+            self.show_notes[(day, hour)] = text
+            RUN_LOG.write("SHOWS", text)
+            return
+        if not self.rotation.queue_has_tag(tag):
+            RUN_LOG.write("SHOWS", f"The mix show {show_id} is ready. The {hour_label(hour)} playlist is not in the queue yet, "
+                                   "so the mix goes in when that playlist is queued.")
             return
         path = self.playlist_generator.current_hour_playlist(day, hour)
         if not path:
@@ -21367,7 +21535,10 @@ class BroadcastingApp(QWidget):
         entries, _missing = read_m3u(path)
         new_entries = self.apply_show_to_hour(day, hour, entries)
         if self.rotation.replace_hour_entries(tag, new_entries):
+            RUN_LOG.write("SHOWS", f"The mix show {show_id} was put into the {hour_label(hour)} hour that was already queued.")
             self.announce(f"The mix show for {hour_label(hour)} arrived and was put into that hour.")
+        else:
+            RUN_LOG.write("SHOWS", f"The mix show {show_id} could not be put into the queued {hour_label(hour)} hour.")
 
     def commercial_free_now(self):
         """True only during an hour whose verified mix show was built as a commercial-free hour."""
@@ -21611,7 +21782,8 @@ class BroadcastingApp(QWidget):
         layout.addWidget(go_folders)
         dj_note = QLabel("DJ mode: the program builds the mix for each hour by itself, like automation, and puts it in that hour's playlist. "
                          "Tick the box and press Save. Hours you voice tracked, and mixes you built or sent yourself, are never replaced. "
-                         "Switch it off and Save to go back to the playlists as they were. Building takes a few minutes per hour, in the background.")
+                         "Switch it off and Save to go back to the playlists as they were. Building takes a few minutes per hour, in the background. "
+                         "Pressing Save again with nothing changed keeps the mixes already built. The button below lists, hour by hour, what DJ mode did.")
         dj_note.setWordWrap(True)
         dj_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(dj_note)
@@ -21642,6 +21814,10 @@ class BroadcastingApp(QWidget):
         save_dj.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save_dj.clicked.connect(lambda _c=False: self.dj_mode_save())
         dj_form.addRow(save_dj)
+        dj_list = QPushButton("Show Each Hour's DJ Mode Status")
+        dj_list.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        dj_list.clicked.connect(lambda _c=False: self.dj_show_status())
+        dj_form.addRow(dj_list)
         self.dj_status = QLabel("DJ mode is off." if not self.dj_mode_check.isChecked() else "DJ mode is on.")
         self.dj_status.setWordWrap(True)
         self.dj_status.setAccessibleName("DJ mode status")
@@ -21863,28 +22039,54 @@ class BroadcastingApp(QWidget):
         self.dj_status.setText(text)
         self.announce(text)
 
-    def dj_remove_auto_shows(self):
-        removed = 0
+    def dj_clear_auto_shows(self, keep=None):
+        """Deletes the automatic mixes that have not aired. With `keep` (the DJ settings now saved), a mix that was built for
+        those same times and an hour that is still wanted stays. Returns (removed, kept)."""
+        removed = kept = 0
         for show in self.show_store.list_shows(AUTO_SHOW_USER):
-            if show["status"] != "aired":
-                self.show_store.delete(AUTO_SHOW_USER, show["show_id"])
-                removed += 1
+            if show["status"] == "aired":
+                continue
+            if keep is not None and self.dj_show_is_current(show, keep):
+                kept += 1
+                continue
+            self.show_store.delete(AUTO_SHOW_USER, show["show_id"])
+            removed += 1
         for path, info in list(self.mix_parts.items()):
             if info[0] == AUTO_SHOW_USER and not os.path.isfile(path):
                 del self.mix_parts[path]
-        return removed
+        return removed, kept
+
+    def dj_remove_auto_shows(self):
+        return self.dj_clear_auto_shows()[0]
+
+    def dj_show_is_current(self, show, cfg):
+        try:
+            if int(show["hour"]) not in cfg["hours"] or show.get("status") != "verified":
+                return False
+            manifest = self.show_store.manifest(AUTO_SHOW_USER, show["show_id"])
+            stamp = (manifest or {}).get("dj_cfg") or {}
+            return (stamp.get("start"), stamp.get("end"), stamp.get("latest")) == (cfg["start"], cfg["end"], cfg["latest"])
+        except Exception:
+            return False
 
     def dj_mode_save(self):
-        """The Save button: switching DJ mode on or off (or changing its times) rebuilds today's playlists to match."""
+        """The Save button. Switching DJ mode on or off, or changing its times, rebuilds today's playlists to match. Pressing Save
+        again with nothing changed keeps every mix already built."""
         on = self.dj_mode_check.isChecked()
         was = self.mix_bool("dj_mode_enabled")
+        before = dj_settings(self.settings)
         self.settings.setValue("dj_start_minute", self.dj_start_spin.value())
         self.settings.setValue("dj_end_minute", max(self.dj_end_spin.value(), self.dj_start_spin.value() + 3))
         self.settings.setValue("dj_latest_minute", max(self.dj_latest_spin.value(), self.dj_end_spin.value()))
         self.settings.setValue("dj_hours", self.dj_hours_edit.text().strip() or "all")
-        if self.dj_worker is not None:
-            self.dj_worker.cancel()
+        cfg = dj_settings(self.settings)
+        hours_text = str(self.settings.value("dj_hours", "all"))
+        RUN_LOG.write("SHOWS", f"DJ mode saved: {'on' if on else 'off'} (was {'on' if was else 'off'}). The mix starts at minute "
+                               f"{cfg['start']}, is planned to end at minute {cfg['end']} and may end as late as minute {cfg['latest']}. "
+                               f"Hours: {hours_text}. Breaks used for planning: {cfg['breaks'] or 'not measured yet, 90 seconds each'}.")
         self.dj_failed = {}
+        self.dj_reasons = {}
+        times_changed = (before["start"], before["end"], before["latest"]) != (cfg["start"], cfg["end"], cfg["latest"])
         if on:
             if not was:
                 self.settings.setValue("dj_prev_mix_enabled", "true" if self.mix_bool("mix_enabled") else "false")
@@ -21894,14 +22096,26 @@ class BroadcastingApp(QWidget):
                     self.mix_enable_check.setChecked(True)
                     self.mix_enable_check.blockSignals(False)
             self.settings.setValue("dj_mode_enabled", "true")
-            self.dj_remove_auto_shows()                  # rebuilt with the times just saved
-            self.ensure_hour_playlists(force=True)       # today's playlists are rebuilt right away
-            self.dj_say("DJ mode is on. Today's playlist was rebuilt. The mix for each hour is being built in the background and goes into "
-                        "its hour as soon as it is ready; until then the hour plays its normal rotation.")
+            if was and not times_changed and self.dj_worker is not None and self.dj_worker.isRunning():
+                pass                                      # nothing changed: the builder carries on
+            elif self.dj_worker is not None:
+                self.dj_worker.cancel()
+            removed, kept = self.dj_clear_auto_shows(keep=cfg)
+            RUN_LOG.write("SHOWS", f"DJ mode save: {kept} built mix(es) kept, {removed} removed.")
+            if was and removed == 0:
+                self.dj_say(f"Saved. Nothing needed rebuilding: {kept} mix(es) already built were kept, and the builder carries on with the "
+                            "hours that are still missing.")
+            else:
+                self.ensure_hour_playlists(force=True)    # today's playlists are rebuilt right away
+                self.dj_say(f"DJ mode is on. Today's playlist was rebuilt. {kept} built mix(es) were kept. The mix for each other hour is being "
+                            "built in the background and goes into its hour as soon as it is ready; until then the hour plays its normal rotation.")
             QTimer.singleShot(1500, self.dj_mode_tick)
         elif was:
+            if self.dj_worker is not None:
+                self.dj_worker.cancel()
             self.settings.setValue("dj_mode_enabled", "false")
             removed = self.dj_remove_auto_shows()
+            RUN_LOG.write("SHOWS", f"DJ mode is off: {removed} built mix(es) that had not aired were removed.")
             if str(self.settings.value("dj_prev_mix_enabled", "false")) != "true":
                 self.settings.setValue("mix_enabled", "false")
                 if hasattr(self, "mix_enable_check"):
@@ -21913,6 +22127,60 @@ class BroadcastingApp(QWidget):
                         "the way it was before.")
         else:
             self.dj_say("Saved. DJ mode stays off.")
+
+    def dj_status_lines(self):
+        """One plain sentence per hour for the next two days: what DJ mode did with it."""
+        cfg = dj_settings(self.settings)
+        now = datetime.now()
+        top = now.replace(minute=0, second=0, microsecond=0)
+        lines = []
+        for offset in range(0, 48):
+            t = top + timedelta(hours=offset)
+            day, hour = t.date(), t.hour
+            name = f"{t.strftime('%A %B %d')}, {hour_label(hour)}"
+            if hour not in cfg["hours"]:
+                text = "not one of the hours to build"
+            elif is_hour_locked(self.settings, day, hour):
+                text = "voice tracked, so it is left alone"
+            else:
+                found = self.show_store.show_for_hour(day, hour)
+                if found is not None:
+                    user, _show_id, manifest, state = found
+                    note = self.show_notes.get((day, hour), "")
+                    if user != AUTO_SHOW_USER:
+                        text = "a mix built by hand or sent to the station is in this hour"
+                    elif state.get("status") == "aired":
+                        text = "its mix has aired"
+                    else:
+                        text = "its mix is built and ready" + (f". {note}" if note else "")
+                elif (day, hour) in self.dj_reasons:
+                    text = "could not build a mix: " + self.dj_reasons[(day, hour)] + ". It plays its normal rotation"
+                elif t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
+                    text = "too late to build a mix, so it plays its normal rotation"
+                else:
+                    text = "waiting its turn to be built"
+            lines.append(f"{name}: {text}.")
+        return lines
+
+    def dj_show_status(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("DJ mode, hour by hour")
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Use the up and down arrows to read what DJ mode did with each hour.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        listing = QListWidget()
+        listing.setAccessibleName("DJ mode, hour by hour")
+        for line in self.dj_status_lines():
+            listing.addItem(line)
+        listing.setCurrentRow(0)
+        layout.addWidget(listing)
+        close = QPushButton("Close")
+        close.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.resize(700, 500)
+        dialog.exec()
 
     def dj_pending_hours(self):
         cfg = dj_settings(self.settings)
@@ -21959,6 +22227,7 @@ class BroadcastingApp(QWidget):
 
     def dj_hour_built(self, day_text, hour, show_id):
         day = datetime.strptime(day_text, "%Y-%m-%d").date()
+        self.dj_reasons.pop((day, hour), None)
         RUN_LOG.write("SHOWS", f"DJ mode built the mix for {day_text} hour {hour:02d} ({show_id}).")
         self.dj_status.setText(f"DJ mode: the mix for {hour_label(hour)} on {day_text} is ready.")
         self.on_show_verified(AUTO_SHOW_USER, show_id, day, hour)
@@ -21966,6 +22235,7 @@ class BroadcastingApp(QWidget):
     def dj_hour_failed(self, day_text, hour, reason):
         day = datetime.strptime(day_text, "%Y-%m-%d").date()
         self.dj_failed[(day, hour)] = time.time()
+        self.dj_reasons[(day, hour)] = reason
         text = f"DJ mode could not build the mix for {hour_label(hour)} on {day_text}: {reason}. That hour plays its normal rotation."
         RUN_LOG.write("SHOWS", text)
         self.dj_status.setText(text)
@@ -22177,7 +22447,22 @@ class BroadcastingApp(QWidget):
         self.refresh_status_tree()
 
     def on_sequence_done(self):
+        self.note_break_length()
         self.rotation.resume_after_sequence()
+
+    def note_break_length(self):
+        """Writes down how long the break that just finished took, so a mix is planned around the real breaks."""
+        try:
+            slot = str(getattr(self.sequence_player, "slot", "") or "")
+            seconds = float(getattr(self.sequence_player, "finished_seconds", 0) or 0)
+            if slot not in (":00", ":15", ":30", ":45") or seconds < 1:
+                return
+            seen = load_break_lengths(self.settings)
+            seen.setdefault(slot, []).append(round(seconds, 1))
+            seen[slot] = seen[slot][-6:]
+            self.settings.setValue("break_seen_seconds", json.dumps(seen))
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
 
     # --- Folder pickers: choosing a folder also starts loudness analysis right away ---
     def set_library_folder(self):
