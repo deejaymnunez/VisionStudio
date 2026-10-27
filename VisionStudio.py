@@ -17092,11 +17092,125 @@ def dj_settings(settings):
             "breaks": real_break_seconds(settings)}
 
 
+DJ_DAY_CHOICES = (("all", "Every day"), ("weekdays", "Weekdays (Monday to Friday)"), ("weekends", "Weekends (Saturday and Sunday)"),
+                  ("mon", "Monday"), ("tue", "Tuesday"), ("wed", "Wednesday"), ("thu", "Thursday"), ("fri", "Friday"),
+                  ("sat", "Saturday"), ("sun", "Sunday"))
+DJ_DAY_TEXT = dict(DJ_DAY_CHOICES)
+DJ_DAY_CODES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def clock_hour_text(hour):
+    return f"{(int(hour) % 12) or 12} {'AM' if int(hour) % 24 < 12 else 'PM'}"
+
+
+def clean_times(start, end, latest):
+    """Start 0 to 55, the planned end at least 3 minutes later (up to 60), the latest end no earlier than the planned end."""
+    start = max(0, min(55, int(start)))
+    end = max(start + 3, min(60, int(end)))
+    latest = max(end, min(60, int(latest)))
+    return start, end, latest
+
+
+def load_schedule_rows(settings):
+    """The extra schedule rows, in order; the first row that matches an hour decides it. Bad rows are left out."""
+    try:
+        data = json.loads(str(settings.value("dj_schedule_json", "") or "[]"))
+    except Exception:
+        return []
+    rows = []
+    for item in data if isinstance(data, list) else []:
+        try:
+            days = str(item.get("days", "all"))
+            if days not in DJ_DAY_TEXT:
+                continue
+            action = "off" if str(item.get("action", "mix")) == "off" else "mix"
+            start, end, latest = clean_times(item.get("start", 20), item.get("end", 47), item.get("latest", 50))
+            rows.append({"days": days, "from_hour": max(0, min(23, int(item.get("from_hour", 0)))),
+                         "to_hour": max(0, min(23, int(item.get("to_hour", 23)))), "action": action,
+                         "start": start, "end": end, "latest": latest})
+        except Exception:
+            continue
+    return rows
+
+
+def save_schedule_rows(settings, rows):
+    settings.setValue("dj_schedule_json", json.dumps(rows))
+
+
+def row_matches(row, day, hour):
+    code = DJ_DAY_CODES[day.weekday()]
+    days = row["days"]
+    if not (days == "all" or days == code or (days == "weekdays" and day.weekday() < 5) or (days == "weekends" and day.weekday() >= 5)):
+        return False
+    a, b = row["from_hour"], row["to_hour"]
+    return (a <= hour <= b) if a <= b else (hour >= a or hour <= b)       # 22 to 5 wraps around midnight
+
+
+def describe_row(row):
+    days = DJ_DAY_TEXT.get(row["days"], row["days"])
+    hours = (f"{clock_hour_text(row['from_hour'])} to the end of {clock_hour_text(row['to_hour'])}" if row["from_hour"] != row["to_hour"]
+             else f"the {clock_hour_text(row['from_hour'])} hour")
+    if row["action"] == "off":
+        return f"{days}, {hours}: no mix, normal rotation."
+    return (f"{days}, {hours}: the mix starts at minute {row['start']}, is planned to end at minute {row['end']} "
+            f"and may end as late as minute {row['latest']}.")
+
+
+def dj_cfg_for(settings, day, hour):
+    """The times for one hour: the first matching schedule row, else the default for the hours to build. None when that hour
+    gets no mix."""
+    for row in load_schedule_rows(settings):
+        if row_matches(row, day, hour):
+            if row["action"] == "off":
+                return None
+            base = dj_settings(settings)
+            return {"start": row["start"], "end": row["end"], "latest": row["latest"], "breaks": base["breaks"], "hours": base["hours"]}
+    base = dj_settings(settings)
+    if hour not in base["hours"]:
+        return None
+    return base
+
+
+def schedule_signature(settings):
+    """Everything about the schedule that decides what a built mix should look like; a Save compares it with the last one."""
+    base = dj_settings(settings)
+    return json.dumps({"start": base["start"], "end": base["end"], "latest": base["latest"], "hours": sorted(base["hours"]),
+                       "rows": load_schedule_rows(settings)}, sort_keys=True)
+
+
+def describe_schedule(settings):
+    base = dj_settings(settings)
+    hours = str(settings.value("dj_hours", "all") or "all")
+    lines = [f"By default, in {'every hour' if base['hours'] == set(range(24)) else 'these hours: ' + hours}, the mix starts at minute "
+             f"{base['start']}, is planned to end at minute {base['end']} and may end as late as minute {base['latest']}."]
+    rows = load_schedule_rows(settings)
+    if rows:
+        lines.append("Extra rows, in the order they are checked:")
+        lines += [f"{n}. {describe_row(r)}" for n, r in enumerate(rows, 1)]
+    else:
+        lines.append("There are no extra rows.")
+    return lines
+
+
 def dj_project(day, hour, cfg):
     project = new_project(day=day, hour=hour, name="Auto Mix", mode="each")
-    project.update({"start_minute": cfg["start"], "end_minute": cfg["end"], "latest_minute": cfg["latest"], "marks": [15, 30, 45],
+    project.update({"start_minute": cfg.get("begin", cfg["start"]), "end_minute": cfg["end"], "latest_minute": cfg["latest"], "marks": [15, 30, 45],
                     "break_by_mark": {str(k): v for k, v in (cfg.get("breaks") or {}).items()}})
     return project
+
+
+def midhour_begin_minute(into_seconds, lead_seconds, cfg):
+    """For the hour that is already running: the first whole minute a mix could start, once it is built (`lead_seconds` from now),
+    moved past any break in progress. Returns None when the hour's own start is still far enough ahead (nothing special to do)."""
+    wanted = into_seconds + lead_seconds
+    if wanted <= cfg["start"] * 60:
+        return None
+    breaks = cfg.get("breaks") or {}
+    for mark in (15, 30, 45):
+        length = float(breaks.get(mark, 90.0)) + 10.0
+        if mark * 60 <= wanted < mark * 60 + length:
+            wanted = mark * 60 + length
+    return int(math.ceil(wanted / 60.0))
 
 
 def plan_is_good(plan, opts):
@@ -17252,12 +17366,13 @@ def build_auto_show(day, hour, pool, opts, cfg, store, rules=None, history=None,
 
 class DjModeWorker(QThread):
     progress = pyqtSignal(str)
-    built = pyqtSignal(str, int, str)          # day, hour, show id
+    built = pyqtSignal(str, int, str, float)   # day, hour, show id, seconds the build took
     failed = pyqtSignal(str, int, str)         # day, hour, reason
     finished_all = pyqtSignal()
 
     def __init__(self, tasks, opts, cfg, store, rules, history):
         super().__init__()
+        # tasks: (day, hour, songs, times for that hour)
         self.tasks, self.opts, self.cfg, self.store, self.rules, self.history = tasks, opts, cfg, store, rules, history
         self.stop_flag = False
 
@@ -17269,12 +17384,13 @@ class DjModeWorker(QThread):
             self.setPriority(QThread.Priority.LowestPriority)
         except Exception:
             pass
-        for day, hour, pool in self.tasks:
+        for day, hour, pool, task_cfg in self.tasks:
             if self.stop_flag:
                 break
+            began = time.monotonic()
             try:
                 show_id, reason = build_auto_show(
-                    day, hour, pool, self.opts, self.cfg, self.store, self.rules, self.history,
+                    day, hour, pool, self.opts, task_cfg or self.cfg, self.store, self.rules, self.history,
                     meta_for=lambda p: {**{k: v for k, v in get_track_metadata(p).items() if k in ("artist", "title", "album")},
                                         **{k: v for k, v in read_licensing_tags(p).items() if k in ("isrc", "label")}},
                     progress=self.progress.emit, should_stop=lambda: self.stop_flag)
@@ -17282,10 +17398,82 @@ class DjModeWorker(QThread):
                 _log_exception(type(e), e, e.__traceback__)
                 show_id, reason = "", str(e) or type(e).__name__
             if show_id:
-                self.built.emit(day.isoformat(), hour, show_id)
+                self.built.emit(day.isoformat(), hour, show_id, time.monotonic() - began)
             elif not self.stop_flag:
                 self.failed.emit(day.isoformat(), hour, reason)
         self.finished_all.emit()
+
+
+class DjRowDialog(QDialog):
+    """One extra DJ schedule row: which days, which hours, and either the times to mix or 'no mix'. Every field is labeled."""
+
+    def __init__(self, parent, row=None):
+        super().__init__(parent)
+        self.setWindowTitle("DJ schedule row")
+        row = row or {"days": "all", "from_hour": 0, "to_hour": 23, "action": "mix", "start": 20, "end": 47, "latest": 50}
+        form = QFormLayout()
+        self.days_combo = QComboBox()
+        self.days_combo.setAccessibleName("Days this row applies to")
+        for code, text in DJ_DAY_CHOICES:
+            self.days_combo.addItem(text, code)
+        self.days_combo.setCurrentIndex(max(0, self.days_combo.findData(row["days"])))
+        form.addRow("Days:", self.days_combo)
+        self.from_combo = QComboBox()
+        self.from_combo.setAccessibleName("First hour this row applies to")
+        self.to_combo = QComboBox()
+        self.to_combo.setAccessibleName("Last hour this row applies to, included")
+        for hour in range(24):
+            text = f"{clock_hour_text(hour)} ({hour:02d}00)"
+            self.from_combo.addItem(text, hour)
+            self.to_combo.addItem(text, hour)
+        self.from_combo.setCurrentIndex(int(row["from_hour"]))
+        self.to_combo.setCurrentIndex(int(row["to_hour"]))
+        form.addRow("From hour:", self.from_combo)
+        form.addRow("To hour (this hour is included):", self.to_combo)
+        self.action_combo = QComboBox()
+        self.action_combo.setAccessibleName("What to do in these hours")
+        self.action_combo.addItem("Build a mix for these hours", "mix")
+        self.action_combo.addItem("No mix: these hours play their normal rotation", "off")
+        self.action_combo.setCurrentIndex(0 if row["action"] != "off" else 1)
+        form.addRow("What to do:", self.action_combo)
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(0, 55)
+        self.start_spin.setValue(int(row["start"]))
+        self.start_spin.setAccessibleName("Start minute")
+        form.addRow("Start minute:", self.start_spin)
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(3, 60)
+        self.end_spin.setValue(int(row["end"]))
+        self.end_spin.setAccessibleName("End minute")
+        form.addRow("End minute:", self.end_spin)
+        self.latest_spin = QSpinBox()
+        self.latest_spin.setRange(3, 60)
+        self.latest_spin.setValue(int(row["latest"]))
+        self.latest_spin.setAccessibleName("Latest end minute")
+        form.addRow("Latest end minute:", self.latest_spin)
+        note = QLabel("The start minute is when the mix begins in the hour. The end minute is when it is planned to finish, and the latest "
+                      "end minute is the last moment it may run to. The program fits the songs to your breaks at :15, :30 and :45.")
+        note.setWordWrap(True)
+        note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        form.addRow(note)
+        self.action_combo.currentIndexChanged.connect(lambda _i: self.show_state())
+        self.show_state()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.setLayout(form)
+
+    def show_state(self):
+        mixing = self.action_combo.currentData() == "mix"
+        for spin in (self.start_spin, self.end_spin, self.latest_spin):
+            spin.setEnabled(mixing)
+
+    def values(self):
+        start, end, latest = clean_times(self.start_spin.value(), self.end_spin.value(), self.latest_spin.value())
+        return {"days": self.days_combo.currentData(), "from_hour": int(self.from_combo.currentData()),
+                "to_hour": int(self.to_combo.currentData()), "action": self.action_combo.currentData(),
+                "start": start, "end": end, "latest": latest}
 
 
 # ---------------------------------------------------------------------------
@@ -17572,6 +17760,7 @@ class BroadcastingApp(QWidget):
         self.dj_worker = None
         self.dj_failed = {}
         self.dj_reasons = {}                   # (day, hour) -> why DJ mode could not build that hour's mix
+        self.dj_build_seconds = []             # how long the last few builds took
         self.dj_timer = QTimer()
         self.dj_timer.setInterval(20 * 60 * 1000)
         self.dj_timer.timeout.connect(self.dj_mode_tick)
@@ -18933,8 +19122,12 @@ class BroadcastingApp(QWidget):
         now = datetime.now()
         entries = self.apply_show_to_hour(now.date(), now.hour, entries)
         count, passed = self.rotation.join_hour(entries, now, locked=is_hour_locked(self.settings, now.date(), now.hour))
-        self.announce(f"Loaded this hour's playlist: {count} entries"
-                      + (f"; {passed} song(s) the clock has passed are unchecked." if passed else "."))
+        text = (f"Loaded this hour's playlist: {count} entries"
+                + (f"; {passed} song(s) the clock has passed are unchecked." if passed else "."))
+        if announce:
+            self.announce(text)
+        else:
+            self.update_status(text)
 
     def choose_playlist_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose the playlist output folder")
@@ -19048,6 +19241,7 @@ class BroadcastingApp(QWidget):
         add(dj_menu, "mic_toggle", "Microphone on or off", self.mic_toggle)
         dj_menu.addSeparator()
         add(dj_menu, "open_dj_settings", "Open the DJ settings", lambda: self.show_settings_section("DJ"))
+        add(dj_menu, "open_dj_schedule", "Open the DJ schedule", lambda: self.show_settings_section("DJ Schedule"))
         add(dj_menu, "open_mix_builder", "Open the Mix Builder", self.open_mix_builder)
         add(voice_menu, "voice_track_before", "Record a voice track before the selected queue item", self.voice_track_before)
         add(voice_menu, "voice_track_after", "Record a voice track after the selected queue item", self.voice_track_after)
@@ -21158,6 +21352,7 @@ class BroadcastingApp(QWidget):
         self.stations_tab = self.build_stations_tab()
         self.conference_tab = self.build_conference_tab()
         self.mix_tab = self.build_mix_tab()
+        self.dj_schedule_tab = self.build_dj_schedule_tab()
         self.dj_tab = self.build_dj_tab()
         self.vt_page = VoiceTrackerPage(self)
         sections = (("Folders", self.settings_pages["folders"]), ("Audio Devices", self.settings_pages["devices"]),
@@ -21168,7 +21363,7 @@ class BroadcastingApp(QWidget):
                     ("Jingles & Scheduler", self.tab_jingles), ("Keyboard Shortcuts", self.shortcuts_tab),
                     ("Voice Track Hour", self.vt_hour_tab),
                     ("Encoders / Simulcast", self.encoder_bank), ("Recording", self.recording_tab),
-                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("DJ", self.dj_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
+                    ("Tagging", self.tagging_tab), ("Crossfade", self.crossfade_tab), ("Programming Rules", self.rules_tab), ("Remote Voice Tracking", self.remote_vt_tab), ("Live Takeover", self.live_tab), ("Stations", self.stations_tab), ("Conference Call", self.conference_tab), ("DJ", self.dj_tab), ("DJ Schedule", self.dj_schedule_tab), ("Mix Blocks", self.mix_tab), ("Folder Report", self.folder_tab),
                     ("Logo", self.logo_tab), ("Version", self.version_tab))
         self.section_list = QListWidget()
         self.section_list.setAccessibleName("Settings sections")
@@ -21521,6 +21716,9 @@ class BroadcastingApp(QWidget):
         hour_start = datetime(day.year, day.month, day.day, hour)
         tag = marker_for(day, hour)[len(HOUR_MARKER_TOKEN):]
         if hour_start <= now:
+            if user == AUTO_SHOW_USER and (day, hour) == (now.date(), now.hour):
+                self.dj_apply_running_hour(show_id, day, hour)
+                return
             text = f"The mix show {show_id} is ready, but the {hour_label(hour)} hour has already started, so it is not used."
             self.show_notes[(day, hour)] = text
             RUN_LOG.write("SHOWS", text)
@@ -21539,6 +21737,37 @@ class BroadcastingApp(QWidget):
             self.announce(f"The mix show for {hour_label(hour)} arrived and was put into that hour.")
         else:
             RUN_LOG.write("SHOWS", f"The mix show {show_id} could not be put into the queued {hour_label(hour)} hour.")
+
+    def dj_apply_running_hour(self, show_id, day, hour):
+        """A mix built by DJ mode for the hour that is already running goes in for the rest of the hour, if its first part
+        still starts far enough ahead; otherwise it is dropped and the next try uses a later start."""
+        try:
+            found = self.show_store.show_for_hour(day, hour)
+            if found is None or found[1] != show_id:
+                return
+            user, _sid, manifest, _state = found
+            hour_start = datetime(day.year, day.month, day.day, hour)
+            first = min(float(p["start_offset"]) for p in manifest["parts"])
+            ahead = (hour_start + timedelta(seconds=first) - datetime.now()).total_seconds()
+            if ahead < 45:
+                text = (f"The mix for the rest of the {hour_label(hour)} hour was ready only {int(max(0, ahead))} seconds before it "
+                        "would start, which is too late, so it was dropped. The next try starts it later.")
+                RUN_LOG.write("SHOWS", text)
+                self.show_notes[(day, hour)] = text
+                self.show_store.delete(user, show_id)
+                self.dj_failed.pop((day, hour), None)
+                self.dj_build_seconds = (self.dj_build_seconds + [self.dj_lead_seconds()])[-5:]     # allow more time next try
+                QTimer.singleShot(2000, self.dj_mode_tick)
+                return
+            self.load_current_hour_playlist(announce=False)
+            nxt = datetime.now() + timedelta(hours=1)
+            self.append_attempted.discard((nxt.date(), nxt.hour))      # the queue was rebuilt: the next hour's playlist may need adding again
+            self.maybe_append_next_hour()
+            RUN_LOG.write("SHOWS", f"The mix show {show_id} was put into the {hour_label(hour)} hour that was already running, "
+                                   f"starting in about {int(ahead // 60)} minutes {int(ahead % 60)} seconds.")
+            self.announce(f"DJ mode: the mix for the rest of the {hour_label(hour)} hour is ready and will start in about {int(ahead // 60)} minutes.")
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
 
     def commercial_free_now(self):
         """True only during an hour whose verified mix show was built as a commercial-free hour."""
@@ -21754,6 +21983,123 @@ class BroadcastingApp(QWidget):
         dialog.exec()
 
     # --- DJ tab: clean / explicit music folders ---------------------------------------------------
+    def build_dj_schedule_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        note = QLabel("DJ schedule: when each hour's mix starts and ends. The default below applies to the hours you list. Extra rows can give "
+                      "other days or hours their own times, or switch the mix off for them. Rows are checked from the top and the first one "
+                      "that fits an hour decides it. Press Save DJ Schedule to apply your changes; mixes that still fit are kept.")
+        note.setWordWrap(True)
+        note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(note)
+        form = QFormLayout()
+        cfg = dj_settings(self.settings)
+        self.dj_start_spin = QSpinBox()
+        self.dj_start_spin.setRange(0, 55)
+        self.dj_start_spin.setValue(cfg["start"])
+        self.dj_start_spin.setAccessibleName("Default start minute")
+        form.addRow("Default start minute:", self.dj_start_spin)
+        self.dj_end_spin = QSpinBox()
+        self.dj_end_spin.setRange(3, 60)
+        self.dj_end_spin.setValue(cfg["end"])
+        self.dj_end_spin.setAccessibleName("Default end minute")
+        form.addRow("Default end minute:", self.dj_end_spin)
+        self.dj_latest_spin = QSpinBox()
+        self.dj_latest_spin.setRange(3, 60)
+        self.dj_latest_spin.setValue(cfg["latest"])
+        self.dj_latest_spin.setAccessibleName("Default latest end minute")
+        form.addRow("Default latest end minute:", self.dj_latest_spin)
+        self.dj_hours_edit = QLineEdit(str(self.settings.value("dj_hours", "all")))
+        self.dj_hours_edit.setAccessibleName("Hours the default applies to: all, or for example 5-9, 14")
+        form.addRow("Hours the default applies to (all, or for example 5-9, 14):", self.dj_hours_edit)
+        layout.addLayout(form)
+        self.dj_rows_list = QListWidget()
+        self.dj_rows_list.setAccessibleName("Extra schedule rows")
+        layout.addWidget(QLabel("Extra schedule rows:"))
+        layout.addWidget(self.dj_rows_list)
+        buttons = QHBoxLayout()
+        for text, handler in (("Add Row", self.dj_row_add), ("Edit Row", self.dj_row_edit), ("Remove Row", self.dj_row_remove),
+                              ("Move Row Up", lambda: self.dj_row_move(-1)), ("Move Row Down", lambda: self.dj_row_move(1))):
+            button = QPushButton(text)
+            button.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            button.clicked.connect(lambda _c=False, h=handler: h())
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        save = QPushButton("Save DJ Schedule")
+        save.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        save.clicked.connect(lambda _c=False: self.dj_schedule_save())
+        layout.addWidget(save)
+        self.dj_schedule_summary = QLabel("")
+        self.dj_schedule_summary.setWordWrap(True)
+        self.dj_schedule_summary.setAccessibleName("What the DJ schedule says")
+        self.dj_schedule_summary.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(self.dj_schedule_summary)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        self.refresh_dj_schedule_view()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
+
+    def refresh_dj_schedule_view(self, select=None):
+        rows = load_schedule_rows(self.settings)
+        self.dj_rows_list.clear()
+        for number, row in enumerate(rows, 1):
+            self.dj_rows_list.addItem(f"{number}. {describe_row(row)}")
+        if rows:
+            self.dj_rows_list.setCurrentRow(max(0, min(len(rows) - 1, select if select is not None else 0)))
+        base = dj_settings(self.settings)
+        lines = describe_schedule(self.settings)
+        pending = ""
+        if (self.dj_start_spin.value(), self.dj_end_spin.value(), self.dj_latest_spin.value()) != (base["start"], base["end"], base["latest"]):
+            pending = " The numbers in the boxes above are not saved yet."
+        self.dj_schedule_summary.setText(" ".join(lines) + pending)
+
+    def dj_row_add(self):
+        dialog = DjRowDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            rows = load_schedule_rows(self.settings)
+            rows.append(dialog.values())
+            save_schedule_rows(self.settings, rows)
+            self.refresh_dj_schedule_view(len(rows) - 1)
+            self.announce("Row added. Press Save DJ Schedule to apply it.")
+
+    def dj_row_edit(self):
+        rows = load_schedule_rows(self.settings)
+        index = self.dj_rows_list.currentRow()
+        if not 0 <= index < len(rows):
+            self.announce("There is no row to edit. Choose Add Row first.")
+            return
+        dialog = DjRowDialog(self, rows[index])
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            rows[index] = dialog.values()
+            save_schedule_rows(self.settings, rows)
+            self.refresh_dj_schedule_view(index)
+            self.announce("Row changed. Press Save DJ Schedule to apply it.")
+
+    def dj_row_remove(self):
+        rows = load_schedule_rows(self.settings)
+        index = self.dj_rows_list.currentRow()
+        if not 0 <= index < len(rows):
+            self.announce("There is no row to remove.")
+            return
+        del rows[index]
+        save_schedule_rows(self.settings, rows)
+        self.refresh_dj_schedule_view(index)
+        self.announce("Row removed. Press Save DJ Schedule to apply it.")
+
+    def dj_row_move(self, step):
+        rows = load_schedule_rows(self.settings)
+        index = self.dj_rows_list.currentRow()
+        target = index + step
+        if not (0 <= index < len(rows) and 0 <= target < len(rows)):
+            return
+        rows[index], rows[target] = rows[target], rows[index]
+        save_schedule_rows(self.settings, rows)
+        self.refresh_dj_schedule_view(target)
+        self.announce(f"Row moved to position {target + 1}. Press Save DJ Schedule to apply it.")
+
     def build_dj_tab(self):
         page = QWidget()
         layout = QVBoxLayout()
@@ -21780,36 +22126,19 @@ class BroadcastingApp(QWidget):
         go_folders.setStyleSheet(BUTTON_STYLE_CONSOLE)
         go_folders.clicked.connect(lambda _c=False: self.show_settings_section("Folders"))
         layout.addWidget(go_folders)
-        dj_note = QLabel("DJ mode: the program builds the mix for each hour by itself, like automation, and puts it in that hour's playlist. "
-                         "Tick the box and press Save. Hours you voice tracked, and mixes you built or sent yourself, are never replaced. "
-                         "Switch it off and Save to go back to the playlists as they were. Building takes a few minutes per hour, in the background. "
-                         "Pressing Save again with nothing changed keeps the mixes already built. The button below lists, hour by hour, what DJ mode did.")
+        dj_note = QLabel("DJ mode: the program builds the mix for each hour by itself, like automation, and puts it in that hour's playlist, "
+                         "starting with the hour that is playing now. Tick Turn on DJ mode and press Save DJ Mode. Hours you voice tracked, and "
+                         "mixes you built or sent yourself, are never replaced. Switch it off and Save to go back to the playlists as they were. "
+                         "Pressing Save again with nothing changed keeps the mixes already built. Which minutes the mix covers, and which hours "
+                         "or days differ, is set on the DJ Schedule page.")
         dj_note.setWordWrap(True)
         dj_note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(dj_note)
         dj_form = QFormLayout()
-        self.dj_mode_check = QCheckBox("DJ mode: build the mix for every hour automatically")
+        self.dj_mode_check = QCheckBox("Turn on DJ mode")
         self.dj_mode_check.setChecked(self.mix_bool("dj_mode_enabled"))
+        self.dj_mode_check.setAccessibleName("Turn on DJ mode")
         dj_form.addRow(self.dj_mode_check)
-        cfg = dj_settings(self.settings)
-        self.dj_start_spin = QSpinBox()
-        self.dj_start_spin.setRange(0, 55)
-        self.dj_start_spin.setValue(cfg["start"])
-        self.dj_start_spin.setAccessibleName("Minute each hour's mix starts")
-        dj_form.addRow("The mix starts at minute:", self.dj_start_spin)
-        self.dj_end_spin = QSpinBox()
-        self.dj_end_spin.setRange(5, 60)
-        self.dj_end_spin.setValue(cfg["end"])
-        self.dj_end_spin.setAccessibleName("Minute each hour's mix is planned to end")
-        dj_form.addRow("It is planned to end at minute:", self.dj_end_spin)
-        self.dj_latest_spin = QSpinBox()
-        self.dj_latest_spin.setRange(5, 60)
-        self.dj_latest_spin.setValue(cfg["latest"])
-        self.dj_latest_spin.setAccessibleName("Latest minute each hour's mix may end")
-        dj_form.addRow("It may end as late as minute:", self.dj_latest_spin)
-        self.dj_hours_edit = QLineEdit(str(self.settings.value("dj_hours", "all")))
-        self.dj_hours_edit.setAccessibleName("Hours to build, all or for example 5-9, 14")
-        dj_form.addRow("Hours to build (all, or for example 5-9, 14):", self.dj_hours_edit)
         save_dj = QPushButton("Save DJ Mode")
         save_dj.setStyleSheet(BUTTON_STYLE_CONSOLE)
         save_dj.clicked.connect(lambda _c=False: self.dj_mode_save())
@@ -21818,6 +22147,10 @@ class BroadcastingApp(QWidget):
         dj_list.setStyleSheet(BUTTON_STYLE_CONSOLE)
         dj_list.clicked.connect(lambda _c=False: self.dj_show_status())
         dj_form.addRow(dj_list)
+        go_schedule = QPushButton("Go To The DJ Schedule Page")
+        go_schedule.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        go_schedule.clicked.connect(lambda _c=False: self.show_settings_section("DJ Schedule"))
+        dj_form.addRow(go_schedule)
         self.dj_status = QLabel("DJ mode is off." if not self.dj_mode_check.isChecked() else "DJ mode is on.")
         self.dj_status.setWordWrap(True)
         self.dj_status.setAccessibleName("DJ mode status")
@@ -22039,14 +22372,14 @@ class BroadcastingApp(QWidget):
         self.dj_status.setText(text)
         self.announce(text)
 
-    def dj_clear_auto_shows(self, keep=None):
-        """Deletes the automatic mixes that have not aired. With `keep` (the DJ settings now saved), a mix that was built for
-        those same times and an hour that is still wanted stays. Returns (removed, kept)."""
+    def dj_clear_auto_shows(self, keep=False):
+        """Deletes the automatic mixes that have not aired. With `keep`, a mix that still fits the schedule (same times, an hour
+        that is still wanted) stays. Returns (removed, kept)."""
         removed = kept = 0
         for show in self.show_store.list_shows(AUTO_SHOW_USER):
             if show["status"] == "aired":
                 continue
-            if keep is not None and self.dj_show_is_current(show, keep):
+            if keep and self.dj_show_is_current(show):
                 kept += 1
                 continue
             self.show_store.delete(AUTO_SHOW_USER, show["show_id"])
@@ -22059,9 +22392,14 @@ class BroadcastingApp(QWidget):
     def dj_remove_auto_shows(self):
         return self.dj_clear_auto_shows()[0]
 
-    def dj_show_is_current(self, show, cfg):
+    def dj_show_is_current(self, show):
+        """True when a built mix still matches the schedule: that hour still gets a mix, with the same times."""
         try:
-            if int(show["hour"]) not in cfg["hours"] or show.get("status") != "verified":
+            if show.get("status") != "verified":
+                return False
+            day = datetime.strptime(show["day"], "%Y-%m-%d").date()
+            cfg = dj_cfg_for(self.settings, day, int(show["hour"]))
+            if cfg is None:
                 return False
             manifest = self.show_store.manifest(AUTO_SHOW_USER, show["show_id"])
             stamp = (manifest or {}).get("dj_cfg") or {}
@@ -22070,23 +22408,36 @@ class BroadcastingApp(QWidget):
             return False
 
     def dj_mode_save(self):
-        """The Save button. Switching DJ mode on or off, or changing its times, rebuilds today's playlists to match. Pressing Save
-        again with nothing changed keeps every mix already built."""
-        on = self.dj_mode_check.isChecked()
-        was = self.mix_bool("dj_mode_enabled")
-        before = dj_settings(self.settings)
-        self.settings.setValue("dj_start_minute", self.dj_start_spin.value())
-        self.settings.setValue("dj_end_minute", max(self.dj_end_spin.value(), self.dj_start_spin.value() + 3))
-        self.settings.setValue("dj_latest_minute", max(self.dj_latest_spin.value(), self.dj_end_spin.value()))
+        """The Save button on the DJ tab: switches DJ mode on or off."""
+        self.dj_apply(self.dj_mode_check.isChecked())
+
+    def dj_schedule_save(self):
+        """The Save button on the DJ Schedule tab: stores the default times and applies the schedule."""
+        start, end, latest = clean_times(self.dj_start_spin.value(), self.dj_end_spin.value(), self.dj_latest_spin.value())
+        self.settings.setValue("dj_start_minute", start)
+        self.settings.setValue("dj_end_minute", end)
+        self.settings.setValue("dj_latest_minute", latest)
         self.settings.setValue("dj_hours", self.dj_hours_edit.text().strip() or "all")
+        for spin, value in ((self.dj_start_spin, start), (self.dj_end_spin, end), (self.dj_latest_spin, latest)):
+            spin.setValue(value)
+        self.refresh_dj_schedule_view()
+        if self.mix_bool("dj_mode_enabled"):
+            self.dj_apply(True)
+        else:
+            self.dj_say("DJ schedule saved. DJ mode is off, so nothing is built until you turn it on on the DJ tab.")
+
+    def dj_apply(self, on):
+        """Makes DJ mode match the settings. Nothing that is still right is thrown away: pressing Save again with nothing changed
+        keeps every mix already built, and a changed schedule only removes the mixes that no longer fit it."""
+        was = self.mix_bool("dj_mode_enabled")
         cfg = dj_settings(self.settings)
         hours_text = str(self.settings.value("dj_hours", "all"))
-        RUN_LOG.write("SHOWS", f"DJ mode saved: {'on' if on else 'off'} (was {'on' if was else 'off'}). The mix starts at minute "
-                               f"{cfg['start']}, is planned to end at minute {cfg['end']} and may end as late as minute {cfg['latest']}. "
-                               f"Hours: {hours_text}. Breaks used for planning: {cfg['breaks'] or 'not measured yet, 90 seconds each'}.")
+        RUN_LOG.write("SHOWS", f"DJ mode saved: {'on' if on else 'off'} (was {'on' if was else 'off'}). " + " ".join(describe_schedule(self.settings))
+                      + f" Hours: {hours_text}. Breaks used for planning: {cfg['breaks'] or 'not measured yet, 90 seconds each'}.")
         self.dj_failed = {}
         self.dj_reasons = {}
-        times_changed = (before["start"], before["end"], before["latest"]) != (cfg["start"], cfg["end"], cfg["latest"])
+        signature = schedule_signature(self.settings)
+        changed = signature != str(self.settings.value("dj_applied_signature", ""))
         if on:
             if not was:
                 self.settings.setValue("dj_prev_mix_enabled", "true" if self.mix_bool("mix_enabled") else "false")
@@ -22096,11 +22447,12 @@ class BroadcastingApp(QWidget):
                     self.mix_enable_check.setChecked(True)
                     self.mix_enable_check.blockSignals(False)
             self.settings.setValue("dj_mode_enabled", "true")
-            if was and not times_changed and self.dj_worker is not None and self.dj_worker.isRunning():
+            if was and not changed and self.dj_worker is not None and self.dj_worker.isRunning():
                 pass                                      # nothing changed: the builder carries on
             elif self.dj_worker is not None:
                 self.dj_worker.cancel()
-            removed, kept = self.dj_clear_auto_shows(keep=cfg)
+            removed, kept = self.dj_clear_auto_shows(keep=True)
+            self.settings.setValue("dj_applied_signature", signature)
             RUN_LOG.write("SHOWS", f"DJ mode save: {kept} built mix(es) kept, {removed} removed.")
             if was and removed == 0:
                 self.dj_say(f"Saved. Nothing needed rebuilding: {kept} mix(es) already built were kept, and the builder carries on with the "
@@ -22108,7 +22460,8 @@ class BroadcastingApp(QWidget):
             else:
                 self.ensure_hour_playlists(force=True)    # today's playlists are rebuilt right away
                 self.dj_say(f"DJ mode is on. Today's playlist was rebuilt. {kept} built mix(es) were kept. The mix for each other hour is being "
-                            "built in the background and goes into its hour as soon as it is ready; until then the hour plays its normal rotation.")
+                            "built in the background and goes into its hour as soon as it is ready, this hour included; until then the hour "
+                            "plays its normal rotation.")
             QTimer.singleShot(1500, self.dj_mode_tick)
         elif was:
             if self.dj_worker is not None:
@@ -22122,6 +22475,7 @@ class BroadcastingApp(QWidget):
                     self.mix_enable_check.blockSignals(True)
                     self.mix_enable_check.setChecked(False)
                     self.mix_enable_check.blockSignals(False)
+            self.settings.setValue("dj_applied_signature", "")
             self.ensure_hour_playlists(force=True)
             self.dj_say(f"DJ mode is off. {removed} automatic mix(es) that had not played were removed, and today's playlist was rebuilt "
                         "the way it was before.")
@@ -22130,7 +22484,6 @@ class BroadcastingApp(QWidget):
 
     def dj_status_lines(self):
         """One plain sentence per hour for the next two days: what DJ mode did with it."""
-        cfg = dj_settings(self.settings)
         now = datetime.now()
         top = now.replace(minute=0, second=0, microsecond=0)
         lines = []
@@ -22138,8 +22491,9 @@ class BroadcastingApp(QWidget):
             t = top + timedelta(hours=offset)
             day, hour = t.date(), t.hour
             name = f"{t.strftime('%A %B %d')}, {hour_label(hour)}"
-            if hour not in cfg["hours"]:
-                text = "not one of the hours to build"
+            cfg = dj_cfg_for(self.settings, day, hour)
+            if cfg is None:
+                text = "no mix is scheduled for this hour, so it plays its normal rotation"
             elif is_hour_locked(self.settings, day, hour):
                 text = "voice tracked, so it is left alone"
             else:
@@ -22155,6 +22509,8 @@ class BroadcastingApp(QWidget):
                         text = "its mix is built and ready" + (f". {note}" if note else "")
                 elif (day, hour) in self.dj_reasons:
                     text = "could not build a mix: " + self.dj_reasons[(day, hour)] + ". It plays its normal rotation"
+                elif offset == 0:
+                    text = "the hour is running; a mix for the rest of it is built when there is time, otherwise it plays its normal rotation"
                 elif t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
                     text = "too late to build a mix, so it plays its normal rotation"
                 else:
@@ -22182,26 +22538,44 @@ class BroadcastingApp(QWidget):
         dialog.resize(700, 500)
         dialog.exec()
 
+    def dj_lead_seconds(self):
+        """How long from now a mix built for the running hour is expected to be ready: a little more than the slowest recent build."""
+        if not self.dj_build_seconds:
+            return 300.0
+        return max(240.0, 1.5 * max(self.dj_build_seconds) + 60.0)
+
     def dj_pending_hours(self):
-        cfg = dj_settings(self.settings)
         now = datetime.now()
         top = now.replace(minute=0, second=0, microsecond=0)
         tasks = []
         for offset in range(0, 49):
             t = top + timedelta(hours=offset)
             day, hour = t.date(), t.hour
-            if day > now.date() + timedelta(days=1) or hour not in cfg["hours"]:
+            if day > now.date() + timedelta(days=1):
                 continue
-            if t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
+            cfg = dj_cfg_for(self.settings, day, hour)
+            if cfg is None:
                 continue
             if is_hour_locked(self.settings, day, hour) or self.show_store.show_for_hour(day, hour) is not None:
                 continue
             if time.time() - self.dj_failed.get((day, hour), 0) < DJ_RETRY_SECONDS:
                 continue
+            task_cfg = cfg
+            if offset == 0:
+                into = now.minute * 60 + now.second
+                begin = midhour_begin_minute(into, self.dj_lead_seconds(), cfg)
+                if begin is not None:
+                    if begin >= cfg["end"] - 6:
+                        continue                      # too little of the hour is left for a mix
+                    task_cfg = dict(cfg, begin=begin)
+                elif t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
+                    continue
+            elif t + timedelta(minutes=cfg["start"]) - now < timedelta(minutes=3):
+                continue
             rotation = self.rotation_library.find(self.rotation_schedule.rotation_id_for(day, hour))
             if rotation is None:
                 continue
-            tasks.append((day, hour, rotation.track_paths()))
+            tasks.append((day, hour, rotation.track_paths(), task_cfg))
         return tasks
 
     def dj_mode_tick(self):
@@ -22225,10 +22599,12 @@ class BroadcastingApp(QWidget):
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
 
-    def dj_hour_built(self, day_text, hour, show_id):
+    def dj_hour_built(self, day_text, hour, show_id, seconds=0.0):
         day = datetime.strptime(day_text, "%Y-%m-%d").date()
         self.dj_reasons.pop((day, hour), None)
-        RUN_LOG.write("SHOWS", f"DJ mode built the mix for {day_text} hour {hour:02d} ({show_id}).")
+        if seconds > 0:
+            self.dj_build_seconds = (self.dj_build_seconds + [float(seconds)])[-5:]
+        RUN_LOG.write("SHOWS", f"DJ mode built the mix for {day_text} hour {hour:02d} ({show_id}), which took {int(seconds)} seconds.")
         self.dj_status.setText(f"DJ mode: the mix for {hour_label(hour)} on {day_text} is ready.")
         self.on_show_verified(AUTO_SHOW_USER, show_id, day, hour)
 
