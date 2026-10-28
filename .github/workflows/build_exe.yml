@@ -30,12 +30,21 @@ jobs:
           try {
             pip install "PyQt6-WebEngine>=6.7,<6.13" "PyQt6-WebEngine-Qt6>=6.7,<6.13" "PyQt6>=6.7,<6.13" "PyQt6-Qt6>=6.7,<6.13"
             if ($LASTEXITCODE -ne 0) { throw "pip could not install the browser engine" }
+            # The engine and the rest of Qt must be the very same version, or its DLLs will not load.
+            $web = ((pip show PyQt6-WebEngine-Qt6) | Select-String '^Version:').Line.Split(':')[1].Trim()
+            $core = ((pip show PyQt6-Qt6) | Select-String '^Version:').Line.Split(':')[1].Trim()
+            Write-Host "Qt core $core, Qt WebEngine $web"
+            if ($web -ne $core) {
+              pip install "PyQt6-Qt6==$web" "PyQt6-WebEngine-Qt6==$web"
+              if ($LASTEXITCODE -ne 0) { throw "Qt core is $core but Qt WebEngine is $web and they could not be matched" }
+            }
             $probe = python -c "from PyQt6.QtWebEngineWidgets import QWebEngineView; from PyQt6.QtWebEngineCore import QWebEngineProfile; print('browser engine ok')" 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) { throw "the browser engine would not load: $probe" }
             "VS_WEBENGINE=1" | Out-File -FilePath $env:GITHUB_ENV -Append
             Write-Host "::notice title=Vision Browser::browser engine added"
           } catch {
-            $msg = ($_ | Out-String) -replace "`r", "" -replace "`n", "%0A"
+            $versions = (pip freeze | Select-String "Qt") -join "; "
+            $msg = (($_ | Out-String) + " Installed: " + $versions) -replace "`r", "" -replace "`n", "%0A"
             Write-Host "::warning title=Vision Browser missing::$msg"
           }
           # This step is optional: a failed browser check must not fail the build.
