@@ -30,14 +30,17 @@ jobs:
           try {
             pip install "PyQt6-WebEngine>=6.7,<6.13" "PyQt6-WebEngine-Qt6>=6.7,<6.13" "PyQt6>=6.7,<6.13" "PyQt6-Qt6>=6.7,<6.13"
             if ($LASTEXITCODE -ne 0) { throw "pip could not install the browser engine" }
-            python -c "from PyQt6.QtWebEngineWidgets import QWebEngineView; from PyQt6.QtWebEngineCore import QWebEngineProfile; print('browser engine ok')"
-            if ($LASTEXITCODE -ne 0) { throw "the browser engine would not load" }
+            $probe = python -c "from PyQt6.QtWebEngineWidgets import QWebEngineView; from PyQt6.QtWebEngineCore import QWebEngineProfile; print('browser engine ok')" 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "the browser engine would not load: $probe" }
             "VS_WEBENGINE=1" | Out-File -FilePath $env:GITHUB_ENV -Append
             Write-Host "::notice title=Vision Browser::browser engine added"
           } catch {
             $msg = ($_ | Out-String) -replace "`r", "" -replace "`n", "%0A"
             Write-Host "::warning title=Vision Browser missing::$msg"
           }
+          # This step is optional: a failed browser check must not fail the build.
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Check the toolkit still supports Windows 10
         shell: pwsh
