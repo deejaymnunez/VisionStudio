@@ -1347,7 +1347,11 @@ def pretty_folder_name(folder_name):
 
 
 class MusicRotation:
-    def __init__(self, name, folder, recursive=True, auto=False, rotation_id=None, regular=True, mix=False):
+    """A rotation is the music of one or more music categories. Rotations made before categories existed
+    point at one folder of their own (category_ids is empty)."""
+
+    def __init__(self, name, folder, recursive=True, auto=False, rotation_id=None, regular=True, mix=False,
+                 category_ids=None):
         self.id = rotation_id or uuid.uuid4().hex[:8]
         self.mix = mix              # the one rotation over the whole music folder: every folder feeds every hour
         self.regular = regular      # part of the everyday schedule; holiday music is not until you schedule it
@@ -1355,19 +1359,92 @@ class MusicRotation:
         self.folder = folder
         self.recursive = recursive
         self.auto = auto  # created automatically from a subfolder of the music library
+        self.category_ids = list(category_ids or [])
+        self.owner = None           # the RotationLibrary that holds it (it knows the categories)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "folder": self.folder,
-                "recursive": self.recursive, "auto": self.auto, "regular": self.regular, "mix": self.mix}
+                "recursive": self.recursive, "auto": self.auto, "regular": self.regular, "mix": self.mix,
+                "category_ids": list(self.category_ids)}
 
     @staticmethod
     def from_dict(data):
         return MusicRotation(data.get("name", "Rotation"), data.get("folder", ""),
                              bool(data.get("recursive", True)), bool(data.get("auto", False)),
-                             data.get("id"), bool(data.get("regular", True)), bool(data.get("mix", False)))
+                             data.get("id"), bool(data.get("regular", True)), bool(data.get("mix", False)),
+                             data.get("category_ids") if isinstance(data.get("category_ids"), list) else None)
+
+    def uses_categories(self):
+        return bool(self.category_ids)
+
+    def categories(self):
+        """The music categories this rotation plays (the ones that still exist)."""
+        library = getattr(self.owner, "category_library", None)
+        found = []
+        if library is not None:
+            for category_id in self.category_ids:
+                category = library.find(category_id)
+                if category is not None and category.get("type") == "music":
+                    found.append(category)
+        return found
+
+    def folders(self):
+        """Every folder this rotation reads. A category rotation reads its categories' folders, so changing
+        a category's folder changes the rotation with it."""
+        if self.category_ids:
+            folders = []
+            for category in self.categories():
+                folder = category.get("folder")
+                if folder and folder not in folders:
+                    folders.append(folder)
+            if folders:
+                self.folder = folders[0]
+            return folders
+        return [self.folder] if self.folder else []
 
     def track_paths(self):
-        return filter_playable(scan_audio_files(self.folder, self.recursive))
+        seen = set()
+        found = []
+        for folder in self.folders():
+            for path in filter_playable(scan_audio_files(folder, self.recursive)):
+                if path not in seen:
+                    seen.add(path)
+                    found.append(path)
+        return found
+
+    def group_labels(self):
+        """{folder: label}: what each folder of a rotation with several folders is called in the rounds."""
+        folders = self.folders()
+        names = {}
+        for folder in folders:
+            names[folder] = os.path.basename(os.path.normpath(folder)) or folder
+        if len(set(names.values())) < len(names):
+            names = {folder: folder for folder in folders}
+        return names
+
+    def group_of(self, path):
+        """The folder round a song belongs to: its subfolder when the rotation has one folder, the folder
+        (category) itself when it has several, so the categories take turns."""
+        folders = self.folders()
+        if len(folders) <= 1:
+            return folder_group(path, folders[0] if folders else self.folder)
+        norm = os.path.normcase(os.path.normpath(path))
+        labels = self.group_labels()
+        for folder in folders:
+            base = os.path.normcase(os.path.normpath(folder))
+            if norm.startswith(base + os.sep):
+                return labels[folder]
+        return ROOT_GROUP
+
+    def groups(self, paths):
+        found = {}
+        for path in paths:
+            found.setdefault(self.group_of(path), []).append(path)
+        return found
+
+    def owns(self, path):
+        norm = os.path.normcase(os.path.normpath(path))
+        return any(norm.startswith(os.path.normcase(os.path.normpath(f)) + os.sep) for f in self.folders())
 
 
 class RotationLibrary:
@@ -1382,6 +1459,7 @@ class RotationLibrary:
         self.on_changed = on_changed
         self.rotations = []
         self.known_files = {}
+        self.category_library = None      # set by the app: rotations read their folders from it
         self.load()
 
     def load(self):
@@ -1390,6 +1468,8 @@ class RotationLibrary:
             self.rotations = [MusicRotation.from_dict(d) for d in data]
         except Exception:
             self.rotations = []
+        for rotation in self.rotations:
+            rotation.owner = self
 
     def save(self):
         try:
@@ -1418,10 +1498,12 @@ class RotationLibrary:
             number += 1
         return candidate
 
-    def add_rotation(self, name, folder, recursive=True, auto=False, notify=True, regular=None):
+    def add_rotation(self, name, folder, recursive=True, auto=False, notify=True, regular=None, category_ids=None):
         if regular is None:
             regular = not self.rotations          # the very first rotations make the everyday schedule; later ones wait to be scheduled
-        rotation = MusicRotation(self.unique_name(name), folder, recursive, auto, regular=regular)
+        rotation = MusicRotation(self.unique_name(name), folder, recursive, auto, regular=regular,
+                                 category_ids=category_ids)
+        rotation.owner = self
         self.rotations.append(rotation)
         if notify:
             self._changed("added")
@@ -1468,8 +1550,72 @@ class RotationLibrary:
         self._changed("linked")
         return True
 
+    def rotations_using(self, category_id):
+        return [r for r in self.rotations if category_id in r.category_ids]
+
+    def has_category_rotations(self):
+        return any(r.category_ids for r in self.rotations)
+
+    def set_categories(self, rotation_id, category_ids):
+        """Chooses which music categories a rotation plays."""
+        rotation = self.find(rotation_id)
+        if rotation is None:
+            return False
+        rotation.category_ids = [c for c in dict.fromkeys(category_ids)]
+        rotation.auto = False
+        rotation.mix = False
+        rotation.folders()
+        self.known_files.pop(rotation_id, None)
+        self._changed("categories")
+        return True
+
+    def drop_category(self, category_id):
+        """A category was removed: no rotation plays it any more. Returns the names of the rotations that changed."""
+        names = []
+        for rotation in self.rotations:
+            if category_id in rotation.category_ids:
+                rotation.category_ids = [c for c in rotation.category_ids if c != category_id]
+                self.known_files.pop(rotation.id, None)
+                names.append(rotation.name)
+        if names:
+            self._changed("categories")
+        return names
+
+    def retire_legacy(self, keep_ids=()):
+        """Rotations built automatically from folders (the ones with no categories) are removed once the
+        schedule is set up the new way. Rotations in keep_ids stay. Returns the names removed."""
+        removed = []
+        for rotation in list(self.rotations):
+            if not rotation.category_ids and rotation.id not in keep_ids:
+                self.rotations.remove(rotation)
+                self.known_files.pop(rotation.id, None)
+                removed.append(rotation.name)
+        if removed:
+            self._changed("removed")
+        return removed
+
+    def remove_under(self, root):
+        """Removes the old automatic rotations that read from `root` (a music folder that was replaced)."""
+        if not root:
+            return []
+        base = os.path.normcase(os.path.normpath(root))
+        removed = []
+        for rotation in list(self.rotations):
+            if rotation.category_ids or not (rotation.auto or rotation.mix):
+                continue
+            folder = os.path.normcase(os.path.normpath(rotation.folder or ""))
+            if folder == base or folder.startswith(base + os.sep):
+                self.rotations.remove(rotation)
+                self.known_files.pop(rotation.id, None)
+                removed.append(rotation.name)
+        if removed:
+            self._changed("removed")
+        return removed
+
     def sync_from_root(self, root):
         """
+        (Older behaviour; the program no longer calls this by itself. Rotations are made on the Rotations
+        tab from music categories.)
         Builds rotations from the music library folder: every subfolder that holds
         audio becomes a rotation; loose files in the folder itself become one more.
         Safe to call repeatedly: it adds new subfolders and removes vanished ones
@@ -1723,15 +1869,25 @@ class RotationSchedule:
         elif not valid:
             self.hours = _Hours([None] * 24, self)
 
+    def scheduled_mode(self):
+        """True once a default (everyday) schedule has been saved: the hours then come from the named
+        schedules only, never from the automatic spread of volumes."""
+        try:
+            return self.events is not None and self.events.default_event() is not None
+        except Exception:
+            return False
+
     def rotation_id_for(self, day, hour):
-        """The rotation for that hour on that day: a running dated schedule wins over the everyday one."""
+        """The rotation for that hour on that day: a running dated schedule wins over the default schedule."""
         if self.events is not None:
             try:
-                event = self.events.event_for_hour(day, hour)
+                rotation_id = self.events.rotation_for_hour(day, hour)
             except Exception:
-                event = None
-            if event is not None and event.get("rotation_id") and self.library.find(event["rotation_id"]):
-                return event["rotation_id"]
+                rotation_id = None
+            if rotation_id and self.library.find(rotation_id):
+                return rotation_id
+            if self.scheduled_mode():
+                return None                  # a schedule is in charge: no hour is filled from some other rotation
         if self.rotate_enabled() and (hour % 24) not in self.pinned:
             if self.hour_mode() == "mix" and self.mix_id():
                 return self.mix_id()
@@ -1891,6 +2047,8 @@ class CategoryLibrary:
         changed = False
         linked = {c.get("rotation_id"): c for c in self.categories if c.get("rotation_id")}
         for rotation in rotation_library.rotations:
+            if rotation.category_ids:
+                continue                      # a rotation made from categories has no category of its own
             category = linked.get(rotation.id)
             if category is None:
                 self.add_category(rotation.folder, rotation.name, "music",
@@ -1909,7 +2067,33 @@ class CategoryLibrary:
             self._changed()
         return changed
 
+    def music_categories(self):
+        return [c for c in self.categories if c.get("type") == "music"]
+
+    def detach_rotations(self):
+        """Music categories stop being tied to the old automatic rotations, so removing those rotations leaves them."""
+        changed = False
+        for category in self.categories:
+            if category.get("rotation_id"):
+                category["rotation_id"] = None
+                changed = True
+        if changed:
+            self._changed()
+        return changed
+
+    def set_folder(self, category_id, folder):
+        """Points a category at another folder. Returns the folder it used before ('' if unknown)."""
+        category = self.find(category_id)
+        if category is None:
+            return ""
+        old = category.get("folder", "")
+        category["folder"] = folder
+        self._changed()
+        return old
+
     def describe(self, category):
+        if category.get("type") == "music":
+            return f"{category['name']} (music) - {category['folder']}"
         state = "in the regular schedule" if self.is_active(category) else "not in the regular schedule"
         return f"{category['name']} ({category['type']}, {state}) - {category['folder']}"
 
@@ -2030,6 +2214,7 @@ class PlaylistGenerator:
         self.pump = None              # set by the app: called now and then so the stream keeps getting audio while a day is written
         self._last_pump = 0.0
         self.last_timing = ""
+        self._pool_cache_names = []
 
     def _pump(self):
         if self.pump is None:
@@ -2053,7 +2238,7 @@ class PlaylistGenerator:
         """The next song from the next folder in the round, or None when folder rotation does not apply."""
         if rotation is None or not self.rotate_folders_on():
             return None
-        groups = group_by_folder(pool, rotation.folder)
+        groups = rotation.groups(pool)
         if len(groups) < 2:
             return None
         eligible = {}
@@ -2161,7 +2346,7 @@ class PlaylistGenerator:
                 rotating = rotation is not None and self.rotate_folders_on()
                 if rotating:
                     waiting = self.rotor.waiting_folders(rotation.id)
-                    preferred = [c for c in candidates if folder_group(c, rotation.folder) in waiting]
+                    preferred = [c for c in candidates if rotation.group_of(c) in waiting]
                     if len(preferred) >= 4:
                         candidates = preferred          # keep the round going: favor folders that have not had a turn
                 chosen, _score = choose_fill(remaining + overlap_seconds(), candidates,
@@ -2169,7 +2354,7 @@ class PlaylistGenerator:
                 if chosen:
                     for track in chosen:
                         if rotating:
-                            self.rotor.note_used(rotation.id, folder_group(track, rotation.folder))
+                            self.rotor.note_used(rotation.id, rotation.group_of(track))
                         entries.append(track)
                         used.add(track)
                         last_track[track] = virtual_clock[0]
@@ -2257,8 +2442,15 @@ class PlaylistGenerator:
         began = time.monotonic()
         self.remove_day_playlists(day, keep_hours=locked_hours)    # replaced, except hours you voice tracked
         self._pool_cache = {}
-        for rotation in self.library.rotations:
-            self._pool_cache[rotation.id] = rotation.track_paths()
+        needed = []
+        for hour in range(24):
+            rotation_id = self.schedule.rotation_id_for(day, hour)
+            if rotation_id and rotation_id not in needed:
+                needed.append(rotation_id)
+        for rotation_id in needed:          # only the rotations this day uses are read, not every folder there is
+            rotation = self.library.find(rotation_id)
+            if rotation is not None:
+                self._pool_cache[rotation.id] = rotation.track_paths()
             self._pump()
         scanned = time.monotonic() - began
         for hour in range(24):            # 00:00 up to and including 23:00
@@ -2285,9 +2477,10 @@ class PlaylistGenerator:
             full_path = os.path.join(self.output_folder(), f"{day.strftime('%Y-%m-%d')}_fullday.m3u8")
             write_m3u(full_path, combined)
             written.append(full_path)
+        self._pool_cache_names = list(needed)
         self._pool_cache = {}
         self.last_timing = (f"Writing the day's playlists took {time.monotonic() - began:.1f} seconds "
-                            f"({scanned:.1f} of them finding the songs in {len(self.library.rotations)} rotation folder(s)).")
+                            f"({scanned:.1f} of them finding the songs in {len(self._pool_cache_names)} rotation(s)).")
         return written
 
     def remove_day_playlists(self, day, keep_hours=()):
@@ -2376,9 +2569,10 @@ DEFAULT_SHORTCUTS = [
     ("toggle_recording", "Start or stop recording", "R", True),
     ("new_item", "New rotation, category or hour marker (depends on the tab)", "Ctrl+N", True),
     ("generate_now", "Generate playlists now", "Ctrl+Shift+G", True),
+    ("generate_schedule", "Generate schedule: rebuild today or tomorrow from the schedules, and today's queue", "Ctrl+Alt+C", True),
     ("say_elapsed", "Announce elapsed time of the current track", "Ctrl+Alt+Shift+T", True),
     ("say_remaining", "Announce time remaining on the current track", "Ctrl+Alt+T", True),
-    ("say_current", "Announce the current track", "Ctrl+Alt+C", True),
+    ("say_current", "Announce the current track", "Ctrl+Alt+Shift+C", True),
     ("say_status", "Announce play status", "Ctrl+Alt+P", True),
     ("say_hour_remaining", "Announce time remaining in this hour", "Ctrl+Alt+H", True),
     ("say_mute", "Announce mute status", "Ctrl+Alt+M", True),
@@ -2639,6 +2833,64 @@ def format_moment(moment):
     return moment.strftime("%Y-%m-%dT%H:%M")
 
 
+def parse_hour_set(text):
+    """The hours a rotation covers: 'all' (or nothing) is every hour; '0-5', '22-5' (wraps past midnight),
+    '14' and '6-9, 22-23' are lists. Returns a set of 0..23, or None when the text is not understood."""
+    raw = str(text or "").strip().lower()
+    if raw in ("", "all", "every hour", "all hours", "24"):
+        return set(range(24))
+    hours = set()
+    for part in re.split(r"[,;]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        match = re.fullmatch(r"(\d{1,2})\s*(?:-|to|\u2013)\s*(\d{1,2})", part)
+        if match:
+            first, last = int(match.group(1)), int(match.group(2))
+        else:
+            match = re.fullmatch(r"(\d{1,2})", part)
+            if not match:
+                return None
+            first = last = int(match.group(1))
+        if not (0 <= first <= 23 and 0 <= last <= 23):
+            return None
+        if first <= last:
+            hours.update(range(first, last + 1))
+        else:
+            hours.update(range(first, 24))
+            hours.update(range(0, last + 1))
+    return hours or None
+
+
+def hours_text(text):
+    """Plain words for an hours entry: 'all hours', 'midnight through the end of 5 AM'."""
+    hours = parse_hour_set(text)
+    if hours is None:
+        return str(text)
+    if len(hours) == 24:
+        return "all hours"
+
+    def clock(h):
+        h %= 24
+        return "midnight" if h == 0 else ("noon" if h == 12 else f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}")
+    runs = []
+    for h in sorted(hours):
+        if runs and h == runs[-1][1] + 1:
+            runs[-1][1] = h
+        else:
+            runs.append([h, h])
+    if len(runs) > 1 and runs[0][0] == 0 and runs[-1][1] == 23:
+        tail = runs.pop()
+        runs[0][0] = tail[0] - 24            # a stretch that wraps past midnight reads as one
+    parts = []
+    for first, last in runs:
+        if first == last:
+            parts.append(f"the {clock(first)} hour")
+        else:
+            parts.append(f"{clock(first)} through the end of {clock(last)}")
+    return ", ".join(parts)
+
+
 class EventLibrary:
     """Named schedules that run between two dates and times and replace the regular schedule while
     they do. A draft (no saved dates) is never active."""
@@ -2675,14 +2927,70 @@ class EventLibrary:
 
     def add_draft(self, name, rotation_id=None, jingle_category_id=None):
         event = {"id": uuid.uuid4().hex[:8], "name": name, "rotation_id": rotation_id,
+                 "entries": [{"rotation_id": rotation_id, "hours": "all"}] if rotation_id else [],
                  "jingle_category_id": jingle_category_id, "ad_category_id": None,
                  "start": "", "end": "", "repeat": False, "voice": False, "marks": [1, 1, 1, 1],
-                 "active": False, "created": time.time()}
+                 "active": False, "default": False, "created": time.time()}
         self.events.append(event)
         self._changed()
         return event
 
+    # --- the rotations of a schedule: each one covers all hours or the hours you give ---
+    def entries_of(self, event):
+        raw = event.get("entries")
+        found = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and item.get("rotation_id"):
+                    found.append({"rotation_id": item["rotation_id"], "hours": str(item.get("hours") or "all")})
+        if not found and event.get("rotation_id"):
+            found.append({"rotation_id": event["rotation_id"], "hours": "all"})
+        return found
+
+    def set_entries(self, event, entries):
+        clean = [{"rotation_id": e["rotation_id"], "hours": str(e.get("hours") or "all")}
+                 for e in entries if e.get("rotation_id")]
+        event["entries"] = clean
+        event["rotation_id"] = clean[0]["rotation_id"] if clean else None
+
+    def entry_rotation(self, event, hour):
+        """The rotation this schedule plays in that hour, or None when none of its rotations cover it."""
+        for item in self.entries_of(event):
+            hours = parse_hour_set(item["hours"])
+            if hours is not None and (int(hour) % 24) in hours:
+                return item["rotation_id"]
+        return None
+
+    def uncovered_hours(self, event):
+        return [h for h in range(24) if self.entry_rotation(event, h) is None]
+
+    def forget_rotation(self, rotation_id):
+        """A rotation was removed: schedules stop using it. Returns the names of the schedules that changed."""
+        names = []
+        for event in self.events:
+            kept = [e for e in self.entries_of(event) if e["rotation_id"] != rotation_id]
+            if len(kept) != len(self.entries_of(event)):
+                self.set_entries(event, kept)
+                names.append(event.get("name", ""))
+        if names:
+            self._changed()
+        return names
+
+    def default_event(self):
+        """The everyday schedule: it has no dates and plays whenever no dated schedule does."""
+        for event in self.events:
+            if event.get("default") and event.get("active", True):
+                return event
+        return None
+
     def validate(self, event):
+        if event.get("default") and not self.entries_of(event):
+            return "Add at least one rotation."
+        for item in self.entries_of(event):
+            if parse_hour_set(item["hours"]) is None:
+                return f"The hours '{item['hours']}' are not clear. Use all, or for example 0-5, or 6-9, 22-23."
+        if event.get("default"):
+            return ""
         start, end = parse_moment(event.get("start")), parse_moment(event.get("end"))
         if start is None or end is None:
             return "Choose a start and an end."
@@ -2691,11 +2999,19 @@ class EventLibrary:
         return ""
 
     def save_event(self, event):
-        """Saves dates and activates the schedule. Returns an error text, or '' when saved."""
+        """Saves a schedule and switches it on. Returns an error text, or '' when saved. A schedule with no dates
+        is the everyday (default) schedule; there is only one, so an earlier one stays saved but off."""
         problem = self.validate(event)
         if problem:
             return problem
         event["active"] = True
+        if event.get("default"):
+            event["start"] = event["end"] = ""
+            event["repeat"] = False
+            for other in self.events:
+                if other["id"] != event["id"] and other.get("default"):
+                    other["default"] = False
+                    other["active"] = False
         if self.find(event["id"]) is None:
             event["created"] = event.get("created", time.time())
             self.events.append(event)
@@ -2714,7 +3030,7 @@ class EventLibrary:
 
     def occurrences(self, event, around):
         start, end = parse_moment(event.get("start")), parse_moment(event.get("end"))
-        if start is None or end is None or end <= start:
+        if event.get("default") or start is None or end is None or end <= start:
             return []
         if not event.get("repeat"):
             return [(start, end)]
@@ -2722,7 +3038,7 @@ class EventLibrary:
         return [(shift_years(start, k), shift_years(end, k)) for k in range(base - 1, base + 3)]
 
     def is_running(self, event, now):
-        if not event.get("active"):
+        if not event.get("active") or event.get("default"):
             return False
         return any(s <= now < e for s, e in self.occurrences(event, now))
 
@@ -2732,17 +3048,41 @@ class EventLibrary:
         future = [s for s, _e in self.occurrences(event, now) if s > now]
         return min(future) if future else None
 
-    def event_at(self, moment):
-        """The running schedule that wins at this moment: the one created last."""
-        winner = None
+    def _running_since(self, event, moment):
+        starts = [s for s, e in self.occurrences(event, moment) if s <= moment < e]
+        return max(starts) if starts else None
+
+    def running_events(self, moment):
+        """The dated schedules running at this moment, the one that started last first (if two overlap, the later start wins)."""
+        found = []
         for event in self.events:
             if self.is_running(event, moment):
-                if winner is None or event.get("created", 0) >= winner.get("created", 0):
-                    winner = event
-        return winner
+                found.append((self._running_since(event, moment), event.get("created", 0), event))
+        found.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        return [t[2] for t in found]
+
+    def event_at(self, moment):
+        """The dated schedule that wins at this moment (the one that started last), or None."""
+        running = self.running_events(moment)
+        return running[0] if running else None
 
     def event_for_hour(self, day, hour):
         return self.event_at(datetime(day.year, day.month, day.day, int(hour) % 24, 0))
+
+    def active_event(self, day, hour):
+        """The schedule that decides this hour: a running dated schedule that covers it, else the default one."""
+        moment = datetime(day.year, day.month, day.day, int(hour) % 24, 0)
+        for event in self.running_events(moment):
+            if self.entry_rotation(event, hour):
+                return event
+        default = self.default_event()
+        if default is not None and self.entry_rotation(default, hour):
+            return default
+        return None
+
+    def rotation_for_hour(self, day, hour):
+        event = self.active_event(day, hour)
+        return self.entry_rotation(event, hour) if event is not None else None
 
     def is_last_hour_of_show(self, event, day, hour):
         hour_start = datetime(day.year, day.month, day.day, int(hour) % 24, 0)
@@ -2765,22 +3105,44 @@ class EventLibrary:
                     break
         return found
 
-    def describe(self, event, now=None):
+    def rotation_names(self, event, rotation_library):
+        parts = []
+        for item in self.entries_of(event):
+            rotation = rotation_library.find(item["rotation_id"]) if rotation_library is not None else None
+            name = rotation.name if rotation else "(a rotation that was removed)"
+            parts.append(f"{name} ({hours_text(item['hours'])})")
+        return ", ".join(parts) if parts else "no rotation"
+
+    def is_default_now(self, event, now=None):
+        """The 'default schedule' box: checked while this schedule is the one on air."""
         now = now or datetime.now()
+        active = self.active_event(now.date(), now.hour)
+        return active is not None and active["id"] == event["id"]
+
+    def describe(self, event, now=None, rotation_library=None):
+        now = now or datetime.now()
+        names = self.rotation_names(event, rotation_library) if rotation_library is not None else ""
+        tail = f". Plays {names}" if names else ""
+        box = "Default schedule box: checked, on air now" if self.is_default_now(event, now) \
+            else "Default schedule box: not checked"
+        if event.get("default"):
+            if not event.get("active", True):
+                return f"{event['name']}: everyday schedule, off{tail}"
+            return f"{event['name']}: everyday schedule with no dates. {box}{tail}"
         if not event.get("active"):
-            return f"{event['name']}: draft, not scheduled yet"
+            return f"{event['name']}: draft, not scheduled yet{tail}"
         start, end = parse_moment(event["start"]), parse_moment(event["end"])
-        text = f"{event['name']}: {start.strftime('%a %b %d %Y %I:%M %p')} to {end.strftime('%a %b %d %Y %I:%M %p')}"
+        text = f"{event['name']}: {start.strftime('%B %d, %Y')} through {end.strftime('%B %d, %Y')}"
         if event.get("repeat"):
             text += ", repeats every year"
         if event.get("voice"):
             text += ", voice tracked"
         if self.is_running(event, now):
-            text += " (on air now)"
+            text += f". {box}"
         else:
             nxt = self.next_start(event, now)
-            text += f" (next starts {nxt.strftime('%b %d %Y')})" if nxt else " (finished)"
-        return text
+            text += f". {box} (next starts {nxt.strftime('%B %d, %Y')})" if nxt else f". {box} (finished)"
+        return text + tail
 
 
 class BreakMarks:
@@ -3113,29 +3475,29 @@ def folder_report(rotation, rotor=None, now=None):
     last scheduled, and anything that was not read and why."""
     now = now or time.time()
     lines = []
-    root = rotation.folder
-    if not root or not os.path.isdir(root):
-        return f"The folder for {rotation.name} was not found: {root}"
+    roots = rotation.folders()
+    if not roots or not any(os.path.isdir(r) for r in roots):
+        return f"The folder for {rotation.name} was not found: {', '.join(roots) if roots else rotation.folder}"
     songs = rotation.track_paths()
-    groups = group_by_folder(songs, root)
+    groups = rotation.groups(songs)
     other = {}
     skipped_dirs = []
-    try:
-        for name in sorted(os.listdir(root), key=str.lower):
-            full = os.path.join(root, name)
-            if os.path.isdir(full) and (name.startswith(".") or os.path.islink(full)):
-                skipped_dirs.append(name + (" (starts with a period)" if name.startswith(".") else " (a shortcut or link)"))
-        for current, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in files:
-                if name.lower().endswith(OTHER_AUDIO):
-                    other.setdefault(folder_group(os.path.join(current, name), root), []).append(name)
-    except OSError:
-        pass
     real_dirs = []
     try:
-        real_dirs = [n for n in os.listdir(root) if os.path.isdir(os.path.join(root, n)) and not n.startswith(".")
-                     and not os.path.islink(os.path.join(root, n))]
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for name in sorted(os.listdir(root), key=str.lower):
+                full = os.path.join(root, name)
+                if os.path.isdir(full) and (name.startswith(".") or os.path.islink(full)):
+                    skipped_dirs.append(name + (" (starts with a period)" if name.startswith(".") else " (a shortcut or link)"))
+                elif os.path.isdir(full) and len(roots) == 1:
+                    real_dirs.append(name)
+            for current, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for name in files:
+                    if name.lower().endswith(OTHER_AUDIO):
+                        other.setdefault(rotation.group_of(os.path.join(current, name)), []).append(name)
     except OSError:
         pass
     names = sorted(set(groups) | set(real_dirs), key=str.lower)
@@ -3143,6 +3505,8 @@ def folder_report(rotation, rotor=None, now=None):
     entry = rotor.entry(rotation.id) if rotor is not None else {"last": {}, "count": {}, "rounds": 0}
     never = [n for n in names if groups.get(n) and not entry["last"].get(n)]
     lines.append(f"Rotation {rotation.name}: {len(songs)} songs in {len([n for n in names if groups.get(n)])} folders.")
+    if len(roots) > 1:
+        lines.append("Music categories (they take turns): " + "; ".join(f"{c['name']} ({c['folder']})" for c in rotation.categories()) + ".")
     if not rotation.recursive:
         lines.append("Include subfolders is OFF for this rotation, so only the top folder is read.")
     lines.append(f"Folders with no readable songs: {len(empty)}." + (" " + ", ".join(empty) if empty else ""))
@@ -3177,10 +3541,8 @@ def day_folder_report(rotation_library, rotor, day, playlist_files, schedule=Non
             if is_hour_marker(entry):
                 continue
             for rotation in rotation_library.rotations:
-                root = rotation.folder
-                if root and os.path.normcase(os.path.normpath(entry)).startswith(
-                        os.path.normcase(os.path.normpath(root)) + os.sep):
-                    used.setdefault(rotation.id, Counter())[folder_group(entry, root)] += 1
+                if rotation.owns(entry):
+                    used.setdefault(rotation.id, Counter())[rotation.group_of(entry)] += 1
                     break
     lines = [f"Folder report for the playlists of {day.strftime('%A %B %d, %Y')}",
              f"Made {time.strftime('%Y-%m-%d %I:%M %p')}", ""]
@@ -3820,6 +4182,11 @@ class RotationEngine:
         if self.has_rotations():
             rotation = self.rotation_library.find(
                 self.rotation_schedule.rotation_id_for_hour(datetime.now().hour))
+            if self.scheduled_mode():
+                # A schedule is in charge: only the music of the rotation it names for this hour plays.
+                files = rotation.track_paths() if rotation else []
+                self.active_rotation_id = rotation.id if (rotation and files) else None
+                return files
             candidates = ([rotation] if rotation else []) + list(self.rotation_library.rotations)
             for candidate in candidates:
                 files = candidate.track_paths()
@@ -3827,7 +4194,16 @@ class RotationEngine:
                     self.active_rotation_id = candidate.id
                     return files
         self.active_rotation_id = None
+        if self.scheduled_mode():
+            return []
         return filter_playable(scan_audio_files(self.get_library_folder()))  # includes every subfolder
+
+    def scheduled_mode(self):
+        """True once a default schedule exists: music then comes only from the rotation the schedule names."""
+        try:
+            return bool(self.rotation_schedule is not None and self.rotation_schedule.scheduled_mode())
+        except Exception:
+            return False
 
     def active_rotation_name(self):
         if self.rotation_library is None:
@@ -3998,6 +4374,36 @@ class RotationEngine:
         self._queue_changed()
         return len(paths)
 
+    def forget_song_caches(self):
+        """The music changed (a folder was replaced or removed): the swap pools are read again."""
+        self._fit_pool = (None, [])
+        self._borrow_cache = (0.0, [])
+        self._borrow_owner = {}
+
+    def remove_songs_under(self, folders):
+        """Takes every queued song that lives in one of these folders out of the queue (the song on air is not
+        cut). Returns how many were removed."""
+        bases = tuple(os.path.normcase(os.path.normpath(f)) + os.sep for f in folders if f)
+        if not bases:
+            return 0
+
+        def under(path):
+            return (not is_hour_marker(path)) and os.path.normcase(os.path.normpath(path)).startswith(bases)
+        if self.next_track_cued and not self.is_paused_for_sequence:
+            cued = self.get_cued_deck().current_track_path
+            if cued and under(cued):
+                self.uncue_to_front()
+        removed = [p for p in self.shuffled_queue if under(p)]
+        if removed:
+            self.shuffled_queue = [p for p in self.shuffled_queue if not under(p)]
+            for item in removed:
+                self.pinned_tracks.discard(item)
+                self.replaceable.discard(item)
+            self.prefetch_upcoming()
+        self.forget_song_caches()
+        self._queue_changed()
+        return len(removed)
+
     def check_rotation_for_hour(self):
         """Called every second: when the hour turns over, swap to that hour's rotation live."""
         if not self.has_rotations():
@@ -4071,7 +4477,7 @@ class RotationEngine:
         busy = {self.deck_a.current_track_path, self.deck_b.current_track_path}
         queued = set(self.shuffled_queue) - set(prefix)
         pool = list(self._fit_pool[1])
-        if len(pool) < 60:
+        if len(pool) < 60 and not self.scheduled_mode():
             have = set(pool)
             pool += [p for p in self.ranked_borrow_pool() if p not in have][:250]      # a small volume: borrow from the others, longest-waiting volumes first
         found = [p for p in pool if p not in busy and p not in queued and not self.rule_problem(p)]
@@ -4079,7 +4485,7 @@ class RotationEngine:
         rotation = self.rotation_library.find(rotation_id) if self.rotation_library else None
         if rotor is not None and rotation is not None and len(found) > 60:
             # Favor songs from the folders that have waited longest, so the swaps keep every folder in turn.
-            waited = sorted(found, key=lambda p: rotor.last_scheduled(rotation.id, folder_group(p, rotation.folder)))
+            waited = sorted(found, key=lambda p: rotor.last_scheduled(rotation.id, rotation.group_of(p)))
             found = waited[:max(40, int(len(found) * 0.7))]
         return found
 
@@ -4103,11 +4509,25 @@ class RotationEngine:
     def borrow_pool(self):
         """Every song of every rotation (refreshed every ten minutes), for when the hour's own volume runs short."""
         now = time.time()
-        if now - self._borrow_cache[0] < 600 and self._borrow_cache[1]:
+        if (now - self._borrow_cache[0] < 600 and self._borrow_cache[1]
+                and not (self.scheduled_mode() and getattr(self, "_borrow_rotation", None) != self.active_rotation_id)):
             return self._borrow_cache[1]
         found = []
         seen = set()
         owner = {}
+        if self.scheduled_mode():
+            # Only the music of the rotation on air this hour: songs from any other rotation or folder never get swapped in.
+            rotation = self.rotation_library.find(self.active_rotation_id) if self.rotation_library is not None else None
+            if rotation is not None:
+                try:
+                    found = list(rotation.track_paths())
+                except Exception:
+                    found = []
+                owner = {p: rotation.id for p in found}
+            self._borrow_owner = owner
+            self._borrow_cache = (now, found)
+            self._borrow_rotation = self.active_rotation_id
+            return found
         if self.rotation_library is not None:
             for rotation in sorted(self.rotation_library.rotations, key=lambda r: bool(getattr(r, "mix", False))):
                 try:
@@ -9414,22 +9834,186 @@ class QueueList(QListWidget):
             self.setCurrentRow(max(0, min(row, self.count() - 1)))
 
 
+SANDWICH_SLOTS = ((":00", "Top of the hour"), (":15", "Quarter past"), (":30", "Half past"),
+                  (":45", "Quarter to"), ("ad_break_folder", "Commercials"))
+
+
+def sandwich_lines(settings):
+    """The break folders every rotation uses (set on the Jingles & Scheduler page): where each one points."""
+    lines = []
+    for key, title in SANDWICH_SLOTS:
+        folder = str(settings.value(key, "") or "")
+        lines.append(f"{title}: {folder if folder else 'no folder chosen'}")
+    return lines
+
+
+class RotationDialog(QDialog):
+    """A rotation: its name and the music categories it plays. The breaks come from the station folders."""
+
+    def __init__(self, app, rotation=None):
+        super().__init__(app)
+        self.app = app
+        self.rotation = rotation
+        self.setWindowTitle("New rotation" if rotation is None else f"Rotation: {rotation.name}")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        self.name_edit = QLineEdit(rotation.name if rotation is not None else "")
+        self.name_edit.setAccessibleName("Rotation name")
+        form.addRow("Name:", self.name_edit)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Music categories this rotation plays. Tick one or more; with several, they take turns:"))
+        self.category_list = QListWidget()
+        self.category_list.setAccessibleName("Music categories. Press Space to tick or untick.")
+        chosen = set(rotation.category_ids) if rotation is not None else set()
+        for category in app.category_library.music_categories():
+            item = QListWidgetItem(f"{category['name']} - {category['folder']}")
+            item.setData(Qt.ItemDataRole.UserRole, category["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if category["id"] in chosen else Qt.CheckState.Unchecked)
+            self.category_list.addItem(item)
+        layout.addWidget(self.category_list)
+        if not app.category_library.music_categories():
+            layout.addWidget(QLabel("There are no music categories yet. Close this, open the Categories page, "
+                                    "choose New Category, name it, pick its folder and type Music, and save."))
+        breaks = QLabel("The breaks in every hour come from your station folders and are placed in this rotation "
+                        "automatically:\n" + "\n".join(sandwich_lines(app.settings)))
+        breaks.setWordWrap(True)
+        breaks.setAccessibleName("Break folders used by this rotation")
+        breaks.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(breaks)
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAccessibleName("Problems")
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        save = QPushButton("Save Rotation")
+        save.setDefault(True)
+        save.clicked.connect(self.try_save)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def chosen_ids(self):
+        ids = []
+        for row in range(self.category_list.count()):
+            item = self.category_list.item(row)
+            if item.checkState() == Qt.CheckState.Checked:
+                ids.append(item.data(Qt.ItemDataRole.UserRole))
+        return ids
+
+    def show_error(self, text):
+        self.error_label.setText(text)
+        if text:
+            self.app.announce(text)
+
+    def try_save(self):
+        if not self.name_edit.text().strip():
+            self.show_error("Give the rotation a name.")
+            return
+        if not self.chosen_ids():
+            self.show_error("Tick at least one music category.")
+            return
+        self.accept()
+
+
+class CategoryDialog(QDialog):
+    """A category: a title, a folder and what is in it. Save, and it is ready to use."""
+
+    TYPES = (("Music", "music"), ("Jingles", "jingle"), ("Sweepers", "sweeper"), ("Ads (commercials)", "ad"))
+
+    def __init__(self, app, category=None):
+        super().__init__(app)
+        self.app = app
+        self.category = category
+        self.setWindowTitle("New category" if category is None else f"Category: {category['name']}")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        self.name_edit = QLineEdit(category["name"] if category else "")
+        self.name_edit.setAccessibleName("Category title")
+        form.addRow("Title:", self.name_edit)
+        self.type_combo = QComboBox()
+        self.type_combo.setAccessibleName("What is in this folder")
+        for label, value in self.TYPES:
+            self.type_combo.addItem(label, value)
+        if category:
+            self.type_combo.setCurrentIndex(max(0, self.type_combo.findData(category["type"])))
+        form.addRow("This category is:", self.type_combo)
+        self.folder_edit = QLineEdit(category["folder"] if category else "")
+        self.folder_edit.setAccessibleName("Folder of this category")
+        form.addRow("Folder:", self.folder_edit)
+        layout.addLayout(form)
+        browse = QPushButton("Choose Folder...")
+        browse.clicked.connect(self.browse)
+        layout.addWidget(browse)
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAccessibleName("Problems")
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        save = QPushButton("Save Category")
+        save.setDefault(True)
+        save.clicked.connect(self.try_save)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def browse(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose the folder", self.folder_edit.text())
+        if folder:
+            self.folder_edit.setText(folder)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(pretty_folder_name(os.path.basename(os.path.normpath(folder))))
+            if self.category is None:
+                guess = guess_category_type(os.path.basename(os.path.normpath(folder)))
+                words = folder_words(os.path.basename(os.path.normpath(folder)))
+                if words & (AD_WORDS | SWEEPER_WORDS | JINGLE_WORDS):
+                    self.type_combo.setCurrentIndex(max(0, self.type_combo.findData(guess)))
+
+    def values(self):
+        return (self.name_edit.text().strip(), self.type_combo.currentData(), self.folder_edit.text().strip())
+
+    def show_error(self, text):
+        self.error_label.setText(text)
+        if text:
+            self.app.announce(text)
+
+    def try_save(self):
+        name, _kind, folder = self.values()
+        if not name:
+            self.show_error("Give the category a title.")
+            return
+        if not folder or not os.path.isdir(folder):
+            self.show_error("Choose a folder that exists.")
+            return
+        self.accept()
+
+
 class RotationsTab(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
         layout = QVBoxLayout()
-        info = QLabel("Rotations: each one is a folder of music. Point the music library at a folder and one "
-                      "rotation is made per subfolder automatically.")
+        info = QLabel("Rotations: a rotation is the music of one or more music categories. The breaks (top of the hour, "
+                      "quarter past, half past, quarter to and commercials) are placed in it automatically from your "
+                      "station folders. Make a rotation, give it a name and tick its music categories. Then put it "
+                      "in a schedule on the Schedule page. Nothing is built for you.")
         info.setWordWrap(True)
+        info.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(info)
         self.list = QListWidget()
         self.list.setAccessibleName("Rotations list")
+        self.list.itemActivated.connect(lambda _item: self.edit_selected())
         layout.addWidget(self.list)
-        for text, handler in (("Set Music Library Folder (builds rotations)", app.set_library_folder),
-                              ("New Rotation (Ctrl+N)", self.new_rotation),
-                              ("Rename Selected", self.rename_selected),
-                              ("Change Folder of Selected", self.change_folder),
+        for text, handler in (("New Rotation (Ctrl+N)", self.new_rotation),
+                              ("Edit Name And Categories Of Selected (Enter)", self.edit_selected),
                               ("Remove Selected", self.remove_selected),
                               ("Import M3U Playlist Into Queue", app.import_m3u),
                               ("Export Queue as M3U Playlist", app.export_m3u)):
@@ -9445,8 +10029,12 @@ class RotationsTab(QWidget):
         self.list.clear()
         for rotation in self.app.rotation_library.rotations:
             count = len(rotation.track_paths())
-            kind = "automatic" if rotation.auto else "manual"
-            self.list.addItem(f"{rotation.name}: {count} tracks, {kind}, {rotation.folder}")
+            if rotation.category_ids:
+                names = ", ".join(c["name"] for c in rotation.categories()) or "no category found"
+                self.list.addItem(f"{rotation.name}: {count} songs from {names}")
+            else:
+                self.list.addItem(f"{rotation.name}: {count} songs, older rotation made from the folder {rotation.folder}. "
+                                  "It goes away when you save your first schedule.")
         if self.list.count():
             self.list.setCurrentRow(max(0, min(row, self.list.count() - 1)))
 
@@ -9456,41 +10044,31 @@ class RotationsTab(QWidget):
         return rotations[row] if 0 <= row < len(rotations) else None
 
     def new_rotation(self):
-        folder = QFileDialog.getExistingDirectory(self, "Choose the folder for the new rotation")
-        if not folder:
+        dialog = RotationDialog(self.app)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        default = pretty_folder_name(os.path.basename(os.path.normpath(folder)))
-        name, ok = QInputDialog.getText(self, "New rotation", "Rotation name:", text=default)
-        if ok and name.strip():
-            rotation = self.app.rotation_library.add_rotation(name.strip(), folder, True, auto=False)
-            self.app.normalizer.start(rotation.track_paths())
-            self.app.update_status(f"Rotation {rotation.name} added. The schedule was rebuilt.")
+        self.app.create_rotation(dialog.name_edit.text().strip(), dialog.chosen_ids())
 
-    def rename_selected(self):
+    def edit_selected(self):
         rotation = self.selected()
         if rotation is None:
             return
-        name, ok = QInputDialog.getText(self, "Rename rotation", "New name:", text=rotation.name)
-        if ok and name.strip():
-            self.app.rotation_library.rename_rotation(rotation.id, name.strip())
-
-    def change_folder(self):
-        rotation = self.selected()
-        if rotation is None:
+        dialog = RotationDialog(self.app, rotation)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        folder = QFileDialog.getExistingDirectory(self, "Choose the new folder", rotation.folder)
-        if folder:
-            self.app.rotation_library.set_rotation_folder(rotation.id, folder)
-            self.app.normalizer.start(rotation.track_paths())
+        self.app.update_rotation(rotation, dialog.name_edit.text().strip(), dialog.chosen_ids())
 
     def remove_selected(self):
         rotation = self.selected()
         if rotation is None:
             return
+        used = [e["name"] for e in self.app.event_library.events
+                if any(i["rotation_id"] == rotation.id for i in self.app.event_library.entries_of(e))]
+        extra = f" It is used by the schedule {', '.join(used)}, which will no longer play it." if used else ""
         answer = QMessageBox.question(self, "Remove rotation",
-                                      f"Remove the rotation {rotation.name}? Your music files are not touched.")
+                                      f"Remove the rotation {rotation.name}? Your music files are not touched.{extra}")
         if answer == QMessageBox.StandardButton.Yes:
-            self.app.rotation_library.remove_rotation(rotation.id)
+            self.app.remove_rotation(rotation)
 
 
 class ScheduleTab(QWidget):
@@ -9568,23 +10146,25 @@ class ScheduleTab(QWidget):
 
 
 class CategoriesTab(QWidget):
-    TYPE_CHOICES = (("Music (makes a rotation and a dated schedule)", "music"), ("Jingles", "jingle"),
+    TYPE_CHOICES = (("Music (a rotation plays it)", "music"), ("Jingles", "jingle"),
                     ("Sweepers", "sweeper"), ("Ads", "ad"))
 
     def __init__(self, app):
         super().__init__()
         self.app = app
         layout = QVBoxLayout()
-        info = QLabel("Categories: every folder of music, jingles, sweepers and ads. Music folders also make a "
-                      "rotation. A newly imported category plays nowhere until you switch it on or put it in a "
-                      "dated schedule, so holiday music and jingles stay off the air until you schedule them. "
-                      "Change a category's folder and everything that uses it follows.")
+        info = QLabel("Categories: choose New Category, give it a title, point it at a folder, say what is in it (music, "
+                      "jingles, sweepers or ads) and save. A music category plays once a rotation uses it: make the "
+                      "rotation on the Rotations page. Change a category's folder and the old songs leave the queue "
+                      "and the new ones come in.")
         info.setWordWrap(True)
+        info.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(info)
         self.list = QListWidget()
         self.list.setAccessibleName("Categories list")
         layout.addWidget(self.list)
-        for text, handler in (("Import Category Folder (Ctrl+N)", self.import_folder),
+        for text, handler in (("New Category (Ctrl+N)", self.new_category),
+                              ("Import Several Category Folders At Once", self.import_folder),
                               ("Change Folder of Selected", self.change_folder),
                               ("Switch Selected On Or Off In The Regular Schedule", self.toggle_active),
                               ("Rename Selected", self.rename_selected),
@@ -9610,6 +10190,13 @@ class CategoriesTab(QWidget):
         cats = self.app.category_library.categories
         return cats[row] if 0 <= row < len(cats) else None
 
+    def new_category(self):
+        dialog = CategoryDialog(self.app)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, kind, folder = dialog.values()
+        self.app.create_category(name, kind, folder)
+
     def import_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Import a category folder")
         if not folder:
@@ -9626,7 +10213,7 @@ class CategoriesTab(QWidget):
             self.app.update_status("No audio files found in that folder, so no category was made.")
             return
         names = ", ".join(f"{c['name']} ({c['type']})" for c in added)
-        extra = " Each music folder also made a rotation and a draft dated schedule; nothing plays until you schedule it." \
+        extra = " Make a rotation from it on the Rotations page; nothing plays until a schedule uses that rotation." \
             if kind == "music" else " It stays off the air until you switch it on or use it in a dated schedule."
         self.app.announce(f"Imported {names}.{extra}")
 
@@ -9641,6 +10228,9 @@ class CategoriesTab(QWidget):
     def toggle_active(self):
         category = self.selected()
         if category is None:
+            return
+        if category.get("type") == "music":
+            self.app.announce("A music category plays in every rotation that lists it. Change that on the Rotations page.")
             return
         self.app.set_category_active(category, not self.app.category_library.is_active(category))
 
@@ -9667,8 +10257,15 @@ class CategoriesTab(QWidget):
 
     def remove_selected(self):
         category = self.selected()
-        if category is not None:
-            self.app.category_library.remove(category["id"])
+        if category is None:
+            return
+        users = [r.name for r in self.app.rotation_library.rotations_using(category["id"])]
+        extra = f" It is used by the rotation {', '.join(users)}, which will no longer play it." if users else ""
+        answer = QMessageBox.question(self, "Remove category",
+                                      f"Remove the category {category['name']}? Your files are not touched. "
+                                      f"Its songs leave the queue.{extra}")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.app.remove_category(category)
 
 
 class ShortcutsTab(QWidget):
@@ -9952,8 +10549,8 @@ def break_window_seconds(settings):
 
 WIZARD_STEPS = [
     ("music_library_folder", "Music folder",
-     "Choose the folder that holds your music. Every subfolder inside it becomes its own rotation, "
-     "and a 24 hour schedule is built from them."),
+     "Choose the folder that holds your music. It is saved as the music category Music library. "
+     "Nothing is built for you: make a rotation from it on the Rotations page, then put the rotation in a schedule."),
     (":00", "Top of the hour",
      "Choose the folder of top of the hour jingles and legal station identification. "
      "They play at the start of every hour."),
@@ -11843,8 +12440,18 @@ class HourDetailDialog(QDialog):
             self.rotation_combo.addItem(rotation.name, rotation.id)
         current = app.rotation_schedule.hours[hour % 24]
         self.rotation_combo.setCurrentIndex(max(0, self.rotation_combo.findData(current)))
+        self.from_schedule = app.rotation_schedule.scheduled_mode()
+        if self.from_schedule:
+            self.rotation_combo.setEnabled(False)
+            self.rotation_combo.setAccessibleName("Rotation for this hour comes from the schedule")
         form = QFormLayout()
         form.addRow("Rotation:", self.rotation_combo)
+        if self.from_schedule:
+            note = QLabel("The rotation for this hour comes from your schedules. Change it on the schedule. "
+                          "Here you can change which breaks run.")
+            note.setWordWrap(True)
+            note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            form.addRow(note)
         self.scope_combo = QComboBox()
         self.scope_combo.setAccessibleName("Where this change applies")
         self.scope_combo.addItem("This hour only", "hour")
@@ -11916,7 +12523,7 @@ class HourDetailDialog(QDialog):
         flags = [c.isChecked() for c in self.mark_checks]
         hours = self.hours_in_scope()
         for h in hours:
-            if rotation_id:
+            if rotation_id and not self.from_schedule:
                 self.app.rotation_schedule.hours[h % 24] = rotation_id
             self.app.break_marks.grid[h % 24] = [1 if f else 0 for f in flags]
         self.app.rotation_schedule.save()
@@ -11927,28 +12534,118 @@ class HourDetailDialog(QDialog):
         self.app.announce(f"Schedule updated for {len(hours)} hour(s).")
 
 
-class EventDialog(QDialog):
-    """A dated schedule: when it starts and ends, what plays, and whether it comes back every year."""
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+               "October", "November", "December")
+
+
+class DatePicker(QWidget):
+    """Month, day and year, each its own box, so it reads clearly and works from the keyboard."""
+
+    def __init__(self, name, day):
+        super().__init__()
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.month = QComboBox()
+        self.month.setAccessibleName(f"{name} month")
+        for number, month in enumerate(MONTH_NAMES, 1):
+            self.month.addItem(month, number)
+        self.day = QSpinBox()
+        self.day.setRange(1, 31)
+        self.day.setAccessibleName(f"{name} day")
+        self.year = QSpinBox()
+        self.year.setRange(2000, 2100)
+        self.year.setAccessibleName(f"{name} year")
+        row.addWidget(self.month)
+        row.addWidget(self.day)
+        row.addWidget(self.year)
+        self.setLayout(row)
+        self.set_date(day)
+
+    def set_date(self, day):
+        self.month.setCurrentIndex(day.month - 1)
+        self.day.setValue(day.day)
+        self.year.setValue(day.year)
+
+    def value(self):
+        """The chosen date, or None when it does not exist (for example February 30)."""
+        try:
+            return datetime(self.year.value(), self.month.currentData(), self.day.value()).date()
+        except ValueError:
+            return None
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        for part in (self.month, self.day, self.year):
+            part.setEnabled(enabled)
+
+
+class ScheduleDialog(QDialog):
+    """A named schedule: the rotations it plays (with their hours), and either no dates (the everyday schedule)
+    or a start and an end date. The 'default schedule' box is filled in by the program."""
 
     def __init__(self, app, event):
         super().__init__(app)
         self.app = app
         self.event = event
-        self.setWindowTitle(f"Dated schedule: {event.get('name', '')}")
+        library = app.event_library
+        self.entries = [dict(e) for e in library.entries_of(event)]
+        self.setWindowTitle(f"Schedule: {event.get('name', '')}")
         self.setModal(True)
         layout = QVBoxLayout()
         form = QFormLayout()
         self.name_edit = QLineEdit(event.get("name", ""))
         self.name_edit.setAccessibleName("Schedule name")
         form.addRow("Name:", self.name_edit)
+        layout.addLayout(form)
 
-        self.rotation_combo = QComboBox()
-        self.rotation_combo.setAccessibleName("Rotation to play")
-        for rotation in app.rotation_library.rotations:
-            self.rotation_combo.addItem(rotation.name, rotation.id)
-        self.rotation_combo.setCurrentIndex(max(0, self.rotation_combo.findData(event.get("rotation_id"))))
-        form.addRow("Rotation:", self.rotation_combo)
+        layout.addWidget(QLabel("Rotations in this schedule and the hours each one plays:"))
+        self.entry_list = QListWidget()
+        self.entry_list.setAccessibleName("Rotations in this schedule")
+        layout.addWidget(self.entry_list)
+        buttons = QHBoxLayout()
+        for text, handler in (("Add Rotation", self.add_entry), ("Change Hours Of Selected", self.edit_hours),
+                              ("Remove Selected", self.remove_entry)):
+            btn = QPushButton(text)
+            btn.clicked.connect(handler)
+            buttons.addWidget(btn)
+        layout.addLayout(buttons)
+        self.hours_help = QLabel("Hours: all, or for example 0-5 (midnight through the end of 5 AM), 22-5 (10 PM through "
+                                 "5 AM) or 6-9, 22-23.")
+        self.hours_help.setWordWrap(True)
+        self.hours_help.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(self.hours_help)
 
+        has_default = library.default_event() is not None
+        is_dated = bool(event.get("start")) or (not event.get("default") and has_default
+                                               and library.default_event()["id"] != event["id"])
+        self.dated_check = QCheckBox("Run only between two dates (leave this unticked for the everyday schedule that "
+                                     "plays whenever nothing else is scheduled)")
+        self.dated_check.setChecked(is_dated)
+        self.dated_check.toggled.connect(self.on_dated)
+        layout.addWidget(self.dated_check)
+        today = datetime.now().date()
+        start = parse_moment(event.get("start"))
+        end = parse_moment(event.get("end"))
+        self.start_picker = DatePicker("Start", start.date() if start else today)
+        self.end_picker = DatePicker("End", end.date() if end else (start.date() if start else today))
+        date_form = QFormLayout()
+        date_form.addRow("Starts on:", self.start_picker)
+        date_form.addRow("Ends on (all of that day):", self.end_picker)
+        layout.addLayout(date_form)
+        self.repeat_check = QCheckBox("Repeat every year (it comes back by itself as the season gets close)")
+        self.repeat_check.setChecked(bool(event.get("repeat")))
+        layout.addWidget(self.repeat_check)
+
+        self.default_check = QCheckBox("Default schedule (the program ticks this for you while this schedule is on air)")
+        self.default_check.setChecked(bool(library.find(event["id"]) and library.is_default_now(event)))
+        self._default_state = self.default_check.isChecked()
+        self.default_check.clicked.connect(self.keep_default_box)      # you can reach it and hear it, but only the program ticks it
+        self.default_check.setAccessibleName("Default schedule box, set by the program: "
+                                             + ("checked, this schedule is on air now" if self.default_check.isChecked()
+                                                else "not checked, this schedule is not on air now"))
+        layout.addWidget(self.default_check)
+
+        more = QFormLayout()
         self.jingle_combo = QComboBox()
         self.jingle_combo.setAccessibleName("Jingles for this schedule")
         self.jingle_combo.addItem("The regular jingles", None)
@@ -11956,7 +12653,7 @@ class EventDialog(QDialog):
             if c["type"] in ("jingle", "sweeper"):
                 self.jingle_combo.addItem(c["name"], c["id"])
         self.jingle_combo.setCurrentIndex(max(0, self.jingle_combo.findData(event.get("jingle_category_id"))))
-        form.addRow("Jingles:", self.jingle_combo)
+        more.addRow("Jingles:", self.jingle_combo)
         self.ad_combo = QComboBox()
         self.ad_combo.setAccessibleName("Ads for this schedule")
         self.ad_combo.addItem("The regular ads", None)
@@ -11964,52 +12661,14 @@ class EventDialog(QDialog):
             if c["type"] == "ad":
                 self.ad_combo.addItem(c["name"], c["id"])
         self.ad_combo.setCurrentIndex(max(0, self.ad_combo.findData(event.get("ad_category_id"))))
-        form.addRow("Ads:", self.ad_combo)
-
-        start = parse_moment(event.get("start")) or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        end = parse_moment(event.get("end")) or start.replace(hour=23, minute=45)
-        self.start_date, self.start_time = QComboBox(), QComboBox()
-        self.end_date, self.end_time = QComboBox(), QComboBox()
-        today = datetime.now().date()
-        days = [today + timedelta(days=i) for i in range(731)]
-        for needed in (start.date(), end.date()):
-            if needed not in days:
-                days.append(needed)
-        days.sort()
-        for combo, name in ((self.start_date, "Start date"), (self.end_date, "End date")):
-            combo.setAccessibleName(name)
-            for day in days:
-                combo.addItem(date_label(day), day)
-        for combo, name in ((self.start_time, "Start time"), (self.end_time, "End time")):
-            combo.setAccessibleName(name)
-            for minutes in range(0, 24 * 60, 15):
-                combo.addItem(time_label(minutes), minutes)
-        self.start_date.setCurrentIndex(self.start_date.findData(start.date()))
-        self.end_date.setCurrentIndex(self.end_date.findData(end.date()))
-        self.start_time.setCurrentIndex(self.start_time.findData(start.hour * 60 + start.minute // 15 * 15))
-        self.end_time.setCurrentIndex(self.end_time.findData(end.hour * 60 + end.minute // 15 * 15))
-        form.addRow("Start date:", self.start_date)
-        form.addRow("Start time:", self.start_time)
-        form.addRow("End date:", self.end_date)
-        form.addRow("End time:", self.end_time)
-        layout.addLayout(form)
-
-        self.one_day_check = QCheckBox("Just one day (the end date follows the start date)")
-        self.one_day_check.setChecked(bool(event.get("start")) and start.date() == end.date())
-        self.one_day_check.toggled.connect(self.on_one_day)
-        self.start_date.currentIndexChanged.connect(self.on_start_date_changed)
-        layout.addWidget(self.one_day_check)
-        self.repeat_check = QCheckBox("Repeat every year (it comes back by itself as the season gets close)")
-        self.repeat_check.setChecked(bool(event.get("repeat")))
-        layout.addWidget(self.repeat_check)
-        voice_form = QFormLayout()
+        more.addRow("Ads:", self.ad_combo)
         self.voice_combo = QComboBox()
         self.voice_combo.setAccessibleName("Voice tracking")
         self.voice_combo.addItem("No voice tracking", False)
         self.voice_combo.addItem("Voice tracking: a voice track slot after every 3 songs", True)
         self.voice_combo.setCurrentIndex(1 if event.get("voice") else 0)
-        voice_form.addRow("Voice tracking:", self.voice_combo)
-        layout.addLayout(voice_form)
+        more.addRow("Voice tracking:", self.voice_combo)
+        layout.addLayout(more)
         layout.addWidget(QLabel("Breaks that run while this schedule is on:"))
         self.mark_checks = []
         marks = (list(event.get("marks", [1, 1, 1, 1])) + [1, 1, 1, 1])[:4]
@@ -12022,57 +12681,193 @@ class EventDialog(QDialog):
         self.error_label.setWordWrap(True)
         self.error_label.setAccessibleName("Problems")
         layout.addWidget(self.error_label)
-        buttons = QHBoxLayout()
+        row = QHBoxLayout()
         ok = QPushButton("Save Schedule")
         ok.setDefault(True)
         ok.clicked.connect(self.try_save)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
-        buttons.addWidget(ok)
-        buttons.addWidget(cancel)
-        layout.addLayout(buttons)
-        self.setLayout(layout)
-        self.on_one_day(self.one_day_check.isChecked())
+        row.addWidget(ok)
+        row.addWidget(cancel)
+        inner = QWidget()
+        inner.setLayout(layout)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout()
+        outer.addWidget(scroll, 1)
+        outer.addLayout(row)
+        self.setLayout(outer)
+        self.resize(700, 640)
+        self.on_dated(self.dated_check.isChecked())
+        self.refresh_entries()
 
-    def on_one_day(self, checked):
-        self.end_date.setEnabled(not checked)
-        if checked:
-            self.end_date.setCurrentIndex(self.start_date.currentIndex())
+    def show_error(self, text):
+        self.error_label.setText(text)
+        if text:
+            self.app.announce(text)
 
-    def on_start_date_changed(self, _index):
-        if self.one_day_check.isChecked():
-            self.end_date.setCurrentIndex(self.start_date.currentIndex())
+    def keep_default_box(self, _checked=False):
+        self.default_check.setChecked(self._default_state)
+        self.show_error("The program ticks the default schedule box by itself. It is checked while this schedule is on air.")
+
+    def on_dated(self, checked):
+        self.start_picker.setEnabled(checked)
+        self.end_picker.setEnabled(checked)
+        self.repeat_check.setEnabled(checked)
+
+    def refresh_entries(self):
+        row = self.entry_list.currentRow()
+        self.entry_list.clear()
+        for item in self.entries:
+            rotation = self.app.rotation_library.find(item["rotation_id"])
+            name = rotation.name if rotation else "(a rotation that was removed)"
+            self.entry_list.addItem(f"{name}: {hours_text(item['hours'])}")
+        if self.entry_list.count():
+            self.entry_list.setCurrentRow(max(0, min(row, self.entry_list.count() - 1)))
+
+    def add_entry(self):
+        rotations = self.app.rotation_library.rotations
+        if not rotations:
+            self.show_error("There are no rotations yet. Make one on the Rotations page first.")
+            return
+        names = [r.name for r in rotations]
+        choice, ok = QInputDialog.getItem(self, "Add a rotation", "Rotation:", names, 0, False)
+        if not ok:
+            return
+        rotation = rotations[names.index(choice)]
+        default_hours = "all" if not self.entries else ""
+        hours, ok = QInputDialog.getText(self, "Hours", "Hours it plays (all, or for example 0-5 or 6-9, 22-23):",
+                                         text=default_hours or "all")
+        if not ok:
+            return
+        if parse_hour_set(hours) is None:
+            self.show_error(f"The hours '{hours}' are not clear. Use all, or for example 0-5, or 6-9, 22-23.")
+            return
+        self.entries.append({"rotation_id": rotation.id, "hours": hours.strip() or "all"})
+        self.show_error("")
+        self.refresh_entries()
+
+    def edit_hours(self):
+        row = self.entry_list.currentRow()
+        if not (0 <= row < len(self.entries)):
+            return
+        hours, ok = QInputDialog.getText(self, "Hours", "Hours it plays (all, or for example 0-5 or 6-9, 22-23):",
+                                         text=self.entries[row]["hours"])
+        if not ok:
+            return
+        if parse_hour_set(hours) is None:
+            self.show_error(f"The hours '{hours}' are not clear. Use all, or for example 0-5, or 6-9, 22-23.")
+            return
+        self.entries[row]["hours"] = hours.strip() or "all"
+        self.show_error("")
+        self.refresh_entries()
+
+    def remove_entry(self):
+        row = self.entry_list.currentRow()
+        if 0 <= row < len(self.entries):
+            del self.entries[row]
+            self.refresh_entries()
 
     def build_values(self):
-        s_day, e_day = self.start_date.currentData(), self.end_date.currentData()
-        s_min, e_min = self.start_time.currentData(), self.end_time.currentData()
-        start = datetime(s_day.year, s_day.month, s_day.day, s_min // 60, s_min % 60)
-        end = datetime(e_day.year, e_day.month, e_day.day, e_min // 60, e_min % 60)
-        return {"name": self.name_edit.text().strip() or "Dated schedule",
-                "rotation_id": self.rotation_combo.currentData(),
-                "jingle_category_id": self.jingle_combo.currentData(),
-                "ad_category_id": self.ad_combo.currentData(),
-                "start": format_moment(start), "end": format_moment(end),
-                "repeat": self.repeat_check.isChecked(), "voice": bool(self.voice_combo.currentData()),
-                "marks": [1 if c.isChecked() else 0 for c in self.mark_checks]}
+        dated = self.dated_check.isChecked()
+        values = {"name": self.name_edit.text().strip() or "Schedule",
+                  "default": not dated,
+                  "jingle_category_id": self.jingle_combo.currentData(),
+                  "ad_category_id": self.ad_combo.currentData(),
+                  "repeat": bool(dated and self.repeat_check.isChecked()),
+                  "voice": bool(self.voice_combo.currentData()),
+                  "marks": [1 if c.isChecked() else 0 for c in self.mark_checks]}
+        if dated:
+            first, last = self.start_picker.value(), self.end_picker.value()
+            if first is None or last is None:
+                return None, "One of those dates does not exist. Check the day of the month."
+            values["start"] = format_moment(datetime(first.year, first.month, first.day, 0, 0))
+            values["end"] = format_moment(datetime(last.year, last.month, last.day, 23, 59))
+        else:
+            values["start"] = values["end"] = ""
+        return values, ""
 
     def try_save(self):
-        values = self.build_values()
+        values, problem = self.build_values()
+        if values is None:
+            self.show_error(problem)
+            return
         probe = dict(self.event)
         probe.update(values)
-        problem = self.app.event_library.validate(probe)
+        library = self.app.event_library
+        library.set_entries(probe, self.entries)
+        problem = library.validate(probe)
         if problem:
-            self.error_label.setText(problem)
+            self.show_error(problem)
             return
-        if not probe.get("rotation_id"):
-            self.error_label.setText("Choose a rotation.")
-            return
+        if probe.get("default"):
+            missing = library.uncovered_hours(probe)
+            if missing:
+                self.show_error("The everyday schedule has to cover every hour, and these hours have no rotation: "
+                                         + ", ".join(hour_label(h) for h in missing[:8]) + (", ..." if len(missing) > 8 else "")
+                                         + ". Add a rotation for them, or give it hours of all.")
+                return
         self.event.update(values)
+        library.set_entries(self.event, self.entries)
         self.accept()
 
 
+class GenerateScheduleDialog(QDialog):
+    """Ctrl+Alt+C: rebuild today's or tomorrow's playlists (and, for today, the queue) from the schedules."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.setWindowTitle("Generate schedule")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        today = datetime.now().date()
+        self.day_combo = QComboBox()
+        self.day_combo.setAccessibleName("Which day to generate")
+        self.day_combo.addItem(f"Today, {date_label(today)}", today)
+        tomorrow = today + timedelta(days=1)
+        self.day_combo.addItem(f"Tomorrow, {date_label(tomorrow)}", tomorrow)
+        form = QFormLayout()
+        form.addRow("Day:", self.day_combo)
+        layout.addLayout(form)
+        self.plan_label = QLabel("")
+        self.plan_label.setWordWrap(True)
+        self.plan_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(self.plan_label)
+        note = QLabel("Generating rebuilds that day from the schedule on air that day, 0000 through 2300, and replaces every "
+                      "earlier playlist and change for it, including hours that have already passed. For today, the queue is "
+                      "rebuilt from this hour on; the song on the air finishes first.")
+        note.setWordWrap(True)
+        note.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(note)
+        row = QHBoxLayout()
+        go = QPushButton("Generate")
+        go.setDefault(True)
+        go.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(go)
+        row.addWidget(cancel)
+        layout.addLayout(row)
+        self.setLayout(layout)
+        self.day_combo.currentIndexChanged.connect(self.update_plan)
+        self.update_plan()
+
+    def chosen_day(self):
+        return self.day_combo.currentData()
+
+    def update_plan(self, *_args):
+        try:
+            text = self.app.describe_day_plan(self.chosen_day())
+        except Exception:
+            text = ""
+        self.plan_label.setText("That day plays: " + text)
+        self.plan_label.setAccessibleName(self.plan_label.text())
+
+
 class ScheduleTab(QWidget):
-    """The everyday 24-hour schedule (press Enter on an hour for its detail) and the dated schedules."""
+    """Named schedules (the everyday one, and dated ones such as a holiday), and what plays hour by hour today."""
 
     def __init__(self, app):
         super().__init__()
@@ -12081,10 +12876,32 @@ class ScheduleTab(QWidget):
         self.live_label = QLabel("")
         self.live_label.setWordWrap(True)
         self.live_label.setStyleSheet(f"color: {COLOR_ON_AIR_GREEN}; font-weight: bold;")
+        self.live_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(self.live_label)
-        self.table = QTableWidget(24, 4)
-        self.table.setHorizontalHeaderLabels(["Hour", "Rotation", "Breaks", "On air"])
-        self.table.setAccessibleName("24 hour rotation schedule. Press Enter on an hour to change it.")
+        heading = QLabel("Schedules: make a schedule, add its rotations, and give it dates, or no dates for the everyday "
+                         "one. The everyday schedule plays whenever no dated schedule does; a dated one such as a holiday "
+                         "takes over between its dates and the everyday one comes back by itself. Saving builds the days; "
+                         "Generate Schedule (Ctrl+Alt+C) rebuilds today or tomorrow after you change something.")
+        heading.setWordWrap(True)
+        heading.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(heading)
+        self.event_list = QListWidget()
+        self.event_list.setAccessibleName("Schedules")
+        self.event_list.itemActivated.connect(lambda _item: self.edit_event())
+        layout.addWidget(self.event_list)
+        buttons = QHBoxLayout()
+        for text, handler in (("New Schedule", self.add_event), ("Edit Selected (Enter)", self.edit_event),
+                              ("Remove Selected", self.remove_event),
+                              ("Generate Schedule (Ctrl+Alt+C)", self.generate)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+            btn.clicked.connect(handler)
+            buttons.addWidget(btn)
+        layout.addLayout(buttons)
+
+        self.table = QTableWidget(24, 5)
+        self.table.setHorizontalHeaderLabels(["Hour", "Rotation", "Schedule", "Breaks", "On air"])
+        self.table.setAccessibleName("Today by hour. Press Enter on an hour to change its breaks.")
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -12093,6 +12910,11 @@ class ScheduleTab(QWidget):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.hour_menu)
         layout.addWidget(self.table)
+
+        # The older hand-set schedule: only shown while no everyday schedule has been saved.
+        self.legacy_box = QWidget()
+        legacy = QVBoxLayout()
+        legacy.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
         self.rotation_combo = QComboBox()
         self.rotation_combo.setAccessibleName("Rotation to assign")
@@ -12105,51 +12927,40 @@ class ScheduleTab(QWidget):
         assign_all.setStyleSheet(BUTTON_STYLE_CONSOLE)
         assign_all.clicked.connect(self.assign_all)
         row.addWidget(assign_all)
-        layout.addLayout(row)
+        legacy.addLayout(row)
+        regen = QPushButton("Regenerate Schedule Evenly")
+        regen.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        regen.clicked.connect(self.regenerate)
+        legacy.addWidget(regen)
+        self.legacy_box.setLayout(legacy)
+        layout.addWidget(self.legacy_box)
         edit_hour = QPushButton("Edit Selected Hour (Enter)")
         edit_hour.setStyleSheet(BUTTON_STYLE_CONSOLE)
         edit_hour.clicked.connect(lambda: self.open_hour(self.table.currentRow()))
         layout.addWidget(edit_hour)
-        regen = QPushButton("Regenerate Schedule Evenly")
-        regen.setStyleSheet(BUTTON_STYLE_CONSOLE)
-        regen.clicked.connect(self.regenerate)
-        layout.addWidget(regen)
-
-        heading = QLabel("Dated schedules: holidays and one-day shows. They replace the everyday schedule "
-                         "between their dates, then it comes back by itself. Press Enter to edit.")
-        heading.setWordWrap(True)
-        layout.addWidget(heading)
-        self.event_list = QListWidget()
-        self.event_list.setAccessibleName("Dated schedules")
-        self.event_list.itemActivated.connect(lambda _item: self.edit_event())
-        layout.addWidget(self.event_list)
-        buttons = QHBoxLayout()
-        for text, handler in (("Add Dated Schedule", self.add_event), ("Edit Selected (Enter)", self.edit_event),
-                              ("Remove Selected", self.remove_event)):
-            btn = QPushButton(text)
-            btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
-            btn.clicked.connect(handler)
-            buttons.addWidget(btn)
-        layout.addLayout(buttons)
         self.setLayout(layout)
         self.refresh()
 
-    # --- everyday schedule ---
+    # --- today, hour by hour ---
     def refresh(self):
         now = datetime.now()
         now_hour = now.hour
         schedule = self.app.rotation_schedule
         library = self.app.rotation_library
+        events = self.app.event_library
         selected = self.table.currentRow()
         self.rotation_combo.clear()
         for rotation in library.rotations:
             self.rotation_combo.addItem(rotation.name, rotation.id)
+        self.legacy_box.setVisible(not schedule.scheduled_mode())
         for hour in range(24):
             rotation = library.find(schedule.rotation_id_for(now.date(), hour))
+            active = events.active_event(now.date(), hour)
             live = hour == now_hour
             flags = self.app.break_marks.grid[hour]
             marks = " ".join(s for s, f in zip(BreakMarks.SLOTS, flags) if f) or "none"
-            cells = [hour_label(hour), rotation.name if rotation else "(none)", marks, "LIVE NOW" if live else ""]
+            cells = [hour_label(hour), rotation.name if rotation else "(none)", active["name"] if active else "",
+                     marks, "LIVE NOW" if live else ""]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if live:
@@ -12160,10 +12971,15 @@ class ScheduleTab(QWidget):
                 self.table.setItem(hour, col, item)
         self.table.setCurrentCell(selected if selected >= 0 else now_hour, 0)
         live_rotation = library.find(schedule.rotation_id_for(now.date(), now_hour))
-        event = self.app.event_library.event_at(now)
-        self.live_label.setText(f"On air now: {hour_label(now_hour)}, "
-                                f"{live_rotation.name if live_rotation else 'no rotation'}"
-                                + (f" (dated schedule: {event['name']})" if event else ""))
+        active_now = events.active_event(now.date(), now_hour)
+        if schedule.scheduled_mode():
+            self.live_label.setText(f"On air now: {hour_label(now_hour)}, "
+                                    f"{live_rotation.name if live_rotation else 'no rotation'}"
+                                    + (f". Default schedule: {active_now['name']}" if active_now else ". No schedule covers this hour"))
+        else:
+            self.live_label.setText(f"On air now: {hour_label(now_hour)}, "
+                                    f"{live_rotation.name if live_rotation else 'no rotation'}"
+                                    + ". No schedule has been saved yet; the older automatic spread of rotations is in use")
         self.live_label.setAccessibleName(self.live_label.text())
         self.refresh_events()
 
@@ -12176,8 +12992,6 @@ class ScheduleTab(QWidget):
         menu = QMenu(self)
         row = self.table.currentRow()
         menu.addAction("Edit this hour...", lambda: self.open_hour(row))
-        menu.addAction("Assign the chosen rotation to this hour", self.assign_selected)
-        menu.addAction("Assign the chosen rotation to the entire schedule", self.assign_all)
         menu.exec(self.table.viewport().mapToGlobal(position))
 
     def assign_selected(self):
@@ -12205,12 +13019,16 @@ class ScheduleTab(QWidget):
         self.app.rotation.check_rotation_for_hour()
         self.app.update_status("Schedule rebuilt evenly across the 24 hours.")
 
-    # --- dated schedules ---
+    def generate(self):
+        self.app.show_generate_schedule()
+
+    # --- named schedules ---
     def refresh_events(self):
         row = self.event_list.currentRow()
         self.event_list.clear()
-        for event in self.app.event_library.events:
-            self.event_list.addItem(self.app.event_library.describe(event))
+        library = self.app.event_library
+        for event in library.events:
+            self.event_list.addItem(library.describe(event, rotation_library=self.app.rotation_library))
         if self.event_list.count():
             self.event_list.setCurrentRow(max(0, min(row, self.event_list.count() - 1)))
 
@@ -12220,10 +13038,14 @@ class ScheduleTab(QWidget):
         return events[row] if 0 <= row < len(events) else None
 
     def add_event(self):
-        rotations = self.app.rotation_library.rotations
-        draft = {"id": uuid.uuid4().hex[:8], "name": "New schedule", "rotation_id": rotations[0].id if rotations else None,
+        if not self.app.rotation_library.rotations:
+            self.app.announce("There are no rotations yet. Make a rotation on the Rotations page first, then come back here.")
+            return
+        has_default = self.app.event_library.default_event() is not None
+        draft = {"id": uuid.uuid4().hex[:8], "name": "New schedule" if has_default else "Automation",
+                 "rotation_id": None, "entries": [],
                  "jingle_category_id": None, "ad_category_id": None, "start": "", "end": "", "repeat": False,
-                 "voice": False, "marks": [1, 1, 1, 1], "active": False, "created": time.time()}
+                 "voice": False, "marks": [1, 1, 1, 1], "active": False, "default": False, "created": time.time()}
         self.run_event_dialog(draft)
 
     def edit_event(self):
@@ -12232,28 +13054,31 @@ class ScheduleTab(QWidget):
             self.run_event_dialog(event)
 
     def run_event_dialog(self, event):
-        if EventDialog(self.app, event).exec() != QDialog.DialogCode.Accepted:
+        before = self.app.plan_signature()
+        if ScheduleDialog(self.app, event).exec() != QDialog.DialogCode.Accepted:
             return
         library = self.app.event_library
-        was_new = library.find(event["id"]) is None
         problem = library.save_event(event)
         if problem:
             self.app.announce(problem)
             return
         overlaps = library.overlaps(event)
-        note = f" It overlaps {', '.join(overlaps)}; the one created last wins." if overlaps else ""
+        note = f" It overlaps {', '.join(overlaps)}; the one that starts later wins on the days they share." if overlaps else ""
         self.app.announce(f"Schedule {event['name']} saved.{note}")
-        self.app.on_events_changed(event)
+        self.app.on_events_changed(event, before)
 
     def remove_event(self):
         event = self.selected_event()
         if event is None:
             return
-        answer = QMessageBox.question(self, "Remove schedule", f"Remove the schedule {event['name']}?")
+        extra = " It is the everyday schedule, so nothing will be scheduled on days no dated schedule covers." \
+            if event.get("default") else ""
+        answer = QMessageBox.question(self, "Remove schedule", f"Remove the schedule {event['name']}?{extra}")
         if answer == QMessageBox.StandardButton.Yes:
+            before = self.app.plan_signature()
             self.app.event_library.remove(event["id"])
             self.app.announce("Schedule removed.")
-            self.app.on_events_changed(None)
+            self.app.on_events_changed(None, before)
 
 
 class VoiceTrackHourTab(QWidget):
@@ -18725,15 +19550,13 @@ class BroadcastingApp(QWidget):
                     pass
             self.settings.setValue("live365_defaults_v1", "done")
         self.rotation_library = RotationLibrary(self.settings, on_changed=self.on_rotations_changed)
-        _mode = str(self.settings.value("hour_mode", ""))
-        if _mode == "mix" or (_mode not in ("volume", "fixed")
-                              and str(self.settings.value("rotate_all_volumes", "true")).lower() != "false"):
-            self.rotation_library.ensure_mix(str(self.settings.value("music_library_folder", "")))
         self.rotation_schedule = RotationSchedule(self.settings, self.rotation_library)
         self.category_library = CategoryLibrary(self.settings, on_changed=self.on_categories_changed)
+        self.rotation_library.category_library = self.category_library
         self.playlist_generator = PlaylistGenerator(self.settings, self.rotation_library, self.rotation_schedule)
         self.event_library = EventLibrary(self.settings, on_changed=self.refresh_schedule_views)
         self.rotation_schedule.events = self.event_library
+        self._active_schedule_id = self.current_schedule_id()
         self.break_marks = BreakMarks(self.settings, self.event_library)
         self.playlist_generator.events = self.event_library
         self.playlist_generator.marks = self.break_marks
@@ -18820,14 +19643,7 @@ class BroadcastingApp(QWidget):
         RUN_LOG.write("START", "Step 7: sounds ready.")
         self.check_ffmpeg_availability()
         RUN_LOG.write("START", "Step 8: music folder scan.")
-        # Pointing at a music library folder builds one rotation per subfolder.
-        root = self.settings.value("music_library_folder", "")
-        if self.setup_complete() and root and os.path.isdir(root):
-            self._rescan_in_progress = True
-            try:
-                self.rotation_library.sync_from_root(root)
-            finally:
-                self._rescan_in_progress = False
+        # Rotations are made on the Rotations page from music categories; nothing is built from folders by itself.
         self.rotation_schedule.ensure_valid()
         self.rotation_library.detect_new_files()  # first look: remember what is already there
         try:
@@ -19042,6 +19858,7 @@ class BroadcastingApp(QWidget):
             "toggle_recording": self.toggle_recording,
             "new_item": self.new_item,
             "generate_now": self.generate_now,
+            "generate_schedule": self.show_generate_schedule,
             "say_elapsed": self.say_elapsed,
             "say_remaining": self.say_remaining,
             "say_current": self.say_current,
@@ -19130,6 +19947,7 @@ class BroadcastingApp(QWidget):
 
     def apply_setup(self, results):
         """Saves every folder from the wizard and creates the playlist folder. Never starts playback."""
+        previous_root = str(self.settings.value("music_library_folder", "") or "")
         for key, path in results.items():
             if path:
                 self.settings.setValue(key, path)
@@ -19143,12 +19961,7 @@ class BroadcastingApp(QWidget):
         self.settings.setValue("setup_complete", "true")
         root = results.get("music_library_folder", "")
         if root and os.path.isdir(root):
-            self._rescan_in_progress = True
-            try:
-                self.rotation_library.sync_from_root(root)
-            finally:
-                self._rescan_in_progress = False
-            self.rotation_schedule.regenerate_even()
+            self.use_music_library_folder(root, previous_root, quiet=True)
             self.rotation_library.detect_new_files()
         self.rotations_tab.refresh()
         self.schedule_tab.refresh()
@@ -19683,7 +20496,7 @@ class BroadcastingApp(QWidget):
         elif current is self.categories_tab:
             self.categories_tab.import_folder()
         elif current is self.schedule_tab:
-            self.schedule_tab.regenerate()
+            self.schedule_tab.add_event()
         else:
             self.insert_hour_marker()
 
@@ -19963,16 +20776,8 @@ class BroadcastingApp(QWidget):
         """Picks up new songs and new subfolders without rebuilding the schedule."""
         if not self.setup_complete():
             return
-        root = self.settings.value("music_library_folder", "")
         self._rescan_in_progress = True
         try:
-            if root and os.path.isdir(root):
-                added, removed = self.rotation_library.sync_from_root(root)
-                if added:
-                    self.announce("New rotation found: " + ", ".join(added) + ".")
-                    for rotation in self.rotation_library.rotations:
-                        if rotation.name in added:
-                            self.normalizer.start(rotation.track_paths())
             new_files = self.rotation_library.detect_new_files()
         finally:
             self._rescan_in_progress = False
@@ -19991,6 +20796,7 @@ class BroadcastingApp(QWidget):
             self.refresh_status_tree()
             if hour != self.last_schedule_hour:
                 self.last_schedule_hour = hour
+                self.check_schedule_change()
                 self.schedule_tab.refresh()
                 self.on_hour_changed()
             self.maybe_append_next_hour()
@@ -20147,7 +20953,7 @@ class BroadcastingApp(QWidget):
         finally:
             self._pumping = False
 
-    def generate_day(self, day):
+    def generate_day(self, day, announce_result=True):
         """Writes every hour from 0000 through 2300 for that day, replacing earlier playlists for it."""
         if self._generating_day:
             return []
@@ -20159,8 +20965,9 @@ class BroadcastingApp(QWidget):
         self.day_generated.add(day)
         self.write_day_report(day, files)
         hourly = max(0, len(files) - 1)
-        self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, 0000 through 2300: {hourly} hourly "
-                      f"files in {self.playlist_generator.output_folder()}. Earlier playlists for that day were replaced.")
+        if announce_result:
+            self.announce(f"Playlists for {day.strftime('%A %B %d')} saved, 0000 through 2300: {hourly} hourly "
+                          f"files in {self.playlist_generator.output_folder()}. Earlier playlists for that day were replaced.")
         RUN_LOG.write("STATUS", self.playlist_generator.last_timing)
         if self._hour_change_waiting:
             self._hour_change_waiting = False
@@ -20691,37 +21498,81 @@ class BroadcastingApp(QWidget):
 
     # --- categories ---
     def import_category_folder(self, folder, kind):
-        """Music folders also make a rotation and a draft dated schedule. Nothing is switched on."""
+        """Several folders at once: each becomes a category. Nothing is switched on and no rotation is made."""
         library = self.category_library
-        if kind != "music":
-            added = library.import_folder(folder, kind)
-            for category in added:
-                self.normalizer.start(scan_audio_files(category["folder"]))
-            return added
-        added = []
-        for path in library.audio_folders(folder):
-            name = pretty_folder_name(os.path.basename(os.path.normpath(path)))
-            rotation = self.rotation_library.add_rotation(name, path, True, auto=False, notify=False, regular=False)
-            category = library.add_category(path, rotation.name, "music", active=False, rotation_id=rotation.id)
-            added.append(category)
-            self.event_library.add_draft(rotation.name, rotation.id)
-            self.normalizer.start(rotation.track_paths())
+        added = library.import_folder(folder, kind)
+        for category in added:
+            if kind == "music":
+                category["active"] = True
+            self.normalizer.start(scan_audio_files(category["folder"]))
         if added:
             library._changed()
-            self.rotation_library._changed("linked")       # no rebuild of the schedule you made
         return added
 
-    def change_category_folder(self, category, folder):
+    def create_category(self, name, kind, folder):
+        """A new category: a title, a folder and what is in it."""
+        library = self.category_library
+        category = library.add_category(folder, name, kind, active=(kind == "music"))
+        library._changed()
+        files = scan_audio_files(folder)
+        self.normalizer.start(files)
+        if kind == "music":
+            self.announce(f"Category {name} saved: {len(files)} songs. It plays once a rotation uses it: make one on the "
+                          "Rotations page.")
+        else:
+            self.announce(f"Category {name} saved: {len(files)} files. It stays off the air until you switch it on or "
+                          "use it in a dated schedule.")
+        return category
+
+    def category_feeds_today(self, category):
+        """Does this music category play at some hour today?"""
+        today = datetime.now().date()
+        ids = {r.id for r in self.rotation_library.rotations_using(category["id"])}
+        if category.get("rotation_id"):
+            ids.add(category["rotation_id"])
+        if not ids:
+            return False
+        return any(self.rotation_schedule.rotation_id_for(today, h) in ids for h in range(24))
+
+    def change_category_folder(self, category, folder, quiet=False):
+        """The folder of a category is replaced: its old songs leave the queue, the new ones come in."""
+        old = category.get("folder", "")
+        same = os.path.normcase(os.path.normpath(old or "-")) == os.path.normcase(os.path.normpath(folder))
+        removed = 0 if same else self.rotation.remove_songs_under([old])
         category["folder"] = folder
         if category.get("type") == "music" and category.get("rotation_id"):
             self.rotation_library.relink_folder(category["rotation_id"], folder)
-            rotation = self.rotation_library.find(category["rotation_id"])
-            if rotation:
-                self.normalizer.start(rotation.track_paths())
-        else:
-            self.normalizer.start(scan_audio_files(folder))
+        for rotation in self.rotation_library.rotations_using(category["id"]):
+            self.rotation_library.known_files.pop(rotation.id, None)
         self.category_library._changed()
-        self.announce(f"{category['name']} now uses {folder}.")
+        files = scan_audio_files(folder)
+        self.normalizer.start(files)
+        rebuilt = False
+        if category.get("type") == "music" and self.category_feeds_today(category) and not self.voice_only:
+            self.generate_schedule(datetime.now().date(), quiet=True)
+            rebuilt = True
+        self.rotation.forget_song_caches()
+        if not quiet:
+            self.announce(f"{category['name']} now uses {folder}: {len(files)} songs found. "
+                          + ("The songs of the old folder left the queue" if removed else "No songs of the old folder were in the queue")
+                          + (", and the queue was rebuilt with the new music." if rebuilt else "."))
+
+    def remove_category(self, category):
+        """A category is removed: its songs leave the queue and the rotations that played it stop playing it."""
+        folder = category.get("folder", "")
+        feeds = self.category_feeds_today(category)
+        names = self.rotation_library.drop_category(category["id"])
+        legacy_id = category.get("rotation_id")
+        if legacy_id and self.rotation_library.find(legacy_id) and not self.rotation_library.find(legacy_id).category_ids:
+            self.rotation_library.remove_rotation(legacy_id)
+        removed = self.rotation.remove_songs_under([folder])
+        self.category_library.remove(category["id"])
+        if feeds and not self.voice_only:
+            self.generate_schedule(datetime.now().date(), quiet=True)
+        text = f"Category {category['name']} removed. {removed} of its songs left the queue."
+        if names:
+            text += " The rotation " + ", ".join(names) + " no longer plays it."
+        self.announce(text)
 
     def set_category_active(self, category, active):
         self.category_library.set_active(category["id"], active)
@@ -20731,21 +21582,235 @@ class BroadcastingApp(QWidget):
             self.rotation_library.save()
         self.announce(f"{category['name']} is now " + ("in the regular schedule." if active else "off the regular schedule."))
 
-    # --- dated schedules ---
+    # --- the Music library folder setting: one music category that follows it ---
+    def use_music_library_folder(self, folder, previous="", quiet=False):
+        """Choosing (or replacing) the music library folder keeps one music category, 'Music library', pointing at it.
+        Replacing the folder takes the old songs out of the queue; no rotations are built."""
+        library = self.category_library
+        category = next((c for c in library.categories if c.get("library")), None)
+        if category is not None:
+            self.change_category_folder(category, folder, quiet=quiet)
+            return category
+        removed = 0
+        retired = []
+        if previous and os.path.normcase(os.path.normpath(previous)) != os.path.normcase(os.path.normpath(folder)):
+            removed = self.rotation.remove_songs_under([previous])
+            retired = self.rotation_library.remove_under(previous)
+        category = library.add_category(folder, "Music library", "music", active=True)
+        category["library"] = True
+        library._changed()
+        files = scan_audio_files(folder)
+        self.normalizer.start(files)
+        self.rotation.forget_song_caches()
+        if not quiet:
+            text = f"Music library set: {len(files)} songs, saved as the music category Music library."
+            if removed or retired:
+                text += f" The old folder was removed: {removed} of its songs left the queue" \
+                        + (f" and {len(retired)} older rotation(s) built from it went away." if retired else ".")
+            text += " Make a rotation from it on the Rotations page, then put the rotation in a schedule."
+            self.announce(text)
+        return category
+
+    # --- rotations ---
+    def create_rotation(self, name, category_ids):
+        rotation = self.rotation_library.add_rotation(name, "", True, auto=False, notify=False, regular=False,
+                                                      category_ids=category_ids)
+        rotation.folders()
+        self.rotation_library._changed("categories")
+        files = rotation.track_paths()
+        self.normalizer.start(files)
+        names = ", ".join(c["name"] for c in rotation.categories())
+        self.announce(f"Rotation {rotation.name} saved: {len(files)} songs from {names}. Put it in a schedule on the "
+                      "Schedule page to play it.")
+        return rotation
+
+    def rotation_in_today_plan(self, rotation_id):
+        today = datetime.now().date()
+        return any(self.rotation_schedule.rotation_id_for(today, h) == rotation_id for h in range(24))
+
+    def update_rotation(self, rotation, name, category_ids):
+        feeds = self.rotation_in_today_plan(rotation.id)
+        if name and name != rotation.name:
+            self.rotation_library.rename_rotation(rotation.id, name)
+        self.rotation_library.set_categories(rotation.id, category_ids)
+        self.rotation.forget_song_caches()
+        self.normalizer.start(rotation.track_paths())
+        text = f"Rotation {rotation.name} saved: {len(rotation.track_paths())} songs."
+        if feeds and not self.voice_only:
+            self.generate_schedule(datetime.now().date(), quiet=True)
+            text += " Today's playlists and the queue were rebuilt."
+        self.announce(text)
+
+    def remove_rotation(self, rotation):
+        feeds = self.rotation_in_today_plan(rotation.id)
+        schedules = self.event_library.forget_rotation(rotation.id)
+        self.rotation_library.remove_rotation(rotation.id)
+        self.rotation.forget_song_caches()
+        text = f"Rotation {rotation.name} removed."
+        if schedules:
+            text += " The schedule " + ", ".join(schedules) + " no longer plays it; add another rotation to it."
+        if feeds and not self.voice_only and self.rotation_schedule.scheduled_mode():
+            self.generate_schedule(datetime.now().date(), quiet=True)
+        self.announce(text)
+
+    # --- schedules ---
     def refresh_schedule_views(self):
         if hasattr(self, "schedule_tab"):
             self.schedule_tab.refresh()
 
-    def on_events_changed(self, event):
-        """A dated schedule was saved or removed: playlists for today are rebuilt so they follow it."""
-        self.refresh_schedule_views()
+    def plan_signature(self):
+        """Which rotation each hour of today plays: used to see whether a change to a schedule matters today."""
+        today = datetime.now().date()
         try:
-            if event is None or self.event_library.event_for_hour(datetime.now().date(), datetime.now().hour) is not None \
-                    or any(self.event_library.event_for_hour(datetime.now().date(), h) for h in range(24)):
-                self.generate_day(datetime.now().date())
+            return tuple(self.rotation_schedule.rotation_id_for(today, h) for h in range(24))
+        except Exception:
+            return None
+
+    def current_schedule_id(self):
+        try:
+            now = datetime.now()
+            event = self.event_library.active_event(now.date(), now.hour)
+            return event["id"] if event else None
+        except Exception:
+            return None
+
+    def check_schedule_change(self):
+        """When the schedule on air changes (a holiday begins or ends), say so and write it in the log."""
+        now_id = self.current_schedule_id()
+        before = getattr(self, "_active_schedule_id", None)
+        if now_id == before:
+            return
+        self._active_schedule_id = now_id
+        names = {e["id"]: e["name"] for e in self.event_library.events}
+        if now_id is None:
+            text = "No schedule covers this hour."
+        else:
+            event = self.event_library.find(now_id)
+            kind = "the everyday schedule" if event and event.get("default") else "a dated schedule"
+            text = f"The default schedule is now {names.get(now_id, '')} ({kind})"
+            if before and names.get(before):
+                text += f", replacing {names[before]}"
+            text += "."
+        RUN_LOG.write("SCHEDULE", text)
+        self.announce(text)
+
+    def retire_legacy_if_needed(self):
+        """The first time an everyday schedule is saved, the older automatic rotations go away. Rotations a schedule
+        uses are kept, now reading their music category."""
+        if self.event_library.default_event() is None:
+            return
+        legacy = [r for r in self.rotation_library.rotations if not r.category_ids]
+        if not legacy:
+            return
+        used_ids = {i["rotation_id"] for e in self.event_library.events for i in self.event_library.entries_of(e)}
+        kept, converted = [], []
+        for rotation in legacy:
+            if rotation.id not in used_ids:
+                continue
+            category = next((c for c in self.category_library.categories if c.get("rotation_id") == rotation.id), None)
+            if category is not None:
+                rotation.category_ids = [category["id"]]
+                rotation.auto = False
+                rotation.mix = False
+                converted.append(rotation.name)
+            else:
+                kept.append(rotation.id)
+        self.category_library.detach_rotations()
+        removed = self.rotation_library.retire_legacy(keep_ids=set(kept))
+        self.rotation_library.save()
+        if removed:
+            RUN_LOG.write("SCHEDULE", f"Older automatic rotations removed: {len(removed)}. Music categories were not touched.")
+            text = (f"Your schedule is set up, so the {len(removed)} older automatic rotation(s) were removed. "
+                    "Your music categories were not touched.")
+            if converted:
+                text += " Kept, now reading their music category: " + ", ".join(converted) + "."
+            self.announce(text)
+
+    def on_events_changed(self, event, before=None):
+        """A schedule was saved or removed: if today's plan changed, today's playlists and the queue are rebuilt."""
+        try:
+            self.retire_legacy_if_needed()
         except Exception as e:
             _log_exception(type(e), e, e.__traceback__)
+        self.refresh_schedule_views()
+        try:
+            after = self.plan_signature()
+            if before is None or after != before:
+                if self.rotation_library.rotations and not self.voice_only:
+                    self.generate_schedule(datetime.now().date(), quiet=True)
+        except Exception as e:
+            _log_exception(type(e), e, e.__traceback__)
+        self.check_schedule_change()
         self.rotation.check_rotation_for_hour()
+
+    def describe_day_plan(self, day):
+        """Plain words for what plays when on that day, for example 'Automation 0000 to 0559; Holiday 0600 to 2359'."""
+        groups = []
+        for hour in range(24):
+            rotation = self.rotation_library.find(self.rotation_schedule.rotation_id_for(day, hour))
+            event = self.event_library.active_event(day, hour)
+            key = (event["name"] if event else "", rotation.name if rotation else "nothing")
+            if groups and groups[-1][0] == key:
+                groups[-1][2] = hour
+            else:
+                groups.append([key, hour, hour])
+        parts = []
+        for (schedule_name, rotation_name), first, last in groups:
+            label = rotation_name + (f" ({schedule_name})" if schedule_name and schedule_name != rotation_name else "")
+            if len(groups) == 1:
+                parts.append(f"{label} all day")
+            else:
+                parts.append(f"{label} {first:02d}00 to {last:02d}59")
+        return "; ".join(parts)
+
+    def show_generate_schedule(self):
+        """Ctrl+Alt+C: choose today or tomorrow and rebuild it."""
+        if self.voice_only:
+            self.announce("Voice tracking only is on. Turn it off in the Voice Track menu to generate a schedule.")
+            return
+        dialog = GenerateScheduleDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.generate_schedule(dialog.chosen_day())
+
+    def generate_schedule(self, day, quiet=False):
+        """Rebuilds that day's playlists from the schedule on air that day, replacing everything made before. For today
+        the queue is rebuilt from this hour on. Says in plain words what it did."""
+        if self._generating_day:
+            self.announce("The playlists are already being built. Try again in a moment.")
+            return False
+        if not self.rotation_library.rotations:
+            self.announce("There are no rotations yet. Make a rotation on the Rotations page and put it in a schedule.")
+            return False
+        today = datetime.now().date()
+        plan = self.describe_day_plan(day)
+        if not quiet:
+            self.announce(f"Generating the schedule for {day.strftime('%A %B %d')}. This takes a few seconds.")
+        files = self.generate_day(day, announce_result=False)
+        hourly = max(0, len(files) - 1)
+        text = (f"Schedule generated for {day.strftime('%A %B %d')}, 0000 through 2300: {plan}. {hourly} hourly playlists saved; "
+                "earlier ones were replaced.")
+        if hourly == 0:
+            text += " No hour had a rotation with songs in it. Check that the schedule's rotations have music categories."
+        if day == today and self.playlists_enabled() and hourly:
+            now = datetime.now()
+            self.append_attempted = {k for k in self.append_attempted if k[0] != today}
+            path = self.playlist_generator.current_hour_playlist()
+            if path:
+                entries, _missing = read_m3u(path)
+                entries = self.apply_show_to_hour(now.date(), now.hour, entries)
+                count, passed = self.rotation.join_hour(entries, now, locked=is_hour_locked(self.settings, now.date(), now.hour))
+                self.rotation.playlist_driven = count > 0
+                rotation = self.rotation_library.find(self.rotation_schedule.rotation_id_for(today, now.hour))
+                text += (f" The queue was rebuilt: {count} entries for this hour"
+                         + (f" from {rotation.name}" if rotation else "")
+                         + (f", {passed} song(s) the clock has passed are unchecked" if passed else "") + ".")
+                self.maybe_append_next_hour()
+            self.rotation.check_rotation_for_hour()
+        RUN_LOG.write("SCHEDULE", text)
+        self.announce(text)
+        self.refresh_schedule_views()
+        return True
 
     def audio_is_playing(self):
         playing = QMediaPlayer.PlaybackState.PlayingState
@@ -21798,7 +22863,8 @@ class BroadcastingApp(QWidget):
         for key, spin in self.rules_spins.items():
             self.settings.setValue("rules_" + key, spin.value())
         self.settings.setValue("hour_mode", self.hour_mode_combo.currentData())
-        if self.hour_mode_combo.currentData() == "mix":
+        if (self.hour_mode_combo.currentData() == "mix" and not self.rotation_schedule.scheduled_mode()
+                and any(not r.category_ids for r in self.rotation_library.rotations)):
             self.rotation_library.ensure_mix(str(self.settings.value("music_library_folder", "")))
         self.rotation.apply_separation_setting()
         self.rotation.check_rotation_for_hour()
@@ -22381,6 +23447,10 @@ class BroadcastingApp(QWidget):
         generate_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
         generate_btn.clicked.connect(self.generate_now)
         form_playlists.addRow(generate_btn)
+        generate_schedule_btn = QPushButton("Generate Schedule: Today Or Tomorrow (Ctrl+Alt+C)")
+        generate_schedule_btn.setStyleSheet(BUTTON_STYLE_CONSOLE)
+        generate_schedule_btn.clicked.connect(self.show_generate_schedule)
+        form_playlists.addRow(generate_schedule_btn)
 
         # Break protection
         self.break_hold_spin = QSpinBox()
@@ -24158,14 +25228,11 @@ class BroadcastingApp(QWidget):
         if key == "music_library_folder":
             self.settings.setValue("setup_complete", "true")
             self._rescan_in_progress = False
-            self.rotation_library.sync_from_root(folder)
-            self.rotation_library.ensure_mix(folder)
-            self.rotation_schedule.regenerate_even()
+            self.use_music_library_folder(folder, previous=start)
             self.rotation_library.detect_new_files()
             self.rotations_tab.refresh()
             self.schedule_tab.refresh()
-            self.announce(f"Music library set: {len(files)} tracks and {len(self.rotation_library.rotations)} rotations found.")
-            self.ensure_hour_playlists(force=True)
+            self.categories_tab.refresh()
         else:
             self.announce(f"{title} folder set: {len(files)} audio files found.")
 
